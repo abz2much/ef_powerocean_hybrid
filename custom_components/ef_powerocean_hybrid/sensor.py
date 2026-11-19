@@ -223,6 +223,10 @@ class EcoflowSensor(EcoFlowBaseEntity[SensorDef | EnergySensorDef], RestoreSenso
             )
 
         self._attr_entity_category = self._definition.entity_category
+        if disabled_models := getattr(self._definition, "disabled_models", ()):
+            self._attr_entity_registry_enabled_default = (
+                coordinator.inverter_model not in disabled_models
+            )
 
     @callback
     def _handle_coordinator_update(self) -> None:

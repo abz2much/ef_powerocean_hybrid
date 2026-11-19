@@ -1,6 +1,6 @@
 """The control test, run from Home Assistant when the user asks for it.
 
-It does what scripts/control_feature_scan.py does for the control methods: takes
+It does what MaxGrmm's control_feature_scan.py does for the control methods: takes
 control with the heartbeat, commands each method in each direction, watches what
 the inverter does, and hands control back to the EcoFlow app. The decisions and the
 report come from control_test_core, so a run here and a run of the script can be

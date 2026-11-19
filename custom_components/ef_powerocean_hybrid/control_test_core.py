@@ -1,9 +1,9 @@
 """What the control test checks, how it judges a result, and the report it writes.
 
-Shared by the control_test action in Home Assistant and by
-scripts/control_feature_scan.py, so both decide the same way and write the same
-report. Nothing here talks to the inverter or imports Home Assistant: the scripts
-load this module without it.
+Used by the control_test action in Home Assistant. It matches MaxGrmm's
+control_feature_scan.py script, which this integration does not ship, so both
+decide the same way and write the same report. Nothing here talks to the inverter
+or imports Home Assistant: the scripts load this module without it.
 
 A frame is one reading of the inverter as a flat dict: the decoded registers with
 the values derived from them on top, the form the coordinator polls into.

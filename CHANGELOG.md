@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0] - Unreleased
+
+### Changed
+
+- Single-phase inverters (PowerOcean Single Phase, Ocean 2 Single Phase, Ocean
+  2 Plus Single Phase) no longer get the L2 and L3 voltage and current
+  sensors, for the inverter and the grid. They always read 0 there.
+- On the PowerOcean Single Phase, the PV string 3 sensors start disabled,
+  because they read 0 on a unit with two strings. They can be enabled.
+
+### Removed
+
+- The German translation. The integration is in English only.
+- `scripts/control_feature_scan.py`, which writes to the inverter outside the
+  integration, including the feed-in settings.
+
 ## [0.1.0] - Unreleased
 
 ### Added

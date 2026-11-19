@@ -33,12 +33,19 @@ def test_every_language_names_only_codes_english_knows() -> None:
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
-async def test_names_follow_the_language(hass: HomeAssistant) -> None:
+async def test_a_german_home_assistant_gets_the_english_names(
+    hass: HomeAssistant,
+) -> None:
     hass.config.language = "de"
 
     names = await async_get_fault_names(hass)
 
-    assert names[521] == "Kommunikationsfehler des Energiespeichers"
+    assert names[521] == "Energy storage communication error"
+
+
+def test_english_is_the_only_translation() -> None:
+    folder = COMPONENT / "translations"
+    assert sorted(path.name for path in folder.glob("*.json")) == ["en.json"]
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")

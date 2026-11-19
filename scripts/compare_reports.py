@@ -6,7 +6,7 @@
 A report is any of: the JSON the run_control_test action saves under
 config/ef_powerocean_hybrid/, the integration's diagnostics download (its last
 control test is taken), the action's response copied from Developer Tools as YAML,
-or the file control_feature_scan.py --json writes.
+or the file MaxGrmm's control_feature_scan.py --json writes.
 
 Only behaviour that changed is listed. Lines marked ! are likely the firmware: a
 method that is no longer followed, a method no longer reported, a ramp that got

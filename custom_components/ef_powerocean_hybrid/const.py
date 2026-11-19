@@ -18,6 +18,7 @@ from homeassistant.const import (
 )
 
 from .models import (
+    SINGLE_PHASE_MODELS,
     UNKNOWN_STATE,
     BatteryModule,
     BinarySensorDef,
@@ -444,6 +445,7 @@ SENSOR_MAP: list[SensorDef] = [
         device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
+        unsupported_models=SINGLE_PHASE_MODELS,
     ),
     SensorDef(
         key="voltage_l3",
@@ -451,6 +453,7 @@ SENSOR_MAP: list[SensorDef] = [
         device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
+        unsupported_models=SINGLE_PHASE_MODELS,
     ),
     SensorDef(
         key="current_l1",
@@ -465,6 +468,7 @@ SENSOR_MAP: list[SensorDef] = [
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
+        unsupported_models=SINGLE_PHASE_MODELS,
     ),
     SensorDef(
         key="current_l3",
@@ -472,6 +476,7 @@ SENSOR_MAP: list[SensorDef] = [
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
+        unsupported_models=SINGLE_PHASE_MODELS,
     ),
     SensorDef(
         key="inverter_temperature",
@@ -507,6 +512,9 @@ SENSOR_MAP: list[SensorDef] = [
         device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
+        # Read 0 on a tested unit while PV1 and PV2 produced (Nov 2026);
+        # not confirmed from a datasheet, so it starts disabled rather than absent.
+        disabled_models=(InverterModel.POWEROCEAN_SINGLE_PHASE,),
     ),
     SensorDef(
         key="pv1_current",
@@ -528,6 +536,9 @@ SENSOR_MAP: list[SensorDef] = [
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
+        # Read 0 on a tested unit while PV1 and PV2 produced (Nov 2026);
+        # not confirmed from a datasheet, so it starts disabled rather than absent.
+        disabled_models=(InverterModel.POWEROCEAN_SINGLE_PHASE,),
     ),
     *[
         SensorDef(
@@ -583,6 +594,7 @@ SENSOR_MAP: list[SensorDef] = [
             device_class=SensorDeviceClass.VOLTAGE,
             state_class=SensorStateClass.MEASUREMENT,
             entity_category=EntityCategory.DIAGNOSTIC,
+            unsupported_models=SINGLE_PHASE_MODELS if phase > 1 else (),
         )
         for phase in (1, 2, 3)
     ],
@@ -593,6 +605,7 @@ SENSOR_MAP: list[SensorDef] = [
             device_class=SensorDeviceClass.CURRENT,
             state_class=SensorStateClass.MEASUREMENT,
             entity_category=EntityCategory.DIAGNOSTIC,
+            unsupported_models=SINGLE_PHASE_MODELS if phase > 1 else (),
         )
         for phase in (1, 2, 3)
     ],
@@ -656,6 +669,9 @@ SENSOR_MAP: list[SensorDef] = [
         unit=UnitOfPower.WATT,
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
+        # Read 0 on a tested unit while PV1 and PV2 produced (Nov 2026);
+        # not confirmed from a datasheet, so it starts disabled rather than absent.
+        disabled_models=(InverterModel.POWEROCEAN_SINGLE_PHASE,),
     ),
     SensorDef(
         key="bat_net_energy",

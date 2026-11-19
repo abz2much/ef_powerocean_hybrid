@@ -481,7 +481,7 @@ def test_every_status_a_check_stands_for_has_its_text() -> None:
     from pathlib import Path
 
     folder = Path(coordinator_module.__file__).parent / "translations"
-    for language in ("en", "de"):
+    for language in ("en",):
         strings = json.loads((folder / f"{language}.json").read_text())
         assert not [key for key in strings["issues"] if key.startswith("reading_")]
         states = strings["entity"]["sensor"]["control_status"]["state"]

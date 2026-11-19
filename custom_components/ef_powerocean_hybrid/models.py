@@ -177,6 +177,14 @@ class InverterModel(StrEnum):
         )
 
 
+# Models with one grid phase: their L2 and L3 registers always read 0.
+SINGLE_PHASE_MODELS: Final = (
+    InverterModel.POWEROCEAN_SINGLE_PHASE,
+    InverterModel.OCEAN_2_SINGLE_PHASE,
+    InverterModel.OCEAN_2_PLUS_SINGLE_PHASE,
+)
+
+
 # Startup voltages come from the datasheet linked above each model. The single
 # phase has no such specification, so its value is deduced from the MPPT range.
 # The DC Fit has no product id because nobody has reported one yet, so it is only
@@ -844,6 +852,9 @@ class SensorDef:
     options: tuple[str, ...] | None = None
     # Models whose register reads a constant 0, so the sensor would only mislead.
     unsupported_models: tuple[InverterModel, ...] = ()
+    # Models on which the sensor starts disabled, as the register likely reads 0
+    # there but may not on every unit.
+    disabled_models: tuple[InverterModel, ...] = ()
     # Data keys published as state attributes, such as the raw word a value is
     # decoded from.
     attribute_keys: tuple[str, ...] = ()
