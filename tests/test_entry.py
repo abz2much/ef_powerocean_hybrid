@@ -643,10 +643,14 @@ async def test_an_older_entry_copies_its_settings_to_the_options(
 
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
+    model = entry.runtime_data.modbus.inverter_model
+    scan_interval = entry.runtime_data.modbus.scan_interval
+    # Unloaded before asserting: the fake inverter waits for an open connection.
+    await hass.config_entries.async_unload(entry.entry_id)
 
     assert (entry.version, entry.minor_version) == (1, 2)
-    assert entry.data == data
+    # Setup also fixes where the energy counters come from (B5).
+    assert entry.data == {**data, const.CONF_COUNTER_SOURCE: "modbus"}
     assert entry.options == settings
-    assert entry.runtime_data.modbus.inverter_model == "powerocean_plus"
-    assert entry.runtime_data.modbus.scan_interval == 10
-    await hass.config_entries.async_unload(entry.entry_id)
+    assert model == "powerocean_plus"
+    assert scan_interval == 10

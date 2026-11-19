@@ -16,9 +16,17 @@ Early development. Do not install it yet.
   own. The cloud adds the values Modbus does not have, such as each battery
   pack's state of health, cycles and temperatures. If the inverter does not
   answer over Modbus at start, the cloud keeps the system running until it does.
-- **Not yet:** values Modbus and the cloud both have (house, battery and grid
-  power, state of charge) come from Modbus only, with no cloud backup yet; the
-  cloud's live power, settings and scheduled tasks over MQTT are not added yet.
+- **One entity per value:** house, battery and grid power, state of charge,
+  inverter voltage and grid frequency are one entity each. They show Modbus
+  while it has a current reading, otherwise the cloud's, if the cloud has
+  reported it within the last minute (two for voltage and frequency, judged on
+  Home Assistant's clock); otherwise they are unavailable. The `source`
+  attribute says which.
+- **Energy totals keep one source:** the battery charged and discharged totals
+  come from Modbus if the system was set up with Modbus, otherwise from the
+  cloud ("(cloud)" in their name). They never switch source, never go down, and
+  keep their last value while their source is away.
+- **Not yet:** the cloud's live power, settings and scheduled tasks over MQTT.
 
 ## Setting up
 

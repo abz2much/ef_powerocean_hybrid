@@ -38,6 +38,19 @@
 - Setting up a PowerOcean Single Phase is refused if the inverter reports a
   different model over Modbus.
 - Diagnostics leave out the EcoFlow account and the cloud serial as well.
+- House, battery and grid power, state of charge, inverter voltage and grid
+  frequency of a PowerOcean Single Phase with the cloud are one entity each:
+  Modbus while it has a current, trusted reading, otherwise the cloud's value
+  if Home Assistant saw it reported within 60 seconds (120 for voltage and
+  frequency); otherwise unavailable. Their `source` attribute (not recorded)
+  says which. Their entity IDs stay the same.
+- The battery energy totals stay on one source, fixed when the system is first
+  set up: Modbus, or the cloud for a system set up through the cloud alone
+  ("Battery charged total (cloud)", "Battery discharged total (cloud)"). Cloud
+  totals never go down and keep their last value while the cloud is away;
+  Modbus totals keep theirs while the system runs on the cloud.
+- A lifetime total whose first reading on a new installation is 0 shows its
+  last known value, or unknown, until a real value follows, instead of 0.
 - A system with the EcoFlow cloud keeps PowerOcean Single Phase as its model in
   the options; a system on the cloud alone has no options yet.
 - Reconfigure adds a Modbus address to a system set up through the cloud alone,

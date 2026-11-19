@@ -919,6 +919,12 @@
       },
       "pack_update_time": {
         "name": "Update time"
+      },
+      "bat_charged_total_cloud": {
+        "name": "Battery charged total (cloud)"
+      },
+      "bat_discharged_total_cloud": {
+        "name": "Battery discharged total (cloud)"
       }
     },
     "binary_sensor": {

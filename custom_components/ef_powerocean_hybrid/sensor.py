@@ -13,23 +13,18 @@ from homeassistant.components.sensor import (
     SensorEntity,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    UnitOfElectricCurrent,
-    UnitOfElectricPotential,
-    UnitOfEnergy,
-    UnitOfFrequency,
-    UnitOfPower,
-    UnitOfTemperature,
-)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 
-from .cloud_sensor import cloud_sensors
+from .catalogue import CATALOGUE_86
+from .cloud_sensor import CloudCounter, HeldCounter, cloud_sensors
 from .const import (
     BATTERY_RESERVE_REGISTER_KEY,
     BATTERY_SOC_KEYS,
     CONF_BATTERY_COUNT,
+    CONF_COUNTER_SOURCE,
+    CONF_HOST,
     CONF_INVERTER_MODEL,
     CONTROL_STATUS_SENSOR,
     CONTROL_TEST_SENSOR,
@@ -39,12 +34,14 @@ from .const import (
     FAULT_KEYS,
     SENSOR_MAP,
     TOTAL_ENERGY_SENSORS_DEVICE_RAW,
-    UNIT_OF_RATIO,
     WRITABLE_NUMBERS_MAP,
 )
 from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
+from .display import VALUE_PRECISION, shown_number
+from .energy_processor import DEVICE_TOTAL_KEYS
 from .entity import EcoFlowBaseEntity
 from .fault_names import async_get_fault_names
+from .joined_sensor import JoinedSensor
 from .models import EnergySensorDef, InverterModel, SensorDef
 from .telemetry import active_fault_codes
 
@@ -58,34 +55,52 @@ _LOGGER = logging.getLogger(__name__)
 ACTIVE_FAULTS_KEY: Final = "active_faults"
 
 
-VALUE_PRECISION: Final = {
-    UNIT_OF_RATIO: 0,
-    UnitOfPower.WATT: 0,
-    UnitOfEnergy.KILO_WATT_HOUR: 2,
-    UnitOfTemperature.CELSIUS: 1,
-    UnitOfFrequency.HERTZ: 2,
-    UnitOfElectricPotential.VOLT: 1,
-    UnitOfElectricCurrent.AMPERE: 2,
-}
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: EcoflowConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data.modbus
-    model: str | None
-    if coordinator is not None:
-        _add_modbus_sensors(coordinator, entry, async_add_entities)
-        model = coordinator.inverter_model
-    else:
-        model = entry.options.get(CONF_INVERTER_MODEL)
-
-    # The cloud's values, for the one model the cloud is read for.
     cloud = entry.runtime_data.cloud
-    if cloud is not None and model == InverterModel.POWEROCEAN_SINGLE_PHASE:
+    model = (
+        coordinator.inverter_model
+        if coordinator is not None
+        else entry.options.get(CONF_INVERTER_MODEL)
+    )
+    # The cloud is read for one model only; its values join the Modbus ones.
+    with_cloud = cloud is not None and model == InverterModel.POWEROCEAN_SINGLE_PHASE
+    joined = [e for e in CATALOGUE_86 if e.kind == "joined"] if with_cloud else []
+
+    if coordinator is not None:
+        _add_modbus_sensors(
+            coordinator, entry, async_add_entities, skip={e.key for e in joined}
+        )
+    elif CONF_HOST in entry.data:
+        # Running on the cloud because Modbus did not answer at start: the
+        # Modbus counters keep their last value until the entry reloads.
+        async_add_entities(
+            HeldCounter(entry, definition.key)
+            for definition in CATALOGUE_86
+            if definition.kind == "counter"
+        )
+    async_add_entities(
+        JoinedSensor(
+            entry,
+            definition,
+            coordinator,
+            cloud,
+            VALUE_PRECISION.get(definition.description.unit or ""),
+        )
+        for definition in joined
+    )
+    if with_cloud and cloud is not None:
         entry.async_on_unload(cloud_sensors(hass, entry, cloud, async_add_entities))
+        if entry.data.get(CONF_COUNTER_SOURCE) == "cloud":
+            async_add_entities(
+                CloudCounter(cloud, entry, definition)
+                for definition in CATALOGUE_86
+                if definition.kind == "counter"
+            )
 
 
 @callback
@@ -93,8 +108,9 @@ def _add_modbus_sensors(
     coordinator: EcoflowCoordinator,
     entry: EcoflowConfigEntry,
     async_add_entities: AddEntitiesCallback,
+    skip: set[str],
 ) -> None:
-    """Add the sensors of the inverter's Modbus registers."""
+    """Add the sensors of the inverter's Modbus registers, except those in *skip*."""
     entities: list[EcoflowSensor] = []
 
     empty_battery_slots = set(
@@ -114,7 +130,8 @@ def _add_modbus_sensors(
 
     for sensor in SENSOR_MAP:
         if (
-            sensor.key in empty_battery_slots
+            sensor.key in skip
+            or sensor.key in empty_battery_slots
             or sensor.key in controlled_keys
             or coordinator.inverter_model in sensor.unsupported_models
         ):
@@ -298,18 +315,18 @@ class EcoflowSensor(EcoFlowBaseEntity[SensorDef | EnergySensorDef], RestoreSenso
         if self._definition.key == "coordinator_status":
             return self.coordinator.status
         value = (self.coordinator.data or {}).get(self._definition.key)
-        if value is None:
+        key = self._definition.key
+        if value is None or (
+            key in DEVICE_TOTAL_KEYS and key in self.coordinator.unconfirmed_totals
+        ):
+            # A first 0 of a lifetime total is not shown: a jump from it to the
+            # real total would book the whole lifetime as one hour.
             return self._last_written_value
         if isinstance(value, datetime | str):
             return value
         if self._definition.device_class is SensorDeviceClass.ENUM:
             return str(value)
-        number = float(value)
-        unit = self._definition.unit
-        precision = VALUE_PRECISION.get(unit) if unit is not None else None
-        if precision is None:
-            return int(number)
-        return round(number, precision) if precision else round(number)
+        return shown_number(value, self._definition.unit)
 
 
 class EcoFlowActiveFaultsSensor(EcoflowSensor):

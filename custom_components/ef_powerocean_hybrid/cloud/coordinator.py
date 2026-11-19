@@ -9,7 +9,7 @@ powerocean_single_phase's coordinator (v1.0.1), MIT, (c) 2026 niltrip, abz2much.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from homeassistant.config_entries import ConfigEntry
@@ -18,8 +18,18 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
+from ..catalogue import (
+    HEARTBEAT,
+    HEARTBEAT_TIME,
+    STREAM,
+    STREAM_TIME,
+    CloudSource,
+    cloud_value,
+)
 from ..const import CONF_CLOUD_SERIAL
+from ..sources import Reading
 from .api import (
     AuthenticationError,
     EcoflowApi,
@@ -34,6 +44,8 @@ _LOGGER = logging.getLogger(__name__)
 CLOUD_MODEL = "86"
 CLOUD_SCAN_INTERVAL = timedelta(seconds=10)
 PARSE_ERRORS = (KeyError, TypeError, ValueError, AttributeError)
+# The reports whose time shows how fresh the joined values are.
+REPORT_TIMES = ((STREAM_TIME, STREAM), (HEARTBEAT_TIME, HEARTBEAT))
 
 
 class CloudApi(Protocol):
@@ -98,16 +110,41 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=CLOUD_SCAN_INTERVAL,
         )
         self.api = api
+        # MQTT live readings by catalogue key; filled once MQTT is added.
+        self.live: dict[str, Reading] = {}
+        # When Home Assistant last saw each report's time change, by time key.
+        self.report_seen: dict[str, datetime] = {}
+        self._report_times: dict[str, Any] = {}
 
     async def _async_update_data(self) -> dict[str, Any]:
         if self.api.token is None:
             await self._async_authorize()
         response = await self._async_fetch()
         try:
-            return parse(response, self.api.sn, self.api.variant).values()
+            values = parse(response, self.api.sn, self.api.variant).values()
         except PARSE_ERRORS as err:
             msg = f"Unexpected cloud response: {err}"
             raise UpdateFailed(msg) from err
+        self._note_report_times(values)
+        return values
+
+    def _note_report_times(self, values: dict[str, Any]) -> None:
+        """Record when each report's time changed, on Home Assistant's clock.
+
+        A time seen for the first time proves nothing: after a restart a dead
+        cloud still returns its last report.
+        """
+        for time_key, report in REPORT_TIMES:
+            current = cloud_value(values, self.api.sn, CloudSource(time_key, report))
+            if current is None:
+                # Missing from this response: not a change when it comes back.
+                continue
+            if (
+                time_key in self._report_times
+                and current != self._report_times[time_key]
+            ):
+                self.report_seen[time_key] = dt_util.utcnow()
+            self._report_times[time_key] = current
 
     async def _async_fetch(self) -> dict[str, Any]:
         """Fetch the response, logging in again once if it was rejected."""

@@ -2,24 +2,39 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.components.sensor import (
+    RestoreSensor,
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .catalogue import CATALOGUE_86, CatalogueEntry, CloudSource, cloud_value
 from .cloud.coordinator import CloudCoordinator
 from .const import CONF_CLOUD_SERIAL, DOMAIN
 from .ids import system_id
 from .models import InverterModel
+
+_LOGGER = logging.getLogger(__name__)
+
+# Faster than any PowerOcean Single Phase can charge or discharge its battery,
+# so a rise beyond it is a bad reading, not energy.
+COUNTER_MAX_POWER_W = 10_000
+COUNTER_RESOLUTION_KWH = 0.01
 
 _PACK_SOC = re.compile(r"^(?P<serial>.+?)_(?:[A-Z0-9]+_)?BP_STA_REPORT_bpSoc$")
 
@@ -172,3 +187,114 @@ def _link_packs(hass: HomeAssistant, entry: ConfigEntry, packs: list[str]) -> No
         )
         if device.via_device_id != inverter.id:
             registry.async_update_device(device.id, via_device_id=inverter.id)
+
+
+class CloudCounter(CoordinatorEntity[CloudCoordinator], RestoreSensor):
+    """A battery energy total counted from the cloud, on an entry whose fixed
+    counter source is the cloud.
+
+    It keeps its last value while the cloud is offline or leaves the value out,
+    and after a restart. A reading of 0, or lower than the last one, counts as
+    missing, so the Energy dashboard never sees a gap or a drop.
+    """
+
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(
+        self,
+        coordinator: CloudCoordinator,
+        entry: ConfigEntry,
+        definition: CatalogueEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._source = cast(CloudSource, definition.cloud)
+        self._serial = entry.data[CONF_CLOUD_SERIAL]
+        self._value: float | None = None
+        # When the shown value was taken; a rise is judged against it.
+        self._accepted_at: datetime | None = None
+        self._spike_logged = False
+        system = system_id(entry)
+        self._attr_unique_id = f"{system}_{definition.key}_cloud"
+        self._attr_translation_key = f"{definition.key}_cloud"
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, system)})
+
+    @property
+    def available(self) -> bool:
+        # The last value stands while the cloud is away.
+        return True
+
+    @property
+    def native_value(self) -> float | None:
+        return self._value
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if (last := await self.async_get_last_sensor_data()) is not None:
+            self._value = cast(float | None, last.native_value)
+            if (state := await self.async_get_last_state()) is not None:
+                self._accepted_at = state.last_updated
+        self._take()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._take()
+        super()._handle_coordinator_update()
+
+    def _take(self) -> None:
+        if not self.coordinator.last_update_success:
+            return
+        value = cloud_value(self.coordinator.data or {}, self._serial, self._source)
+        if not isinstance(value, int | float) or value <= 0:
+            return
+        now = dt_util.utcnow()
+        if self._value is not None and self._accepted_at is not None:
+            # Never down: on a total_increasing sensor any drop reads as a
+            # meter reset, and the Energy dashboard would count the whole
+            # lifetime again. Never faster than the battery can charge either:
+            # a spike, once booked, would hold the counter there for good.
+            hours = max((now - self._accepted_at).total_seconds(), 0) / 3600
+            believable = COUNTER_MAX_POWER_W * hours / 1000 + COUNTER_RESOLUTION_KWH
+            if not 0 <= value - self._value <= believable:
+                if value > self._value and not self._spike_logged:
+                    _LOGGER.warning(
+                        "Ignoring an implausible rise of %s from %s to %s kWh",
+                        self.entity_id,
+                        self._value,
+                        value,
+                    )
+                    self._spike_logged = True
+                return
+        self._value = float(value)
+        self._accepted_at = now
+        self._spike_logged = False
+
+
+class HeldCounter(RestoreSensor):
+    """A Modbus energy total shown at its last value while Modbus is away.
+
+    Made only when the entry runs on the cloud because Modbus did not answer at
+    start. It keeps the unique ID of the Modbus sensor, which takes over again,
+    from Modbus's own saved totals, once the entry reloads with Modbus.
+    """
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _unrecorded_attributes = frozenset({"source"})
+
+    def __init__(self, entry: ConfigEntry, key: str) -> None:
+        system = system_id(entry)
+        self._attr_unique_id = f"{system}_{key}"
+        self._attr_translation_key = key
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, system)})
+        self._attr_extra_state_attributes = {"source": "modbus (held)"}
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if (last := await self.async_get_last_sensor_data()) is not None:
+            self._attr_native_value = last.native_value

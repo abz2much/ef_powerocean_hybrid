@@ -74,6 +74,9 @@ CONF_MODBUS_CONTROL: Final = "modbus_control"
 CONF_INVERTER_MODEL: Final = "inverter_model"
 # The inverter serial the EcoFlow cloud knows it by; set with a cloud connection.
 CONF_CLOUD_SERIAL: Final = "cloud_serial"
+# Where the battery energy totals come from: "modbus" or "cloud". Fixed when the
+# entry is first set up, so the Energy dashboard never switches source.
+CONF_COUNTER_SOURCE: Final = "counter_source"
 # kWh added to what the device reports for a lifetime total, by its key. Set by the
 # user for a counter the inverter reset, so the total continues as in EcoFlow's portal.
 CONF_ENERGY_OFFSETS: Final = "energy_offsets"

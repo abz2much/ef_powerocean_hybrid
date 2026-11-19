@@ -549,6 +549,25 @@ def test_a_first_read_of_zero_is_shown_but_not_trusted(
     assert "solar_total" not in processor.accepted_at
 
 
+def test_an_unconfirmed_first_zero_is_reported_as_such(
+    processor: EnergyProcessor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The display hides it; the processor keeps it as its baseline."""
+    poll_sequence(processor, [(POLL, 0.0)], monkeypatch)
+
+    assert processor.unconfirmed({"solar_total": 0.0}) == {"solar_total"}
+
+
+def test_a_confirmed_total_is_not_unconfirmed(
+    processor: EnergyProcessor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    published = poll_sequence(
+        processor, [(POLL, 0.0), (POLL, 4296.8), (POLL, 4296.81)], monkeypatch
+    )
+
+    assert processor.unconfirmed({"solar_total": published[-1]}) == frozenset()
+
+
 def test_the_real_value_after_a_bogus_first_zero_is_taken(
     processor: EnergyProcessor, monkeypatch: pytest.MonkeyPatch
 ) -> None:

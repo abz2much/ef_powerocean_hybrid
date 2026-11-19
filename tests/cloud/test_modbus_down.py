@@ -192,3 +192,30 @@ async def test_no_reload_unless_this_inverter_answers(
         await hass.async_block_till_done()
 
     reload.assert_not_called()
+
+
+async def test_the_joined_values_come_from_the_cloud_with_modbus_down(
+    hass: HomeAssistant, down_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    import copy
+
+    from homeassistant.helpers import entity_registry as er
+
+    def at(time: str) -> dict:
+        response = copy.deepcopy(model86_response())
+        response["data"]["quota"]["JTS1_ENERGY_STREAM_REPORT"]["updateTime"] = time
+        return response
+
+    api = FakeApi(fetch=[at("2026-11-19 20:00:00")])
+    await set_up_hybrid(down_entry, api)
+    api.respond(at("2026-11-19 20:00:30"))
+    await down_entry.runtime_data.cloud.async_refresh()
+    await hass.async_block_till_done()
+
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "sensor", const.DOMAIN, f"{SERIAL}_house_power"
+    )
+    assert entity_id is not None
+    state = hass.states.get(entity_id)
+    assert state is not None
+    assert state.attributes["source"] == "cloud"

@@ -19,7 +19,13 @@ from homeassistant.helpers.typing import ConfigType
 
 from .cloud import coordinator as cloud_module
 from .cloud.coordinator import CloudCoordinator
-from .const import CONF_CLOUD_SERIAL, CONF_HOST, CONF_PORT, DOMAIN
+from .const import (
+    CONF_CLOUD_SERIAL,
+    CONF_COUNTER_SOURCE,
+    CONF_HOST,
+    CONF_PORT,
+    DOMAIN,
+)
 from .control import ControlInputs
 from .coordinator import (
     EcoflowConfigEntry,
@@ -172,6 +178,14 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> bool:
     """Set up EF PowerOcean Hybrid from a config entry."""
 
+    if CONF_COUNTER_SOURCE not in entry.data:
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_COUNTER_SOURCE: "modbus" if CONF_HOST in entry.data else "cloud",
+            },
+        )
     coordinator = None
     # An entry made with only a cloud connection has no inverter address.
     if CONF_HOST in entry.data:

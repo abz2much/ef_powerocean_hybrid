@@ -1134,6 +1134,16 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             value = round(value / 1000, 3)
         return value
 
+    @property
+    def unconfirmed_totals(self) -> frozenset[str]:
+        """Lifetime totals that are a first 0 not yet confirmed by a real value."""
+        return self._energy_processor.unconfirmed(self.data or {})
+
+    @property
+    def last_good_poll(self) -> datetime | None:
+        """When the last poll was read and checked; None before the first."""
+        return self._last_checked_time
+
     async def _async_update_data(self) -> dict[str, Any]:
         try:
             raw_data = await self.async_get_raw_data()

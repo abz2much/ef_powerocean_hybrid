@@ -224,6 +224,18 @@ class EnergyProcessor:
         self.offsets = dict(offsets)
         return result
 
+    def unconfirmed(self, data: Mapping[str, Any]) -> frozenset[str]:
+        """Return the lifetime totals in *data* that are a first 0 never confirmed.
+
+        The processor keeps such a 0 as its baseline, so a spike after it is
+        still refused; the display shows it as missing instead (upstream #2).
+        """
+        return frozenset(
+            key
+            for key in DEVICE_TOTAL_KEYS
+            if data.get(key) == 0 and key not in self.accepted_at
+        )
+
     def validate_totals(
         self,
         raw_data: Mapping[str, Any],
