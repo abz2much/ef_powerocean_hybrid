@@ -1,0 +1,7 @@
+{
+  "name": "EF PowerOcean Hybrid",
+  "homeassistant": "2026.9.0",
+  "render_readme": true,
+  "zip_release": true,
+  "filename": "ef_powerocean_hybrid.zip"
+}

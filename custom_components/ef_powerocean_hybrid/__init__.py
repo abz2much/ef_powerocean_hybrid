@@ -1,0 +1,202 @@
+"""EF PowerOcean Hybrid: local Modbus TCP integration for EcoFlow PowerOcean."""
+
+from __future__ import annotations
+
+import logging
+from typing import Final
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.typing import ConfigType
+
+from .const import CONF_HOST, CONF_PORT, DOMAIN
+from .control import ControlInputs
+from .coordinator import (
+    EcoflowConfigEntry,
+    EcoflowCoordinator,
+    held_totals_issue_id,
+    identity_mismatch_issue_id,
+    state_store,
+)
+from .modbus import async_prepare
+from .reading_checks import KEYS as READING_CHECK_KEYS
+from .services import async_setup_services
+
+_LOGGER = logging.getLogger(__name__)
+
+CONFIG_SCHEMA: Final = cv.config_entry_only_config_schema(DOMAIN)
+
+PLATFORMS: Final = [
+    Platform.BINARY_SENSOR,
+    Platform.SENSOR,
+    Platform.NUMBER,
+    Platform.SELECT,
+    Platform.SWITCH,
+]
+
+
+def _modbus_disabled_issue_id(entry: ConfigEntry) -> str:
+    """Return the stable id of the repairs issue raised while Modbus is disabled."""
+    return f"modbus_disabled_{entry.entry_id}"
+
+
+async def async_setup(
+    hass: HomeAssistant,
+    config: ConfigType,  # noqa: ARG001 - required by the integration API
+) -> bool:
+    """Register the actions, which serve every configured inverter."""
+    async_setup_services(hass)
+    return True
+
+
+@callback
+def _async_update_modbus_disabled_issue(
+    hass: HomeAssistant, entry: EcoflowConfigEntry, coordinator: EcoflowCoordinator
+) -> None:
+    """Raise a repairs issue while telemetry appears disabled, and clear it after."""
+    issue_id = _modbus_disabled_issue_id(entry)
+    if not coordinator.is_modbus_disabled:
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+        return
+
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        issue_id,
+        is_fixable=False,
+        is_persistent=False,
+        severity=ir.IssueSeverity.ERROR,
+        translation_key="modbus_disabled",
+        translation_placeholders={"host": coordinator.host},
+        learn_more_url="https://github.com/abz2much/ef_powerocean_hybrid#prerequisites",
+    )
+
+
+@callback
+def _async_claim_serial_number(
+    hass: HomeAssistant, entry: EcoflowConfigEntry, coordinator: EcoflowCoordinator
+) -> None:
+    """Make the serial number the entry's unique id once the device has reported it.
+
+    Entries made before the serial was read are keyed by host and port, which
+    changes with the network while the inverter does not. Entities and the device
+    are keyed by the entry id, so the entry's unique id can change under them.
+    """
+    serial = coordinator.identity.serial_number
+    if not serial or serial == "unknown" or entry.unique_id == serial:
+        return
+    if any(
+        other.unique_id == serial and other.entry_id != entry.entry_id
+        for other in hass.config_entries.async_entries(DOMAIN)
+    ):
+        _LOGGER.warning(
+            "Serial number %s is already the unique id of another entry; "
+            "keeping %s for this one",
+            serial,
+            entry.unique_id,
+        )
+        return
+    _LOGGER.info(
+        "Unique id of %s changes from %s to %s", entry.title, entry.unique_id, serial
+    )
+    hass.config_entries.async_update_entry(entry, unique_id=serial)
+
+
+@callback
+def _async_make_device_physical(hass: HomeAssistant, entry: EcoflowConfigEntry) -> None:
+    """Drop the service entry type the device was once registered with.
+
+    The device info no longer sets one, which leaves what the registry has.
+    """
+    registry = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(registry, entry.entry_id):
+        if device.entry_type is dr.DeviceEntryType.SERVICE:
+            registry.async_update_device(device.id, entry_type=None)
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Copy the settings of an older entry from its data to its options.
+
+    Copied, not moved: an earlier release still finds them in the data, and as
+    the version only goes up by a minor one, it still loads the entry.
+    """
+    if entry.version == 1 and entry.minor_version < 2:
+        connection = {CONF_HOST, CONF_PORT}
+        hass.config_entries.async_update_entry(
+            entry,
+            options={
+                **{k: v for k, v in entry.data.items() if k not in connection},
+                **entry.options,
+            },
+            minor_version=2,
+        )
+        _LOGGER.debug("Copied the settings of %s to its options", entry.title)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> bool:
+    """Set up EF PowerOcean Hybrid from a config entry."""
+
+    await async_prepare(hass)
+    coordinator = EcoflowCoordinator(
+        hass,
+        config_entry=entry,
+    )
+    # Connects and reads the device, through the coordinator's _async_setup. If
+    # it fails, Home Assistant retries the setup and shuts the coordinator down.
+    await coordinator.async_config_entry_first_refresh()
+    # Before the update listener below, which would reload the entry over it.
+    _async_claim_serial_number(hass, entry, coordinator)
+
+    _async_update_modbus_disabled_issue(hass, entry, coordinator)
+    entry.async_on_unload(
+        coordinator.async_add_listener(
+            lambda: _async_update_modbus_disabled_issue(hass, entry, coordinator)
+        )
+    )
+
+    entry.runtime_data = coordinator
+    _async_make_device_physical(hass, entry)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # The control loop reads its inputs, and what its reading checks compare,
+    # whatever entities are enabled. With it and
+    # the entities all asking, the poll reads only what they ask for from here on.
+    entry.async_on_unload(
+        coordinator.async_require(ControlInputs.keys() | READING_CHECK_KEYS)
+    )
+    coordinator.async_poll_on_demand()
+
+    # Reload integration when config entry data changes
+    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+
+    return True
+
+
+async def _async_reload_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> None:
+    """Reload the integration when the config entry is updated."""
+    _LOGGER.debug("Config entry updated — reloading EF PowerOcean Hybrid")
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unload_ok:
+        return False
+
+    ir.async_delete_issue(hass, DOMAIN, _modbus_disabled_issue_id(entry))
+    ir.async_delete_issue(hass, DOMAIN, identity_mismatch_issue_id(entry))
+    ir.async_delete_issue(hass, DOMAIN, held_totals_issue_id(entry))
+    # The coordinator's async_shutdown, registered with the entry, hands control
+    # back and closes the connection after this returns.
+    return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the state saved for the entry, which nothing else would read again."""
+    await state_store(hass, entry.entry_id).async_remove()

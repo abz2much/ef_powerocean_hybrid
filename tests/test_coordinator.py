@@ -1,0 +1,1961 @@
+"""Unit tests for coordinator data validation without Home Assistant."""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import struct
+from collections import deque
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.util import dt as dt_util
+from pymodbus.exceptions import ModbusException
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.ef_powerocean_hybrid import const, models
+from custom_components.ef_powerocean_hybrid import coordinator as coordinator_module
+from custom_components.ef_powerocean_hybrid.control import ControlManager
+from custom_components.ef_powerocean_hybrid.coordinator import EcoflowConfigEntry
+from custom_components.ef_powerocean_hybrid.energy_processor import EnergyProcessor
+from custom_components.ef_powerocean_hybrid.modbus import (
+    ModbusClient,
+    ModbusReadRejected,
+)
+from custom_components.ef_powerocean_hybrid.telemetry import TelemetryData
+
+
+@pytest.fixture
+def coordinator():
+    instance = coordinator_module.EcoflowCoordinator.__new__(
+        coordinator_module.EcoflowCoordinator
+    )
+    instance._last_checked_data = {}
+    instance._last_checked_time = None
+    instance.data = cast(dict[str, Any], None)
+    instance._modbus_client = cast(
+        ModbusClient,
+        SimpleNamespace(
+            connected=True,
+            async_read=AsyncMock(),
+            async_write=AsyncMock(),
+            close=Mock(),
+            block_writes=Mock(),
+            allow_writes=Mock(),
+        ),
+    )
+    instance.hass = Mock()
+    instance.host = "192.0.2.10"
+    instance.config_entry = cast(
+        EcoflowConfigEntry,
+        SimpleNamespace(entry_id="entry", unique_id="R371ZAS2TEST0002"),
+    )
+    instance._identity_verified = True
+    instance._status = None
+    instance._store = None
+    instance.identity = models.DeviceIdentity()
+    instance._consecutive_modbus_disabled_reads = 0
+    instance._optional_stalls = {}
+    instance._battery_capacity_wh = None
+    instance._raw_blocks = {}
+    instance._check_snapshots = deque(maxlen=const.READING_CHECK_SNAPSHOTS)
+    instance._ena_calc_solar_power = False
+    instance.inverter_model = const.DEFAULT_INVERTER_MODEL
+    instance._register_blocks = const.register_blocks_for(instance.inverter_model)
+    instance._registers_by_key = {
+        register.key: register
+        for block in instance._register_blocks
+        for register in block.registers
+    }
+    instance.limits = {
+        const.CONF_MAX_GRID_POWER: 15_000,
+        const.CONF_MAX_SOLAR_POWER: 12_000,
+        const.CONF_MAX_BATTERY_CHARGED_POWER: 5_000,
+        const.CONF_MAX_BATTERY_DISCHARGED_POWER: 6_600,
+    }
+    instance.control = ControlManager(
+        instance._modbus_client,
+        registers_by_key=instance._registers_by_key,
+        limits=instance.limits,
+        inverter_model=instance.inverter_model,
+        enabled=False,
+        scan_interval_s=const.DEFAULT_SCAN_INTERVAL_S,
+        on_update=Mock(),
+        on_refresh=AsyncMock(),
+        write_setting=instance._async_write_register,
+        on_command_expired=Mock(),
+    )
+    instance._energy_processor = EnergyProcessor(instance.limits)
+    instance._energy_offsets = {}
+    return instance
+
+
+def validate_totals(
+    coordinator,
+    data: dict[str, float],
+    now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, float]:
+    monkeypatch.setattr(dt_util, "now", lambda: now)
+    return coordinator._energy_processor.validate_totals(
+        data, coordinator._last_checked_data, coordinator._last_checked_time
+    )
+
+
+def run_update(
+    coordinator,
+    raw_data: Mapping[str, float | None],
+    now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, float]:
+    """Run a full coordinator update cycle with a fixed frame and clock."""
+    coordinator.async_get_raw_data = AsyncMock(return_value=dict(raw_data))
+    monkeypatch.setattr(dt_util, "now", lambda: now)
+    return asyncio.run(coordinator._async_update_data())
+
+
+@pytest.mark.parametrize(
+    ("entry_options", "expected"),
+    (({}, False), ({const.CONF_MODBUS_CONTROL: True}, True)),
+)
+async def test_modbus_control_enablement_comes_from_config_entry(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_options: dict,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(
+        coordinator_module,
+        "create_client",
+        lambda *_args, **_kwargs: Mock(connected=False),
+    )
+    config_entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        minor_version=2,
+        data={const.CONF_HOST: "192.0.2.10"},
+        options=entry_options,
+    )
+
+    instance = coordinator_module.EcoflowCoordinator(hass, config_entry)
+
+    assert instance.control.enabled is expected
+
+
+@pytest.mark.parametrize(
+    ("capacity_wh", "charge_w", "discharge_w"),
+    (
+        (10_000, 5_106, 8_160),  # 10000 Wh, as two old 5 kWh modules read
+        (0, 5_000, 6_600),  # a zero reading keeps the module-count limits
+        (589_824_000, 5_000, 6_600),  # an absurd reading too
+    ),
+)
+def test_battery_limits_follow_the_reported_capacity(
+    coordinator,
+    monkeypatch: pytest.MonkeyPatch,
+    capacity_wh: float,
+    charge_w: int,
+    discharge_w: int,
+) -> None:
+    run_update(
+        coordinator,
+        {"battery_capacity": capacity_wh},
+        datetime(2026, 10, 23, 12, tzinfo=UTC),
+        monkeypatch,
+    )
+
+    assert coordinator.limits[const.CONF_MAX_BATTERY_CHARGED_POWER] == charge_w
+    assert coordinator.limits[const.CONF_MAX_BATTERY_DISCHARGED_POWER] == discharge_w
+    assert coordinator._energy_processor.limits is coordinator.limits
+
+
+def test_a_sleeping_battery_keeps_its_last_capacity(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inverter reads 0 Wh while the battery sleeps at its reserve."""
+    now = datetime(2026, 10, 23, 22, tzinfo=UTC)
+    awake = run_update(
+        coordinator,
+        {"battery_capacity": 10_000.0, "battery_soc": 50.0},
+        now,
+        monkeypatch,
+    )
+
+    asleep = run_update(
+        coordinator,
+        {"battery_capacity": 0.0, "battery_soc": 50.0},
+        now + timedelta(minutes=1),
+        monkeypatch,
+    )
+
+    assert asleep["battery_capacity"] == awake["battery_capacity"]
+    assert asleep["bat_remaining"] == awake["bat_remaining"]
+
+
+def test_an_implausible_first_capacity_is_unknown(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = run_update(
+        coordinator,
+        {"battery_capacity": 0.0},
+        datetime(2026, 10, 23, 22, tzinfo=UTC),
+        monkeypatch,
+    )
+
+    assert data["battery_capacity"] is None
+
+
+def test_the_kept_capacity_survives_a_restart(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A battery still asleep after a restart is not of unknown size."""
+    now = datetime(2026, 10, 23, 22, tzinfo=UTC)
+    run_update(coordinator, {"battery_capacity": 10_000.0}, now, monkeypatch)
+    stored = coordinator._persisted_state()
+
+    coordinator._battery_capacity_wh = None
+    coordinator._store = SimpleNamespace(
+        async_load=AsyncMock(return_value=stored), async_delay_save=Mock()
+    )
+    asyncio.run(coordinator.async_load_persisted_state())
+    asleep = run_update(
+        coordinator,
+        {"battery_capacity": 0.0},
+        now + timedelta(minutes=1),
+        monkeypatch,
+    )
+
+    assert asleep["battery_capacity"] == 10_000.0
+
+
+# Every real module as its datasheet rates it, unlike the merged const table.
+DATASHEET_MODULES = (
+    models.BatteryModule(5000, charge_w=2500, discharge_w=3300),  # EF BD-5.1-S1
+    models.BatteryModule(5024, charge_w=2500, discharge_w=4080),  # EF BD-5-S2
+    models.BatteryModule(8030, charge_w=4100, discharge_w=6400),  # EF BD-8-S2
+)
+
+
+def test_any_battery_mix_is_rated_at_least_its_datasheet_power() -> None:
+    for counts in itertools.product(range(5), repeat=len(DATASHEET_MODULES)):
+        mix = [
+            module
+            for module, count in zip(DATASHEET_MODULES, counts, strict=True)
+            for _ in range(count)
+        ]
+        capacity = sum(module.reported_wh for module in mix)
+
+        charge_w, discharge_w = coordinator_module.battery_power_limits(capacity)
+
+        assert sum(module.charge_w for module in mix) <= charge_w, counts
+        assert sum(module.discharge_w for module in mix) <= discharge_w, counts
+
+
+@pytest.mark.parametrize(
+    ("disabled_reads", "expected"),
+    (
+        (0, False),
+        (const.MODBUS_DISABLED_READ_THRESHOLD - 1, False),
+        (const.MODBUS_DISABLED_READ_THRESHOLD, True),
+        (const.MODBUS_DISABLED_READ_THRESHOLD + 1, True),
+    ),
+)
+def test_reports_modbus_disabled_after_consecutive_read_threshold(
+    coordinator,
+    disabled_reads: int,
+    expected: bool,
+) -> None:
+    coordinator._consecutive_modbus_disabled_reads = disabled_reads
+
+    assert coordinator.is_modbus_disabled is expected
+
+
+def test_seeds_baseline_from_legacy_persisted_state(coordinator) -> None:
+    stored = {
+        "last_checked_data": {"grid_import_total": 12.5},
+        "last_checked_time": "2026-08-07T12:00:00+00:00",
+    }
+    coordinator._store = SimpleNamespace(async_load=AsyncMock(return_value=stored))
+
+    asyncio.run(coordinator.async_load_persisted_state())
+
+    assert coordinator._last_checked_data == {"grid_import_total": 12.5}
+    assert coordinator._last_checked_time == datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    assert coordinator._energy_processor.daily_snapshots == {}
+    assert coordinator._energy_processor.last_rollover is None
+
+
+def test_persisted_state_round_trips(coordinator) -> None:
+    coordinator._last_checked_data = {"grid_import_total": 12.5}
+    coordinator._last_checked_time = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    coordinator._energy_processor.accepted_at = {
+        "grid_import_total": datetime(2026, 8, 7, 11, 0, tzinfo=UTC)
+    }
+    coordinator._energy_processor.daily_snapshots = {"grid_import_today": 10.0}
+    coordinator._energy_processor.last_rollover = datetime(2026, 8, 7, 0, 0, tzinfo=UTC)
+
+    stored = coordinator._persisted_state()
+
+    coordinator._last_checked_data = {}
+    coordinator._last_checked_time = None
+    coordinator._energy_processor.accepted_at = {}
+    coordinator._energy_processor.daily_snapshots = {}
+    coordinator._energy_processor.last_rollover = None
+    coordinator._store = SimpleNamespace(async_load=AsyncMock(return_value=stored))
+
+    asyncio.run(coordinator.async_load_persisted_state())
+
+    assert coordinator._last_checked_data == {"grid_import_total": 12.5}
+    assert coordinator._energy_processor.accepted_at == {
+        "grid_import_total": datetime(2026, 8, 7, 11, 0, tzinfo=UTC)
+    }
+    assert coordinator._energy_processor.daily_snapshots == {"grid_import_today": 10.0}
+    assert coordinator._energy_processor.last_rollover == datetime(
+        2026, 8, 7, 0, 0, tzinfo=UTC
+    )
+
+
+@pytest.mark.parametrize("model", list(models.InverterModel))
+def test_state_saved_at_the_current_revision_is_kept(coordinator, model) -> None:
+    coordinator.inverter_model = model
+    coordinator._last_checked_data = {"grid_import_total": 12.5}
+    coordinator._energy_processor.daily_snapshots = {"grid_import_today": 10.0}
+    stored = coordinator._persisted_state()
+    coordinator._last_checked_data = {}
+    coordinator._energy_processor.daily_snapshots = {}
+    coordinator._store = SimpleNamespace(async_load=AsyncMock(return_value=stored))
+
+    asyncio.run(coordinator.async_load_persisted_state())
+
+    assert coordinator._last_checked_data == {"grid_import_total": 12.5}
+    assert coordinator._energy_processor.daily_snapshots == {"grid_import_today": 10.0}
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        model
+        for model in models.InverterModel
+        if model.traits.energy_state_revision == 0
+    ],
+)
+def test_state_saved_without_a_revision_is_kept(coordinator, model) -> None:
+    coordinator.inverter_model = model
+    stored = {
+        "last_checked_data": {"grid_import_total": 12.5},
+        "daily_energy_snapshots": {"grid_import_today": 10.0},
+    }
+    coordinator._store = SimpleNamespace(async_load=AsyncMock(return_value=stored))
+
+    asyncio.run(coordinator.async_load_persisted_state())
+
+    assert coordinator._last_checked_data == {"grid_import_total": 12.5}
+    assert coordinator._energy_processor.daily_snapshots == {"grid_import_today": 10.0}
+
+
+def test_ocean_2_plus_energy_state_from_beta_2_is_dropped(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Counters 1000x too large would read as a decrease and be held forever."""
+    coordinator.inverter_model = models.InverterModel.OCEAN_2_PLUS_SINGLE_PHASE
+    coordinator.control._battery_saver = True
+    stored = {
+        **coordinator._persisted_state(),
+        "last_checked_data": {"grid_import_total": 12500.0},
+        "last_checked_time": "2026-08-07T12:00:00+00:00",
+        "daily_energy_snapshots": {"grid_import_today": 10000.0},
+    }
+    del stored["energy_state_revision"]
+    coordinator.control._battery_saver = False
+    coordinator._store = SimpleNamespace(
+        async_load=AsyncMock(return_value=stored), async_delay_save=Mock()
+    )
+
+    asyncio.run(coordinator.async_load_persisted_state())
+
+    assert coordinator._last_checked_data == {}
+    assert coordinator._last_checked_time is None
+    assert coordinator._energy_processor.daily_snapshots == {}
+    assert coordinator.control.battery_saver_commanded is True
+
+    # Today's energy so far comes back from the device's own daily counter.
+    result = run_update(
+        coordinator,
+        {"grid_import_total": 12.5, "grid_import_today": 2.5},
+        datetime(2026, 8, 7, 12, 5, tzinfo=UTC),
+        monkeypatch,
+    )
+
+    assert result["grid_import_total"] == 12.5
+    assert result["grid_import_today"] == 2.5
+
+
+def test_control_state_is_persisted_with_the_coordinators(coordinator) -> None:
+    """The manager owns the values; the coordinator only carries them to the store."""
+    coordinator.control._battery_saver = True
+
+    stored = coordinator._persisted_state()
+    coordinator.control._battery_saver = False
+    coordinator._store = SimpleNamespace(async_load=AsyncMock(return_value=stored))
+
+    asyncio.run(coordinator.async_load_persisted_state())
+
+    assert coordinator.control.battery_saver_commanded is True
+
+
+def test_a_failed_cap_write_still_leaves_the_feed_mode_as_an_enum(
+    coordinator,
+) -> None:
+    """The enum sensor rejects a raw 0/1, and the mode is written before the cap."""
+    coordinator.control._grid_feed_restore = {"mode": 1, "power": 9000}
+    coordinator.control._async_require_control_authority = AsyncMock()
+    coordinator.async_set_updated_data = Mock(
+        side_effect=lambda data: setattr(coordinator, "data", data)
+    )
+    coordinator._modbus_client.async_read = AsyncMock(return_value=[0])
+    coordinator._modbus_client.async_write = AsyncMock(
+        side_effect=[None, HomeAssistantError("rejected")]
+    )
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(coordinator.control.async_set_grid_feed(False))
+
+    assert coordinator.data["grid_feed_mode"] is models.GridFeedMode.LIMITED
+
+
+def test_accepted_update_publishes_successful_coordinator_status(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    coordinator.async_get_raw_data = AsyncMock(return_value={"grid_import_total": 10.0})
+    coordinator._energy_processor.validate_totals = Mock(
+        return_value={"grid_import_total": 10.0}
+    )
+    coordinator._energy_processor.derive_daily = Mock(
+        side_effect=lambda data: (data, False)
+    )
+    coordinator._energy_processor.clamp_calculated = Mock(
+        side_effect=lambda data, _prev, **_: data
+    )
+    coordinator._ena_calc_solar_power = False
+    coordinator._store = None
+    monkeypatch.setattr(dt_util, "now", lambda: now)
+    monkeypatch.setattr(
+        TelemetryData,
+        "from_mapping",
+        Mock(return_value=object()),
+    )
+    monkeypatch.setattr(
+        coordinator_module, "calculate_derived_values", Mock(return_value={})
+    )
+
+    asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.status == models.CoordinatorStatus.SUCCESS
+    assert "coordinator_status" not in coordinator._last_checked_data
+
+
+def test_control_sees_the_derived_solar_power_not_the_raw_register(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The register reads 0 W on some inverters, which would read as a sunless day."""
+    now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    coordinator.async_get_raw_data = AsyncMock(
+        return_value={"solar_power": 0.0, "house_power": 900.0}
+    )
+    coordinator._energy_processor.validate_totals = Mock(
+        side_effect=lambda data, *_: dict(data)
+    )
+    coordinator._energy_processor.raw_daily_values = Mock(return_value={})
+    coordinator._energy_processor.derive_daily = Mock(
+        side_effect=lambda data: (data, False)
+    )
+    coordinator._energy_processor.clamp_calculated = Mock(
+        side_effect=lambda data, _prev, **_: data
+    )
+    coordinator._ena_calc_solar_power = True
+    coordinator.control.async_poll = AsyncMock()
+    monkeypatch.setattr(dt_util, "now", lambda: now)
+    monkeypatch.setattr(TelemetryData, "from_mapping", Mock(return_value=object()))
+    monkeypatch.setattr(
+        coordinator_module,
+        "calculate_derived_values",
+        Mock(return_value={"solar_power": 4200.0}),
+    )
+
+    asyncio.run(coordinator._async_update_data())
+
+    coordinator.control.async_poll.assert_awaited_once()
+    assert coordinator.control.async_poll.await_args.args[0]["solar_power"] == 4200.0
+
+
+def test_read_failure_raises_to_show_gap(coordinator) -> None:
+    coordinator._last_checked_data = {"grid_import_total": 10.0}
+    coordinator.async_get_raw_data = AsyncMock(return_value=None)
+
+    with pytest.raises(UpdateFailed):
+        asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.status == models.CoordinatorStatus.READ_FAILED
+    # The stale frame is not republished; entities go unavailable instead.
+    assert coordinator._last_checked_data == {"grid_import_total": 10.0}
+
+
+def test_reconnect_failure_updates_coordinator_status(coordinator) -> None:
+    coordinator.async_get_raw_data = AsyncMock(
+        side_effect=UpdateFailed("Reconnect failed")
+    )
+
+    with pytest.raises(UpdateFailed):
+        asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.status == models.CoordinatorStatus.RECONNECT_FAILED
+
+
+def test_a_failed_reconnect_retries_after_30_seconds(coordinator) -> None:
+    coordinator.async_get_raw_data = AsyncMock(
+        side_effect=UpdateFailed("Reconnect failed")
+    )
+
+    with pytest.raises(UpdateFailed) as raised:
+        asyncio.run(coordinator._async_update_data())
+
+    assert raised.value.retry_after == 30
+    assert "retrying in 30 s" in str(raised.value)
+
+
+def test_processing_failure_updates_coordinator_status(coordinator) -> None:
+    coordinator.async_get_raw_data = AsyncMock(return_value={})
+    coordinator._energy_processor.validate_totals = Mock(
+        side_effect=ValueError("Invalid data")
+    )
+
+    with pytest.raises(ValueError, match="Invalid data"):
+        asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.status == models.CoordinatorStatus.PROCESSING_FAILED
+
+
+def test_a_poll_over_its_budget_fails_and_drops_the_connection(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coordinator_module, "MODBUS_POLL_BUDGET_S", 0.01)
+
+    async def slow_read(*_args):
+        await asyncio.sleep(1)
+
+    coordinator._modbus_client.async_read = slow_read
+
+    with pytest.raises(UpdateFailed):
+        asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.status == models.CoordinatorStatus.READ_FAILED
+    coordinator._modbus_client.close.assert_called_once()
+    assert not coordinator.identity_verified
+
+
+def test_a_lost_socket_is_a_read_failure(coordinator) -> None:
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=ConnectionResetError("reset")
+    )
+
+    with pytest.raises(UpdateFailed):
+        asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.status == models.CoordinatorStatus.READ_FAILED
+    coordinator._modbus_client.close.assert_called_once()
+
+
+def test_a_bug_while_reading_is_raised_not_published_as_partial_data(
+    coordinator,
+) -> None:
+    coordinator._modbus_client.async_read = AsyncMock(side_effect=KeyError("bug"))
+
+    with pytest.raises(KeyError):
+        asyncio.run(coordinator._async_update_data())
+
+    coordinator._modbus_client.close.assert_not_called()
+
+
+def test_persisted_state_after_reload_clamps_total_reset(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stored = {
+        "last_checked_data": {"grid_import_total": 10.0},
+        "last_checked_time": "2026-08-07T11:59:30+00:00",
+    }
+    coordinator._store = SimpleNamespace(async_load=AsyncMock(return_value=stored))
+    asyncio.run(coordinator.async_load_persisted_state())
+
+    now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    result = validate_totals(coordinator, {"grid_import_total": 0.0}, now, monkeypatch)
+
+    assert result["grid_import_total"] == 10.0
+
+
+def test_initial_daily_snapshot_uses_device_daily_value(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = run_update(
+        coordinator,
+        {"grid_import_total": 1000.0, "grid_import_today": 5.0},
+        datetime(2026, 8, 7, 12, 0, tzinfo=UTC),
+        monkeypatch,
+    )
+
+    assert result["grid_import_today"] == 5.0
+    assert result["grid_import_today_raw"] == 5.0
+    assert coordinator._energy_processor.daily_snapshots["grid_import_today"] == 995.0
+
+
+def test_rolls_daily_counters_at_local_midnight(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    totals = {
+        "solar_total": 1000.0,
+        "grid_import_total": 500.0,
+        "grid_export_total": 300.0,
+        "bat_charged_total": 200.0,
+        "bat_discharged_total": 180.0,
+    }
+    # Initial observation seeds snapshot to current total; today starts at 0.0
+    before = run_update(
+        coordinator,
+        totals,
+        datetime(2026, 8, 27, 16, 0, 0, tzinfo=UTC),
+        monkeypatch,
+    )
+    # Energy grows on same date (8 kWh over 7 hours)
+    during = run_update(
+        coordinator,
+        {**totals, "solar_total": 1008.0},
+        datetime(2026, 8, 27, 23, 59, 55, tzinfo=UTC),
+        monkeypatch,
+    )
+    # Local date boundary crossed at 00:00:05 -> daily reset rolls
+    after = run_update(
+        coordinator,
+        {**totals, "solar_total": 1008.0},
+        datetime(2026, 8, 28, 0, 0, 5, tzinfo=UTC),
+        monkeypatch,
+    )
+    grown = run_update(
+        coordinator,
+        {**totals, "solar_total": 1008.01},
+        datetime(2026, 8, 28, 0, 0, 10, tzinfo=UTC),
+        monkeypatch,
+    )
+
+    assert before["solar_today"] == 0.0
+    assert during["solar_today"] == 8.0
+    assert after["solar_today"] == 0.0
+    assert grown["solar_today"] == 0.01
+    assert coordinator._energy_processor.last_rollover == datetime(
+        2026, 8, 28, 0, 0, 5, tzinfo=UTC
+    )
+
+
+def test_ignores_bogus_zero_device_registers(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replay: the daily device registers read a bogus 0 mid-day.
+
+    Derived daily values depend strictly on validated lifetime totals minus
+    midnight snapshots, so bogus device registers have no impact.
+    """
+    totals = {"solar_total": 1000.0, "bat_discharged_total": 180.0}
+    coordinator._energy_processor.last_rollover = datetime(
+        2026, 8, 27, 0, 0, 0, tzinfo=UTC
+    )
+    coordinator._energy_processor.daily_snapshots = {
+        "solar_today": 992.0,
+        "bat_discharged_today": 177.5,
+    }
+
+    result = run_update(
+        coordinator,
+        {**totals, "solar_today": 0.0, "bat_discharged_today": 0.0},
+        datetime(2026, 8, 27, 12, 0, 5, tzinfo=UTC),
+        monkeypatch,
+    )
+
+    assert result["solar_today"] == 8.0
+    assert result["bat_discharged_today"] == 2.5
+    assert result["solar_today_raw"] == 0.0
+
+
+def test_publishes_raw_device_daily_as_diagnostic(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The device's own register is published unmodified under a *_raw diagnostic key.
+    coordinator._energy_processor.last_rollover = datetime(
+        2026, 8, 27, 0, 0, 0, tzinfo=UTC
+    )
+    coordinator._energy_processor.daily_snapshots = {"solar_today": 990.0}
+
+    result = run_update(
+        coordinator,
+        {"solar_total": 1000.0, "solar_today": 9.5},
+        datetime(2026, 8, 27, 12, 0, 0, tzinfo=UTC),
+        monkeypatch,
+    )
+
+    assert result["solar_today"] == 10.0
+    assert result["solar_today_raw"] == 9.5
+
+
+def test_a_refresh_within_a_second_of_a_poll_keeps_the_grid_feed_mode(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second update reuses the first one's frame, where the mode is decoded."""
+    first = datetime(2026, 8, 27, 12, 0, 0, tzinfo=UTC)
+    frame = {"solar_total": 1000.0, "grid_feed_mode": 0.0}
+
+    run_update(coordinator, frame, first, monkeypatch)
+    result = run_update(coordinator, frame, first + timedelta(seconds=0.5), monkeypatch)
+
+    assert result["grid_feed_mode"] is models.GridFeedMode.LIMITED
+
+
+def test_clamps_derived_house_energy_rounding_jitter(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 21, 8, 24, 19, tzinfo=UTC)
+    previous = {
+        "solar_total": 104.0,
+        "grid_import_total": 102.0,
+        "bat_discharged_total": 101.0,
+        "grid_export_total": 100.5,
+        "bat_charged_total": 101.35,
+        "solar_today": 4.0,
+        "grid_import_today": 2.0,
+        "bat_discharged_today": 1.0,
+        "grid_export_today": 0.5,
+        "bat_charged_today": 1.35,
+        "house_energy_today": 5.15,
+    }
+    coordinator._last_checked_time = now - timedelta(seconds=5)
+    coordinator._last_checked_data = previous
+    coordinator._ena_calc_solar_power = False
+    coordinator._energy_processor.daily_snapshots = {
+        "solar_today": 100.0,
+        "grid_import_today": 100.0,
+        "bat_discharged_today": 100.0,
+        "grid_export_today": 100.0,
+        "bat_charged_today": 100.0,
+    }
+    coordinator.async_get_raw_data = AsyncMock(
+        return_value={
+            **previous,
+            "bat_charged_total": 101.36,
+            "bat_charged_today": 1.36,
+        }
+    )
+    monkeypatch.setattr(dt_util, "now", lambda: now)
+
+    result = asyncio.run(coordinator._async_update_data())
+
+    assert result["house_energy_today"] == 5.15
+
+
+def test_clamps_derived_house_energy_jitter_during_raw_counter_reset(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 21, 9, 10, 54, tzinfo=UTC)
+    previous = {
+        "solar_total": 105.63,
+        "grid_import_total": 100.0,
+        "bat_discharged_total": 100.0,
+        "grid_export_total": 100.0,
+        "bat_charged_total": 100.0,
+        "solar_today": 5.63,
+        "grid_import_today": 0.0,
+        "bat_discharged_today": 0.0,
+        "grid_export_today": 0.0,
+        "bat_charged_today": 0.0,
+        "house_energy_today": 5.63,
+    }
+    coordinator._last_checked_time = now - timedelta(seconds=5)
+    coordinator._last_checked_data = previous
+    coordinator._ena_calc_solar_power = False
+    coordinator._energy_processor.daily_snapshots = {
+        "solar_today": 100.0,
+        "grid_import_today": 100.0,
+        "bat_discharged_today": 100.0,
+        "grid_export_today": 100.0,
+        "bat_charged_today": 100.0,
+    }
+    coordinator.async_get_raw_data = AsyncMock(
+        return_value={**previous, "solar_today": 5.62}
+    )
+    monkeypatch.setattr(dt_util, "now", lambda: now)
+
+    result = asyncio.run(coordinator._async_update_data())
+
+    assert result["house_energy_today"] == 5.63
+
+
+def test_replays_daily_register_flap_without_spike(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replay: the device reset its daily registers at local
+    midnight, but around 00:00 UTC (02:00 CEST) a ghost of yesterday's values
+    flaps onto the daily registers for several polls. The published daily
+    sensors derive from the lifetime counters and must not follow the ghost.
+    """
+    totals = {
+        "solar_total": 12408.0,
+        "grid_import_total": 820.55,
+        "grid_export_total": 9640.02,
+        "bat_charged_total": 3120.4,
+        "bat_discharged_total": 2980.11,
+    }
+    ghost_of_yesterday = {
+        "solar_today": 62.09,
+        "grid_import_today": 0.03,
+        "grid_export_today": 42.58,
+        "bat_charged_today": 7.35,
+        "bat_discharged_today": 6.43,
+    }
+    new_day = {
+        "solar_today": 0.0,
+        "grid_import_today": 0.0,
+        "grid_export_today": 0.01,
+        "bat_charged_today": 0.0,
+        "bat_discharged_today": 0.51,
+    }
+
+    # The reset happened at local midnight, two hours earlier.
+    coordinator._energy_processor.last_rollover = datetime(
+        2026, 8, 28, 0, 0, 2, tzinfo=UTC
+    )
+    coordinator._energy_processor.daily_snapshots = {
+        "solar_today": 12408.0,
+        "grid_import_today": 820.55,
+        "grid_export_today": 9640.02,
+        "bat_charged_today": 3120.4,
+        "bat_discharged_today": 2979.60,
+    }
+    now = datetime(2026, 8, 28, 1, 59, 57, tzinfo=UTC)
+    previous = run_update(coordinator, {**totals, **new_day}, now, monkeypatch)
+    assert previous["solar_today"] == 0.0
+    assert previous["bat_discharged_today"] == 0.51
+
+    flap = [ghost_of_yesterday] * 3 + [new_day] * 3 + [ghost_of_yesterday] * 3
+    for raw_dailies in flap:
+        now += timedelta(seconds=2)
+        # The battery keeps discharging slowly through the night.
+        totals["bat_discharged_total"] = round(totals["bat_discharged_total"] + 0.01, 2)
+        published = run_update(coordinator, {**totals, **raw_dailies}, now, monkeypatch)
+
+        for key in new_day:
+            delta = published[key] - previous[key]
+            assert 0 <= round(delta, 2) <= 0.02, f"{key} moved by {delta}"
+        assert published["house_energy_today"] >= previous["house_energy_today"] >= 0
+        previous = published
+
+    # The ghost never made it through: still the new day's small values.
+    assert previous["solar_today"] == 0.0
+    assert previous["bat_discharged_today"] == 0.6
+
+
+def test_replays_hours_long_total_read_gap_with_clean_recovery(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replay of the reported statistics gap: solar_total reads failed for
+    ~9 h overnight. Published values must hold the last validated value while
+    the device's reset cannot be confirmed, then roll and accept the first
+    genuine reading the next morning.
+    """
+    coordinator._energy_processor.last_rollover = datetime(
+        2026, 8, 27, 0, 0, 0, tzinfo=UTC
+    )
+    coordinator._energy_processor.daily_snapshots = {"solar_today": 12388.0}
+
+    seeded = run_update(
+        coordinator,
+        {"solar_total": 12408.0, "solar_today": 20.0},
+        datetime(2026, 8, 27, 21, 0, 0, tzinfo=UTC),
+        monkeypatch,
+    )
+    assert seeded["solar_today"] == 20.0
+
+    for hour in (22, 23):
+        held = run_update(
+            coordinator,
+            {"solar_total": None, "solar_today": None},
+            datetime(2026, 8, 27, hour, 0, 0, tzinfo=UTC),
+            monkeypatch,
+        )
+        assert held["solar_total"] == 12408.0
+        assert held["solar_today"] == 20.0
+
+    past_midnight = run_update(
+        coordinator,
+        {"solar_total": None, "solar_today": None},
+        datetime(2026, 8, 28, 0, 30, 0, tzinfo=UTC),
+        monkeypatch,
+    )
+    assert past_midnight["solar_total"] == 12408.0
+    assert past_midnight["solar_today"] == 0.0
+
+    recovered = run_update(
+        coordinator,
+        {"solar_total": 12408.01, "solar_today": 0.01},
+        datetime(2026, 8, 28, 6, 20, 0, tzinfo=UTC),
+        monkeypatch,
+    )
+    assert recovered["solar_total"] == 12408.01
+    assert recovered["solar_today"] == 0.01
+
+
+def test_floors_derived_house_energy_at_zero_without_baseline(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 26, 12, 0, 4, tzinfo=UTC)
+    raw = {
+        "solar_total": 100.0,
+        "grid_import_total": 100.04,
+        "bat_discharged_total": 100.76,
+        "grid_export_total": 100.01,
+        "bat_charged_total": 107.75,
+        "solar_today": 0.0,
+        "grid_import_today": 0.04,
+        "bat_discharged_today": 0.76,
+        "grid_export_today": 0.01,
+        "bat_charged_today": 7.75,
+    }
+    coordinator._last_checked_time = None
+    coordinator._last_checked_data = {}
+    coordinator._ena_calc_solar_power = False
+    coordinator._energy_processor.daily_snapshots = {
+        "solar_today": 100.0,
+        "grid_import_today": 100.0,
+        "bat_discharged_today": 100.0,
+        "grid_export_today": 100.0,
+        "bat_charged_today": 100.0,
+    }
+    coordinator.async_get_raw_data = AsyncMock(return_value=dict(raw))
+    monkeypatch.setattr(dt_util, "now", lambda: now)
+
+    result = asyncio.run(coordinator._async_update_data())
+
+    assert result["house_energy_today"] == 0
+
+
+def test_gets_and_decodes_raw_data(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = models.RegisterBlock(
+        (
+            models.RegisterDef("battery_count", 100, models.RegisterType.UINT16),
+            models.RegisterDef("grid_power", 101, models.RegisterType.UINT16),
+        )
+    )
+    coordinator._register_blocks = (block,)
+    decode_register = Mock(side_effect=(2.0, 42.0))
+    monkeypatch.setattr(coordinator_module, "decode_register", decode_register)
+    coordinator._modbus_client.connected = True
+    coordinator._modbus_client.async_read = AsyncMock(return_value=[2, 42])
+
+    result = asyncio.run(coordinator.async_get_raw_data())
+
+    assert result == {"battery_count": 2.0, "grid_power": 42.0}
+    coordinator._modbus_client.async_read.assert_awaited_once_with(100, 2)
+
+
+def _float_words(value: float, high_word_first: bool) -> list[int]:
+    high, low = struct.unpack(">HH", struct.pack(">f", value))
+    return [high, low] if high_word_first else [low, high]
+
+
+def _read_energy_and_power(coordinator, model: models.InverterModel, energy, power):
+    coordinator.inverter_model = model
+    coordinator._register_blocks = (
+        models.RegisterBlock(
+            (
+                models.RegisterDef("solar_today", 100),
+                models.RegisterDef("grid_power", 102),
+            )
+        ),
+    )
+    high_word_first = model.traits.high_word_first
+    coordinator._modbus_client.connected = True
+    coordinator._modbus_client.async_read = AsyncMock(
+        return_value=[
+            *_float_words(energy, high_word_first),
+            *_float_words(power, high_word_first),
+        ]
+    )
+    return asyncio.run(coordinator.async_get_raw_data())
+
+
+def test_reads_ocean_2_energy_counters_as_kilowatt_hours(coordinator) -> None:
+    """The three-phase Ocean 2 reports its energy counters in Wh."""
+    result = _read_energy_and_power(
+        coordinator, models.InverterModel.OCEAN_2_THREE_PHASE, 11840.0, 517.0
+    )
+
+    assert result == {"solar_today": 11.84, "grid_power": 517.0}
+
+
+def test_other_models_report_energy_counters_in_kilowatt_hours(coordinator) -> None:
+    result = _read_energy_and_power(
+        coordinator, models.InverterModel.POWEROCEAN_PLUS, 11.84, 517.0
+    )
+
+    assert result == {"solar_today": 11.84, "grid_power": 517.0}
+
+
+def test_every_device_energy_counter_is_read_from_a_register() -> None:
+    """The Wh conversion applies to what the coordinator reads, so each counter
+    the device reports has to be a register."""
+    assert const.DEVICE_ENERGY_KEYS
+    assert const.REGISTERS_BY_KEY.keys() >= const.DEVICE_ENERGY_KEYS
+
+
+def test_modbus_disabled_recovers_when_telemetry_returns(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    block = models.RegisterBlock(
+        (
+            models.RegisterDef("battery_count", 100, models.RegisterType.UINT16),
+            models.RegisterDef("inverter_rated_power", 101, models.RegisterType.UINT16),
+            models.RegisterDef("limit_inv_max", 102, models.RegisterType.UINT16),
+        )
+    )
+    coordinator._register_blocks = (block,)
+    disabled_frame = (0.0, 0.0, 0.0)
+    enabled_frame = (2.0, 6000.0, 5000.0)
+    decode_register = Mock(
+        side_effect=disabled_frame * const.MODBUS_DISABLED_READ_THRESHOLD
+        + enabled_frame
+    )
+    monkeypatch.setattr(coordinator_module, "decode_register", decode_register)
+    coordinator._modbus_client.connected = True
+    coordinator._modbus_client.async_read = AsyncMock(return_value=[0, 0, 0])
+    coordinator.identity.serial_number = "R123456789"
+
+    for _ in range(const.MODBUS_DISABLED_READ_THRESHOLD - 1):
+        asyncio.run(coordinator.async_get_raw_data())
+        assert coordinator.is_modbus_disabled is False
+
+    assert asyncio.run(coordinator.async_get_raw_data()) == {
+        "battery_count": 0.0,
+        "inverter_rated_power": 0.0,
+        "limit_inv_max": 0.0,
+    }
+    assert coordinator.is_modbus_disabled is True
+
+    assert asyncio.run(coordinator.async_get_raw_data()) == {
+        "battery_count": 2.0,
+        "inverter_rated_power": 6000.0,
+        "limit_inv_max": 5000.0,
+    }
+    assert coordinator.is_modbus_disabled is False
+
+
+@pytest.mark.parametrize(
+    "registers",
+    (
+        *(
+            tuple(
+                register
+                for block in const.register_blocks_for(inverter_model)
+                for register in block.registers
+            )
+            for inverter_model in models.InverterModel
+        ),
+        const.DEVICE_INFO_BLOCK.registers,
+    ),
+    ids=(*models.InverterModel, "device-info"),
+)
+def test_registers_do_not_overlap(registers: tuple[models.RegisterDef, ...]) -> None:
+    """A multi-word register must not extend into the next register's address."""
+    ordered = sorted(registers, key=lambda register: register.address)
+
+    for register, following in itertools.pairwise(ordered):
+        assert register.end <= following.address, (
+            f"{register.key} at {register.address} spans {register.size} words "
+            f"and overlaps {following.key} at {following.address}"
+        )
+
+
+@pytest.mark.parametrize("inverter_model", models.InverterModel)
+def test_blocks_cover_every_register_word_they_map(
+    inverter_model: models.InverterModel,
+) -> None:
+    """Every register must decode from inside the block that was read for it."""
+    for block in const.register_blocks_for(inverter_model):
+        for register in block.registers:
+            index = block.index_of(register)
+
+            assert index >= 0, (
+                f"{register.key} at {register.address} sits before the start of "
+                f"its block at {block.start}"
+            )
+            assert index + register.size <= block.count, (
+                f"{register.key} needs words {index}-{index + register.size - 1} "
+                f"but the block at {block.start} only reads {block.count}"
+            )
+
+
+@pytest.mark.parametrize("inverter_model", models.InverterModel)
+def test_both_feed_in_caps_are_read_on_every_model(
+    inverter_model: models.InverterModel,
+) -> None:
+    """40538 is the configured cap and 40609 the effective one."""
+    addresses = {
+        register.key: register.address
+        for block in const.register_blocks_for(inverter_model)
+        for register in block.registers
+    }
+
+    assert addresses[const.FEED_IN_POWER_MAX_SETTING_KEY] == 40538
+    assert addresses[const.FEED_IN_POWER_MAX_EFFECTIVE_KEY] == 40609
+
+
+def test_the_plus_gets_no_feed_in_sensor_that_reads_zero_on_it() -> None:
+    plus = models.InverterModel.POWEROCEAN_PLUS
+    hidden = {
+        sensor.key for sensor in const.SENSOR_MAP if plus in sensor.unsupported_models
+    }
+
+    assert {
+        const.FEED_IN_POWER_MAX_EFFECTIVE_KEY,
+        "feed_in_power_max_percent",
+    } <= hidden
+    assert const.FEED_IN_POWER_MAX_SETTING_KEY not in hidden
+
+
+def test_the_feed_in_cap_is_written_to_the_configured_register(coordinator) -> None:
+    """The PowerOcean refuses writes to 40609, and 40538 is the one configured."""
+    coordinator.async_set_updated_data = Mock()
+    coordinator._modbus_client.async_read = AsyncMock(return_value=[0, 0])
+    register = coordinator._registers_by_key[const.FEED_IN_POWER_MAX_SETTING_KEY]
+
+    asyncio.run(coordinator._async_write_register(register, 0))
+
+    assert coordinator._modbus_client.async_write.await_args.args[0] == 40538
+    coordinator._modbus_client.async_read.assert_awaited_once_with(40538, 2)
+
+
+def test_writable_numbers_write_to_the_register_they_read() -> None:
+    for number in const.WRITABLE_NUMBERS_MAP:
+        expected = const.REGISTERS_BY_KEY[number.read_key].address
+
+        assert number.register == expected, (
+            f"{number.key} writes to {number.register} but reads "
+            f"{number.read_key} from {expected}"
+        )
+
+
+def test_raw_daily_sensors_exist_only_for_device_read_values() -> None:
+    """The processor only echoes dailies backed by a total, so entities must match."""
+    produced = EnergyProcessor.raw_daily_values(
+        {energy_sensor.key: 1.0 for energy_sensor in const.ENERGY_SENSOR_MAP}
+    )
+
+    assert {sensor.key for sensor in const.DAILY_ENERGY_SENSORS_DEVICE_RAW} == set(
+        produced
+    )
+
+
+def test_enum_sensors_declare_their_options() -> None:
+    for sensor in const.SENSOR_MAP:
+        if sensor.device_class == "enum":
+            assert sensor.options, f"{sensor.key} is an enum without options"
+
+
+def _device_info_registers(
+    serial: str = "R371ZAS2TEST0002",
+    product_number: int = 3,
+    product_category: int = 1,
+    firmware: int = 0x03001313,
+) -> list[int]:
+    registers = [0] * const.DEVICE_INFO_BLOCK.count
+    registers[const.DEVICE_INFO_BLOCK.index_of(const.PRODUCT_CATEGORY)] = (
+        product_category
+    )
+    registers[const.DEVICE_INFO_BLOCK.index_of(const.PRODUCT_NUMBER)] = product_number
+    serial_index = const.DEVICE_INFO_BLOCK.index_of(const.SERIAL_NUMBER)
+    for offset in range(const.SERIAL_NUMBER.size):
+        high, low = serial[offset * 2], serial[offset * 2 + 1]
+        registers[serial_index + offset] = (ord(high) << 8) | ord(low)
+    firmware_index = const.DEVICE_INFO_BLOCK.index_of(const.FIRMWARE_VERSION)
+    registers[firmware_index] = firmware & 0xFFFF
+    registers[firmware_index + 1] = firmware >> 16
+    return registers
+
+
+def test_reads_the_device_info_block_then_the_extra_registers(coordinator) -> None:
+    coordinator.inverter_model = models.InverterModel.POWEROCEAN_PLUS
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=[_device_info_registers(), [0x0001], [1]]
+    )
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert coordinator.identity == models.DeviceIdentity(
+        serial_number="R371ZAS2TEST0002",
+        firmware_version="3.0.19.19",
+        product_number=3,
+        product_category=1,
+        protocol_version=0x0001,
+        device_address=1,
+    )
+    # The block first, then the protocol version and device address on their own.
+    reads = coordinator._modbus_client.async_read.await_args_list
+    assert [call.args for call in reads] == [(40002, 12), (40001, 1), (40014, 1)]
+
+
+def test_reads_device_info_of_a_three_phase_ocean_2(coordinator) -> None:
+    """A configured Ocean 2 is read high word first."""
+    registers = _device_info_registers(product_number=4, product_category=1)
+    firmware_index = const.DEVICE_INFO_BLOCK.index_of(const.FIRMWARE_VERSION)
+    registers[firmware_index], registers[firmware_index + 1] = 0x0100, 0x034F
+    coordinator.inverter_model = models.InverterModel.OCEAN_2_THREE_PHASE
+    coordinator._modbus_client.async_read = AsyncMock(return_value=registers)
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert coordinator.identity.firmware_version == "1.0.3.79"
+
+
+def test_the_configured_model_decides_how_the_device_is_read(coordinator) -> None:
+    """What the device reports only pre-fills the config flow.
+
+    A PowerOcean configured by hand stays a PowerOcean even when the product
+    registers say Ocean 2, so its words are still read low word first.
+    """
+    registers = _device_info_registers(product_number=4, product_category=1)
+    firmware_index = const.DEVICE_INFO_BLOCK.index_of(const.FIRMWARE_VERSION)
+    registers[firmware_index], registers[firmware_index + 1] = 0x034F, 0x0100
+    coordinator.inverter_model = models.InverterModel.POWEROCEAN_PLUS
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=[registers, [0x0100], [1]]
+    )
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert coordinator.identity.firmware_version == "1.0.3.79"
+
+
+def test_a_failed_device_info_read_leaves_the_connection_to_the_poll(
+    coordinator,
+) -> None:
+    """It runs on every reconnect, so closing here would fail the poll after it."""
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=ModbusException("boom")
+    )
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert coordinator.identity.serial_number == "unknown"
+    coordinator._modbus_client.close.assert_not_called()
+
+
+def test_a_failed_device_info_read_keeps_what_was_known(coordinator) -> None:
+    coordinator.identity.serial_number = "R371ZAS2TEST0002"
+    coordinator.identity.firmware_version = "3.0.19.19"
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=ModbusException("timeout")
+    )
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert coordinator.identity.serial_number == "R371ZAS2TEST0002"
+    assert coordinator.identity.firmware_version == "3.0.19.19"
+
+
+def test_a_refused_protocol_version_leaves_the_rest_of_the_device_info(
+    coordinator,
+) -> None:
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=[
+            _device_info_registers(),
+            ModbusException("illegal address"),
+            [1],
+        ]
+    )
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert coordinator.identity.serial_number == "R371ZAS2TEST0002"
+    assert coordinator.identity.protocol_version is None
+    assert coordinator._device_info_values() == {
+        "protocol_version": None,
+        "device_address": 1,
+    }
+
+
+def test_a_reconnect_reads_the_device_info_again(coordinator) -> None:
+    """A firmware update reboots the inverter, and the first connect may have failed."""
+    coordinator._modbus_client.async_reconnect = AsyncMock(return_value=True)
+    coordinator.async_read_device_info = AsyncMock()
+
+    assert asyncio.run(coordinator.async_reconnect()) is True
+    coordinator.async_read_device_info.assert_awaited_once()
+
+
+@pytest.mark.parametrize("inverter_model", models.InverterModel)
+def test_read_plan_is_not_split_more_than_necessary(
+    inverter_model: models.InverterModel,
+) -> None:
+    """Neighbouring blocks must be unmergeable, so no poll wastes a round trip."""
+    blocks = sorted(const.register_blocks_for(inverter_model), key=lambda b: b.start)
+    for block, following in itertools.pairwise(blocks):
+        end = block.start + block.count
+        gap = following.start - end
+        merged = following.start + following.count - block.start
+
+        # Optional registers are kept apart from required ones on purpose: on a
+        # model that rejects reads over unimplemented addresses always, and on the
+        # others where joining would widen a required read.
+        isolated = block.optional != following.optional
+        assert (
+            gap > inverter_model.traits.max_register_gap
+            or merged > models.MAX_REGISTERS_PER_READ
+            or end <= const.HEARTBEAT_REGISTER < following.start
+            or isolated
+        ), (
+            f"blocks at {block.start} and {following.start} are only {gap} words "
+            f"apart and would merge into {merged} words, so they should be one read"
+        )
+
+
+@pytest.mark.parametrize("inverter_model", models.InverterModel)
+def test_the_heartbeat_register_is_never_read_by_a_poll(
+    inverter_model: models.InverterModel,
+) -> None:
+    """The effective feed-in cap sits one register past it, and the inverter answers
+    a write to a register it is serving a read for with "busy"."""
+    for block in const.register_blocks_for(inverter_model):
+        assert not (
+            block.start <= const.HEARTBEAT_REGISTER < block.start + block.count
+        ), f"the block at {block.start} reads {const.HEARTBEAT_REGISTER}"
+
+
+@pytest.mark.parametrize("inverter_model", models.InverterModel)
+def test_read_plan_never_reaches_further_than_the_model_allows(
+    inverter_model: models.InverterModel,
+) -> None:
+    """A read must not reach over more unmapped addresses than the device tolerates."""
+    for block in const.register_blocks_for(inverter_model):
+        end = block.start
+        for register in block.registers:
+            gap = register.address - end
+
+            assert gap <= inverter_model.traits.max_register_gap, (
+                f"the read at {block.start} reaches over {gap} unmapped words to "
+                f"{register.key} at {register.address}, which {inverter_model} refuses"
+            )
+            end = max(end, register.end)
+
+
+def test_block_rejects_more_registers_than_a_modbus_read_allows() -> None:
+    with pytest.raises(ValueError, match="more than the 125"):
+        models.RegisterBlock(
+            (
+                models.RegisterDef("first", 40000, models.RegisterType.UINT16),
+                models.RegisterDef("last", 40200, models.RegisterType.UINT16),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("product_number", "product_category", "expected"),
+    (
+        (1, 1, models.InverterModel.POWEROCEAN_THREE_PHASE),
+        (1, 2, models.InverterModel.POWEROCEAN_SINGLE_PHASE),
+        # The single-phase Ocean 2 reports the same 2 as the PowerOcean single phase.
+        (2, 2, models.InverterModel.POWEROCEAN_SINGLE_PHASE),
+        (3, 1, models.InverterModel.POWEROCEAN_PLUS),
+        (4, 1, models.InverterModel.OCEAN_2_THREE_PHASE),
+        (4, 2, models.InverterModel.OCEAN_2_SINGLE_PHASE),
+        (0, 1, None),
+        (None, None, None),
+    ),
+)
+def test_detects_inverter_model_from_product_info(
+    product_number: int | None,
+    product_category: int | None,
+    expected: models.InverterModel | None,
+) -> None:
+    assert (
+        models.InverterModel.from_product_info(product_number, product_category)
+        == expected
+    )
+
+
+def test_raw_data_raises_when_reconnect_fails(coordinator) -> None:
+    coordinator._modbus_client.connected = False
+    coordinator.async_reconnect = AsyncMock(return_value=False)
+
+    with pytest.raises(UpdateFailed, match="Reconnect failed"):
+        asyncio.run(coordinator.async_get_raw_data())
+
+
+# ── Optional registers ────────────────────────────────────────────────────────
+
+
+def _optional_block_coordinator(coordinator):
+    """A coordinator on an Ocean 2, with one required and one optional block."""
+    coordinator.inverter_model = models.InverterModel.OCEAN_2_THREE_PHASE
+    coordinator._modbus_client.connected = True
+    coordinator._register_blocks = (
+        models.RegisterBlock(
+            (models.RegisterDef("battery_soc", 40527, models.RegisterType.UINT16),)
+        ),
+        models.RegisterBlock(
+            (
+                models.RegisterDef(
+                    "feed_in_power_max_percent",
+                    40573,
+                    models.RegisterType.UINT16,
+                    optional=True,
+                ),
+                models.RegisterDef(
+                    "battery_voltage_probe",
+                    40574,
+                    models.RegisterType.UINT16,
+                    optional=True,
+                ),
+            )
+        ),
+    )
+    return coordinator
+
+
+def test_a_refused_optional_block_is_probed_register_by_register(coordinator) -> None:
+    """One register the firmware lacks must not blank the rest of the poll."""
+    _optional_block_coordinator(coordinator)
+    rejected = ModbusReadRejected("illegal", exception_code=2)
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=[[55], rejected, rejected, [30]]
+    )
+
+    data = asyncio.run(coordinator.async_get_raw_data())
+
+    assert data == {
+        "battery_soc": 55.0,
+        "feed_in_power_max_percent": None,
+        "battery_voltage_probe": 30.0,
+    }
+    assert coordinator.unsupported_registers == {"feed_in_power_max_percent"}
+    polled = {
+        register.key
+        for block in coordinator._register_blocks
+        for register in block.registers
+    }
+    assert "feed_in_power_max_percent" not in polled
+    coordinator._modbus_client.close.assert_not_called()
+
+
+def test_a_busy_optional_block_is_skipped_for_one_poll_only(coordinator) -> None:
+    """Device busy says nothing about whether the register exists."""
+    _optional_block_coordinator(coordinator)
+    busy = ModbusReadRejected("busy", exception_code=6)
+    coordinator._modbus_client.async_read = AsyncMock(side_effect=[[55], busy])
+
+    data = asyncio.run(coordinator.async_get_raw_data())
+
+    assert data == {
+        "battery_soc": 55.0,
+        "feed_in_power_max_percent": None,
+        "battery_voltage_probe": None,
+    }
+    assert coordinator.unsupported_registers == frozenset()
+    coordinator._modbus_client.close.assert_not_called()
+
+
+def test_a_refused_required_block_still_fails_the_poll(coordinator) -> None:
+    _optional_block_coordinator(coordinator)
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=ModbusReadRejected("illegal", exception_code=2)
+    )
+
+    assert asyncio.run(coordinator.async_get_raw_data()) is None
+    coordinator._modbus_client.close.assert_called_once()
+
+
+@pytest.mark.parametrize("inverter_model", models.InverterModel)
+def test_optional_registers_share_no_read_where_the_model_rejects_them(
+    inverter_model: models.InverterModel,
+) -> None:
+    for block in const.register_blocks_for(inverter_model):
+        kinds = {register.optional for register in block.registers}
+        if inverter_model.traits.rejects_unimplemented:
+            assert len(kinds) == 1, f"block at {block.start} mixes optional registers"
+
+
+def test_the_powerocean_reads_optional_registers_without_extra_requests() -> None:
+    """They sit inside the live block, which reads through unmapped addresses.
+
+    The Grid Connection Code lies before it, so it gets a read of its own rather
+    than widening the one the poll depends on.
+    """
+    optional_keys = {
+        register.key
+        for register in const.MODBUS_REGISTERS
+        if register.optional and register.key != "grid_connection_code"
+    }
+    optional_keys.add("grid_connection_code")
+    model = models.InverterModel.POWEROCEAN_PLUS
+
+    assert len(const.register_blocks_for(model)) == 1 + len(
+        const.register_blocks_for(model, exclude=optional_keys)
+    )
+
+
+def test_the_powerocean_reads_the_new_diagnostic_registers_in_its_live_block() -> None:
+    """They sit inside reads the PowerOcean already makes."""
+    keys = {
+        register.key
+        for block in const.register_blocks_for(models.InverterModel.POWEROCEAN_PLUS)
+        for register in block.registers
+    }
+
+    assert {"grid_voltage_l1", "inverter_ac_out_total"} <= keys
+
+
+# ── Identity check ────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def issues(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    created, deleted = Mock(), Mock()
+    monkeypatch.setattr(ir, "async_create_issue", created)
+    monkeypatch.setattr(ir, "async_delete_issue", deleted)
+    return SimpleNamespace(created=created, deleted=deleted)
+
+
+def _device_info_reads(serial: str) -> AsyncMock:
+    return AsyncMock(side_effect=[_device_info_registers(serial=serial), [1], [1]])
+
+
+def test_the_expected_serial_verifies_the_device_and_allows_writes(
+    coordinator, issues
+) -> None:
+    coordinator._identity_verified = False
+    coordinator._modbus_client.async_read = _device_info_reads("R371ZAS2TEST0002")
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert coordinator.identity_verified
+    coordinator._modbus_client.allow_writes.assert_called_once()
+    issues.created.assert_not_called()
+
+
+def test_another_serial_blocks_writes_and_keeps_the_known_identity(
+    coordinator, issues
+) -> None:
+    coordinator.identity.serial_number = "R371ZAS2TEST0002"
+    coordinator._modbus_client.async_read = _device_info_reads("R371ZD1AZH3X9999")
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert not coordinator.identity_verified
+    assert coordinator.identity.serial_number == "R371ZAS2TEST0002"
+    key, placeholders = coordinator._modbus_client.block_writes.call_args.args
+    assert key == "identity_mismatch"
+    assert placeholders["found"] == "R371ZD1AZH3X9999"
+    coordinator._modbus_client.allow_writes.assert_not_called()
+    issues.created.assert_called_once()
+    assert issues.created.call_args.kwargs["translation_key"] == "identity_mismatch"
+
+
+@pytest.mark.usefixtures("issues")
+def test_a_poll_against_another_device_fails_without_reading_telemetry(
+    coordinator,
+) -> None:
+    coordinator._identity_verified = False
+    coordinator._modbus_client.async_read = _device_info_reads("R371ZD1AZH3X9999")
+
+    with pytest.raises(coordinator_module.IdentityMismatch):
+        asyncio.run(coordinator._async_update_data())
+
+    assert coordinator.status is models.CoordinatorStatus.IDENTITY_MISMATCH
+    # Only the device info block; no telemetry.
+    assert coordinator._modbus_client.async_read.await_count == 1
+
+
+def test_the_right_device_coming_back_clears_the_mismatch(coordinator, issues) -> None:
+    coordinator._modbus_client.async_read = _device_info_reads("R371ZD1AZH3X9999")
+    asyncio.run(coordinator.async_read_device_info())
+
+    coordinator._modbus_client.async_read = _device_info_reads("R371ZAS2TEST0002")
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert coordinator.identity_verified
+    issues.deleted.assert_called_once()
+
+
+@pytest.mark.usefixtures("issues")
+def test_an_unreadable_serial_keeps_a_known_device_unverified(coordinator) -> None:
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=ModbusException("timeout")
+    )
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert not coordinator.identity_verified
+    coordinator._modbus_client.allow_writes.assert_not_called()
+
+
+@pytest.mark.usefixtures("issues")
+def test_an_entry_without_a_known_serial_pins_the_first_one_seen(coordinator) -> None:
+    coordinator.config_entry.unique_id = "192.0.2.10:502"
+    coordinator._modbus_client.async_read = _device_info_reads("R371ZAS2TEST0002")
+    asyncio.run(coordinator.async_read_device_info())
+    assert coordinator.identity_verified
+
+    coordinator._modbus_client.async_read = _device_info_reads("R371ZD1AZH3X9999")
+    asyncio.run(coordinator.async_read_device_info())
+    assert not coordinator.identity_verified
+
+
+@pytest.mark.usefixtures("issues")
+def test_an_entry_without_a_known_serial_stays_usable_when_none_is_readable(
+    coordinator,
+) -> None:
+    coordinator.config_entry.unique_id = "192.0.2.10:502"
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=ModbusException("timeout")
+    )
+
+    asyncio.run(coordinator.async_read_device_info())
+
+    assert coordinator.identity_verified
+
+
+@pytest.mark.usefixtures("issues")
+def test_a_failed_poll_asks_for_the_serial_again(coordinator) -> None:
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=ModbusException("timeout")
+    )
+
+    with pytest.raises(UpdateFailed):
+        asyncio.run(coordinator._async_update_data())
+
+    assert not coordinator.identity_verified
+    coordinator._modbus_client.block_writes.assert_called()
+
+
+def test_a_bogus_zero_on_the_first_poll_does_not_hold_back_the_real_total(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#169, FFreund3: the first solar read was 0, then the real 4,296.8 kWh.
+
+    Before, the 0 became the baseline and the real total was held for days,
+    with solar today at 0 and house energy negative.
+    """
+    now = datetime(2026, 10, 10, 9, 31, tzinfo=UTC)
+    first = run_update(
+        coordinator, {"solar_total": 0.0, "solar_today": 0.0}, now, monkeypatch
+    )
+    assert first["solar_total"] == 0.0
+
+    second = run_update(
+        coordinator,
+        {"solar_total": 4296.8, "solar_today": 12.5},
+        now + timedelta(seconds=5),
+        monkeypatch,
+    )
+    assert second["solar_total"] == 0.0
+    assert second["solar_total_raw"] == 4296.8
+
+    third = run_update(
+        coordinator,
+        {"solar_total": 4296.81, "solar_today": 12.51},
+        now + timedelta(seconds=10),
+        monkeypatch,
+    )
+
+    assert third["solar_total"] == 4296.81
+    assert third["solar_today"] == 12.51
+
+
+def test_a_counter_from_a_2_4_0_state_file_is_not_stuck_after_upgrade(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state file from 2.4.0 has no energy_accepted_at.
+
+    The first poll after the upgrade comes back without the energy registers, so
+    the counters are filled from the saved baseline; the polls after must still
+    accept the device's counters again.
+    """
+    saved = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
+    coordinator._store = SimpleNamespace(
+        async_load=AsyncMock(
+            return_value={
+                "last_checked_data": {"solar_total": 19903.49},
+                "last_checked_time": saved.isoformat(),
+            }
+        )
+    )
+    asyncio.run(coordinator.async_load_persisted_state())
+    coordinator._store = None
+
+    now = saved + timedelta(minutes=10)
+    result = run_update(coordinator, {"battery_soc": 50.0}, now, monkeypatch)
+    assert result["solar_total"] == 19903.49
+
+    solar = 19904.10
+    for _ in range(3):
+        now += timedelta(seconds=5)
+        solar = round(solar + 0.01, 2)
+        result = run_update(coordinator, {"solar_total": solar}, now, monkeypatch)
+
+    assert result["solar_total"] == solar
+
+
+def _hold_export(coordinator, monkeypatch, now: datetime) -> dict[str, float]:
+    """Poll once with the device's export counter below the held total."""
+    return run_update(coordinator, {"grid_export_total": 507.5}, now, monkeypatch)
+
+
+@pytest.fixture
+def held_for_a_month(coordinator) -> datetime:
+    """Export held at 1,548.73 kWh, last accepted 30 days ago, as for MaxGrmm."""
+    accepted = datetime(2026, 9, 16, 21, 48, tzinfo=UTC)
+    now = accepted + timedelta(days=30)
+    coordinator._energy_processor.accepted_at = {"grid_export_total": accepted}
+    coordinator._last_checked_data = {"grid_export_total": 1548.73}
+    coordinator._last_checked_time = now - timedelta(seconds=5)
+    coordinator.async_request_refresh = AsyncMock()
+    return now
+
+
+def test_a_total_held_for_over_a_day_raises_a_fixable_issue_once(
+    coordinator, issues, held_for_a_month: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = held_for_a_month
+    for poll in range(3):
+        _hold_export(coordinator, monkeypatch, now + poll * timedelta(seconds=5))
+
+    issues.created.assert_called_once()
+    _, kwargs = issues.created.call_args
+    assert kwargs["is_fixable"] is True
+    assert kwargs["translation_key"] == "energy_totals_held"
+    assert kwargs["data"] == {"entry_id": "entry"}
+    assert set(coordinator.long_held_totals) == {"grid_export_total"}
+
+
+def test_a_total_held_for_less_than_a_day_raises_nothing(
+    coordinator, issues, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 10, 16, 19, 24, tzinfo=UTC)
+    coordinator._energy_processor.accepted_at = {
+        "grid_export_total": now - timedelta(hours=23)
+    }
+    coordinator._last_checked_data = {"grid_export_total": 1548.73}
+    coordinator._last_checked_time = now - timedelta(seconds=5)
+
+    _hold_export(coordinator, monkeypatch, now)
+
+    issues.created.assert_not_called()
+    assert coordinator._energy_processor.held["grid_export_total"].device == 507.5
+
+
+def test_taking_the_device_totals_continues_from_the_inverter_and_clears_the_issue(
+    coordinator, issues, held_for_a_month: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = held_for_a_month
+    _hold_export(coordinator, monkeypatch, now)
+
+    taken = asyncio.run(coordinator.async_take_device_totals())
+    after = run_update(
+        coordinator,
+        {"grid_export_total": 507.52},
+        now + timedelta(seconds=5),
+        monkeypatch,
+    )
+
+    assert taken == {"grid_export_total": 507.5}
+    assert after["grid_export_total"] == 507.52
+    issues.deleted.assert_called()
+    assert coordinator.long_held_totals == {}
+
+
+@pytest.mark.usefixtures("issues")
+def test_the_diagnostics_report_lists_held_totals(
+    coordinator, held_for_a_month: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _hold_export(coordinator, monkeypatch, held_for_a_month)
+
+    held = coordinator.energy_report["held"]
+
+    assert held["grid_export_total"]["published"] == 1548.73
+    assert held["grid_export_total"]["device"] == 507.5
+    assert held["grid_export_total"]["since"].startswith("2026-09-16T21:48")
+
+
+@pytest.mark.usefixtures("issues")
+def test_the_issue_names_each_held_total_with_both_values(
+    coordinator, held_for_a_month: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _hold_export(coordinator, monkeypatch, held_for_a_month)
+    registry = SimpleNamespace(async_get_entity_id=lambda *_: "sensor.grid_export")
+    monkeypatch.setattr(er, "async_get", lambda _: registry)
+    monkeypatch.setattr(dt_util, "as_local", lambda value: value)
+
+    text = coordinator.describe_held_totals()
+
+    assert text == (
+        "- sensor.grid_export: 1548.73 kWh in Home Assistant, "
+        "507.50 kWh on the inverter, "
+        "held since 2026-09-16 21:48"
+    )
+
+
+def test_an_error_in_the_held_totals_issue_never_fails_the_poll(
+    coordinator, issues, held_for_a_month: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    issues.created.side_effect = RuntimeError("issue registry unavailable")
+
+    result = _hold_export(coordinator, monkeypatch, held_for_a_month)
+
+    issues.created.assert_called_once()
+    assert result["grid_export_total"] == 1548.73
+    assert result["grid_export_total_raw"] == 507.5
+
+
+def test_an_optional_read_that_stalls_the_poll_is_dropped_after_a_few(
+    coordinator,
+) -> None:
+    """A model that times out on an address, rather than refusing it, recovers."""
+    _optional_block_coordinator(coordinator)
+    stalls = const.OPTIONAL_STALLS_TO_DROP
+    coordinator._modbus_client.async_read = AsyncMock(
+        side_effect=[[55], TimeoutError()] * stalls
+    )
+
+    for _ in range(stalls):
+        # A failed poll has the serial number checked again before the next.
+        coordinator._identity_verified = True
+        assert asyncio.run(coordinator.async_get_raw_data()) is None
+    assert coordinator.unsupported_registers == {
+        "feed_in_power_max_percent",
+        "battery_voltage_probe",
+    }
+
+    polled = {
+        register.key
+        for block in coordinator._register_blocks
+        for register in block.registers
+    }
+    assert not polled & coordinator.unsupported_registers
+    assert "battery_soc" in polled
+
+
+def test_a_lost_link_on_a_required_read_does_not_count_against_optional_ones(
+    coordinator,
+) -> None:
+    """The optional block is never reached, so a dead link drops nothing."""
+    _optional_block_coordinator(coordinator)
+    coordinator._modbus_client.async_read = AsyncMock(side_effect=TimeoutError())
+
+    for _ in range(const.OPTIONAL_STALLS_TO_DROP + 1):
+        coordinator._identity_verified = True
+        asyncio.run(coordinator.async_get_raw_data())
+
+    assert coordinator.unsupported_registers == frozenset()
+
+
+def test_an_optional_read_that_recovers_starts_counting_again(coordinator) -> None:
+    _optional_block_coordinator(coordinator)
+    reads = [[55], TimeoutError()] * (const.OPTIONAL_STALLS_TO_DROP - 1)
+    reads += [[55], [1, 2]]
+    reads += [[55], TimeoutError()] * (const.OPTIONAL_STALLS_TO_DROP - 1)
+    coordinator._modbus_client.async_read = AsyncMock(side_effect=reads)
+
+    for _ in range(2 * const.OPTIONAL_STALLS_TO_DROP - 1):
+        coordinator._identity_verified = True
+        asyncio.run(coordinator.async_get_raw_data())
+
+    assert coordinator.unsupported_registers == frozenset()
+
+
+def test_an_offset_corrects_the_total_but_not_its_device_sensor(
+    coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator._energy_processor.offsets = {"grid_export_total": 1041.23}
+
+    result = run_update(
+        coordinator,
+        {"grid_export_total": 507.5},
+        datetime(2026, 8, 7, 12, 0, tzinfo=UTC),
+        monkeypatch,
+    )
+
+    assert result["grid_export_total"] == pytest.approx(1548.73)
+    assert result["grid_export_total_raw"] == 507.5
+
+
+def _saved_before_a_correction(coordinator) -> dict[str, Any]:
+    coordinator._last_checked_data = {
+        "solar_total": 4296.8,
+        "solar_total_raw": 4296.8,
+        "grid_import_total": 80.0,
+        "grid_import_total_raw": 80.0,
+    }
+    coordinator._last_checked_time = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    coordinator._energy_processor.daily_snapshots = {"solar_today": 4290.0}
+    return coordinator._persisted_state()
+
+
+def _load(coordinator, stored: dict[str, Any], offsets: dict[str, float]) -> None:
+    coordinator._energy_offsets = offsets
+    coordinator._store = SimpleNamespace(async_load=AsyncMock(return_value=stored))
+    asyncio.run(coordinator.async_load_persisted_state())
+
+
+def test_a_new_offset_moves_its_total_when_the_entry_loads(coordinator) -> None:
+    stored = _saved_before_a_correction(coordinator)
+
+    _load(coordinator, stored, {"solar_total": 103.2})
+
+    assert coordinator._last_checked_data["solar_total"] == pytest.approx(4400.0)
+    assert coordinator._last_checked_data["grid_import_total"] == 80.0
+    assert coordinator._energy_processor.daily_snapshots["solar_today"] == (
+        pytest.approx(4393.2)
+    )
+
+
+def test_an_offset_moves_its_total_only_once(coordinator) -> None:
+    _load(coordinator, _saved_before_a_correction(coordinator), {"solar_total": 103.2})
+
+    _load(coordinator, coordinator._persisted_state(), {"solar_total": 103.2})
+
+    assert coordinator._last_checked_data["solar_total"] == pytest.approx(4400.0)
+
+
+def test_offsets_for_entered_totals_are_worked_out_from_the_device(
+    coordinator,
+) -> None:
+    coordinator._energy_offsets = {"grid_export_total": 1041.23}
+    coordinator.data = {
+        "solar_total": 4296.8,
+        "solar_total_raw": 4296.8,
+        "grid_import_total": 0.0,
+        "grid_import_total_raw": 0.0,
+    }
+
+    assert coordinator.correctable_totals == {"solar_total": 4296.8}
+    assert coordinator.energy_offsets_for({"solar_total": 4400.0}) == {
+        "grid_export_total": 1041.23,
+        "solar_total": pytest.approx(103.2),
+    }
+    # Entering the device's value removes the correction.
+    assert coordinator.energy_offsets_for({"solar_total": 4296.8}) == {
+        "grid_export_total": 1041.23
+    }

@@ -1,0 +1,1032 @@
+"""Constants for EF PowerOcean Hybrid integration."""
+
+from __future__ import annotations
+
+from collections.abc import Collection
+from typing import Final
+
+from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
+from homeassistant.const import (
+    EntityCategory,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
+    UnitOfEnergy,
+    UnitOfFrequency,
+    UnitOfPower,
+    UnitOfTemperature,
+)
+
+from .models import (
+    UNKNOWN_STATE,
+    BatteryModule,
+    BinarySensorDef,
+    ControlEntityDef,
+    ControlFeature,
+    ControlFeatureDef,
+    ControlMode,
+    ControlStatus,
+    CoordinatorStatus,
+    EnergySensorDef,
+    GridFeedMode,
+    GridMode,
+    InverterModel,
+    NumberWritableDef,
+    OperatingMode,
+    RegisterBlock,
+    RegisterDef,
+    RegisterType,
+    SensorDef,
+    plan_blocks_for_model,
+    requires_modbus_control,
+)
+
+DOMAIN: Final = "ef_powerocean_hybrid"
+EVENT_COMMAND_EXPIRED: Final = f"{DOMAIN}_command_expired"
+EVENT_CONTROL_TEST_STARTED: Final = f"{DOMAIN}_control_test_started"
+EVENT_CONTROL_TEST_FINISHED: Final = f"{DOMAIN}_control_test_finished"
+# A reading check failed for long enough to act on, and passes again; see
+# reading_checks.py. Control steps aside in between while it is on.
+EVENT_READING_CHECK_FAILED: Final = f"{DOMAIN}_reading_check_failed"
+EVENT_READING_CHECK_CLEARED: Final = f"{DOMAIN}_reading_check_cleared"
+ATTR_STATUS: Final = "status"
+ATTR_CHECK: Final = "check"
+ATTR_MODE: Final = "mode"
+DEFAULT_PORT: Final = 502
+DEFAULT_SLAVE: Final = 1
+DEFAULT_SCAN_INTERVAL_S: Final = 5
+DEFAULT_BATTERY_COUNT: Final = 0
+DEFAULT_MAX_SOLAR_POWER: Final = 12000
+DEFAULT_MAX_GRID_POWER: Final = 15000
+DEFAULT_MAX_POWER: Final = 30000
+
+CONF_HOST: Final = "host"
+CONF_PORT: Final = "port"
+CONF_BATTERY_COUNT: Final = "battery_count"
+CONF_MAX_SOLAR_POWER: Final = "solar_power_max"
+CONF_MAX_GRID_POWER: Final = "grid_power_max"
+CONF_MAX_BATTERY_CHARGED_POWER: Final = "battery_charged_power_max"
+CONF_MAX_BATTERY_DISCHARGED_POWER: Final = "battery_discharged_power_max"
+CONF_SCAN_INTERVAL: Final = "scan_interval"
+CONF_CALC_SOLAR_POWER: Final = "calc_solar_power"
+CONF_MODBUS_CONTROL: Final = "modbus_control"
+CONF_INVERTER_MODEL: Final = "inverter_model"
+# kWh added to what the device reports for a lifetime total, by its key. Set by the
+# user for a counter the inverter reset, so the total continues as in EcoFlow's portal.
+CONF_ENERGY_OFFSETS: Final = "energy_offsets"
+
+MAX_BATTERY_COUNT: Final = 12
+# At most 12 of the 8 kWh modules, with some margin.
+MAX_BATTERY_CAPACITY_WH: Final = 100_000
+
+# Old and new 5 kWh modules. They are similar enough to not affect the behaviour.
+BATTERY_5KWH: Final = BatteryModule(5000, charge_w=2500, discharge_w=4080)
+BATTERY_8KWH: Final = BatteryModule(8030, charge_w=4100, discharge_w=6400)
+BATTERY_MODULES: Final = (BATTERY_5KWH, BATTERY_8KWH)
+# Modules can be mixed in any way and the capacity does not show the mix, so take
+# the highest rate of any module to never set a limit too low.
+BATTERY_CHARGE_W_PER_WH: Final = max(
+    module.charge_w / module.reported_wh for module in BATTERY_MODULES
+)
+BATTERY_DISCHARGE_W_PER_WH: Final = max(
+    module.discharge_w / module.reported_wh for module in BATTERY_MODULES
+)
+
+MAX_FAULT_EVENTS: Final = 20
+
+SLEEP_TIME_AFTER_RECONNECT_S: Final = 1
+
+# Short, so a silent inverter cannot hold the lock the heartbeat waits on.
+MODBUS_REQUEST_TIMEOUT_S: Final = 3
+# Well under the sum of all request timeouts, which could pass a minute.
+MODBUS_POLL_BUDGET_S: Final = 4 * MODBUS_REQUEST_TIMEOUT_S
+
+# The inverter runs on its app settings and merely stores the commands it is sent,
+# until this register is written; each write buys it a minute of obeying them. Every
+# constant below is seconds measured against that one deadline.
+HEARTBEAT_REGISTER: Final = 40608
+HEARTBEAT_VALUE: Final = 1
+# The inverter's deadline: it stops obeying once the last accepted write is older.
+HEARTBEAT_WINDOW_S: Final = 60
+# How often to write, so a missed write still leaves two more before the deadline.
+HEARTBEAT_INTERVAL_S: Final = 20
+# Offsets the write from the poll tick, so the two rarely land on the same second.
+HEARTBEAT_JITTER_S: Final = 2
+# A write this recent still holds the deadline off, so a command rides on it rather
+# than sending one of its own.
+HEARTBEAT_REUSE_S: Final = 10
+# How long one write may spend being retried, all attempts together. Below
+# HEARTBEAT_INTERVAL_S, so the retries are over before the next write is due.
+HEARTBEAT_RETRY_TOTAL_S: Final = 15
+# The shortest gap between two writes. Only reached after a failed one, where the
+# deadline has kept running and waiting a full interval would risk passing it.
+HEARTBEAT_MIN_GAP_S: Final = 5
+# How long to leave the register alone once the inverter has called the request
+# invalid rather than ill-timed, which is what firmware without it answers.
+HEARTBEAT_UNSUPPORTED_RETRY_S: Final = 900
+
+# 40534, write-only. Bit 0 forces the system off-grid and bit 1 shuts it down, so a
+# command touching either is refused before it reaches the wire. Bit 3 is the
+# battery saver switch and bits 4-7 select the control method; the setpoint registers
+# only take effect while their control method is selected here.
+CONTROL_COMMAND_REGISTER: Final = 40534
+CONTROL_COMMAND_UNSAFE_BITS: Final = 0b11
+CONTROL_COMMAND_BATTERY_SAVER_BIT: Final = 3
+CONTROL_COMMAND_METHOD_SHIFT: Final = 4
+CONTROL_COMMAND_METHOD_MASK: Final = 0xF
+
+# The export cap as configured (40538) and as in force (40609). feed_in_power_max
+# is the one the export ceiling follows: the effective cap where the model reports
+# it, the configured one elsewhere. Only the configured cap is ever written.
+FEED_IN_POWER_MAX_SETTING_KEY: Final = "feed_in_power_max_setting"
+FEED_IN_POWER_MAX_EFFECTIVE_KEY: Final = "feed_in_power_max_effective"
+FEED_IN_POWER_MAX_KEY: Final = "feed_in_power_max"
+
+# 40546 and 40548, the most the inverter converts from DC to AC and from AC to DC.
+# The keys predate these names and stay as they are to keep the entities' ids.
+INVERTER_CAPACITY_KEY: Final = "limit_inv_power"
+RECTIFIER_CAPACITY_KEY: Final = "limit_inv_max"
+
+# How far under the device's export cap Export Solar First pins the meter. The inverter
+# holds the meter there by itself, and keeping a little under the cap stops its own
+# overshoot from being curtailed. A Solar Export Limit set lower is used as it is.
+SOLAR_EXPORT_CAP_MARGIN_W: Final = 100.0
+
+ENERGY_RESOLUTION_KWH: Final = 0.01
+STORAGE_VERSION: Final = 1
+STATE_SAVE_DELAY_S: Final = 30
+# A lifetime total held this long while the inverter reports another value raises
+# a repairs issue offering to take the inverter's value. Longer than any glitch on
+# record, a bogus 0 that lasted hours.
+HELD_TOTAL_ISSUE_AFTER_S: Final = 24 * 3600
+# Where a user reports a held total they believe is wrong, with the bug form's
+# fields filled in from the device.
+BUG_REPORT_URL: Final = "https://github.com/abz2much/ef_powerocean_hybrid/issues/new"
+# EcoFlow's portal page with the lifetime energy totals, in one of the languages
+# below. The first is used for any other language.
+ECOFLOW_PORTAL_LANGUAGES: Final = ("en", "de")
+ECOFLOW_PORTAL_HISTORY_URL: Final = "https://user-portal.ecoflow.com/user/eu/{language}/main/home/dashboard/historicalData"
+# The lifetime totals EcoFlow's portal shows, so the ones a user can correct to it.
+# The inverter's AC input and output totals are not among them.
+ECOFLOW_PORTAL_TOTALS: Final = frozenset(
+    {
+        "solar_total",
+        "bat_discharged_total",
+        "bat_charged_total",
+        "grid_import_total",
+        "grid_export_total",
+    }
+)
+MODBUS_DISABLED_READ_THRESHOLD: Final = 3
+
+
+# Home Assistant only introdcued UnitOfRatio in 2026.7, so for backwards compatibility
+# we hardcode this
+UNIT_OF_RATIO: Final = "%"
+
+DEFAULT_INVERTER_MODEL: Final = InverterModel.POWEROCEAN_THREE_PHASE
+
+
+PROTOCOL_VERSION: Final = RegisterDef("protocol_version", 40001, RegisterType.UINT16)
+PRODUCT_CATEGORY: Final = RegisterDef("product_category", 40002, RegisterType.UINT16)
+PRODUCT_NUMBER: Final = RegisterDef("product_number", 40003, RegisterType.UINT16)
+SERIAL_NUMBER: Final = RegisterDef("serial_number", 40004, RegisterType.SERIAL)
+FIRMWARE_VERSION: Final = RegisterDef("firmware_version", 40012, RegisterType.UINT32)
+
+DEVICE_ADDRESS: Final = RegisterDef("device_address", 40014, RegisterType.UINT16)
+
+# Read on every connect, not on every poll.
+DEVICE_INFO_BLOCK: Final = RegisterBlock(
+    (PRODUCT_CATEGORY, PRODUCT_NUMBER, SERIAL_NUMBER, FIRMWARE_VERSION)
+)
+# Read one at a time, so a model that refuses one still reports the other.
+DEVICE_INFO_EXTRA: Final = (PROTOCOL_VERSION, DEVICE_ADDRESS)
+
+FAULT_KEYS: Final = tuple(
+    f"fault_{fault_number}" for fault_number in range(1, MAX_FAULT_EVENTS + 1)
+)
+
+BATTERY_SOC_KEYS: Final = tuple(
+    f"soc_battery_{battery_number}"
+    for battery_number in range(1, MAX_BATTERY_COUNT + 1)
+)
+
+# Polls in a row an optional read may time out or lose the link before it is no
+# longer polled.
+OPTIONAL_STALLS_TO_DROP: Final = 3
+
+# Every polled register, by absolute Modbus address. Order is for readability only;
+# the reads are worked out by plan_blocks().
+MODBUS_REGISTERS: Final[tuple[RegisterDef, ...]] = (
+    RegisterDef("grid_connection_code", 40513, RegisterType.UINT16, optional=True),
+    RegisterDef("house_power", 40519),
+    RegisterDef("grid_power", 40521),
+    RegisterDef("solar_power", 40523),
+    RegisterDef("battery_power", 40525),
+    RegisterDef("battery_soc", 40527, RegisterType.UINT16),
+    RegisterDef("inverter_rated_power", 40528, RegisterType.UINT32),
+    RegisterDef("system_modes", 40530, RegisterType.UINT32),
+    RegisterDef("system_state_2", 40532, RegisterType.UINT32, optional=True),
+    RegisterDef("min_soc_limit", 40536, RegisterType.UINT16),
+    RegisterDef("grid_feed_mode", 40537, RegisterType.UINT16),
+    # The two export caps: 40538 is the one configured, and the only one that takes
+    # a write; 40609 is the one in force after the internal safety rules.
+    # feed_in_power_max is derived from them per model.
+    RegisterDef(
+        FEED_IN_POWER_MAX_SETTING_KEY, 40538, RegisterType.UINT32, optional=True
+    ),
+    RegisterDef("breaker_capacity", 40540, RegisterType.UINT16, optional=True),
+    RegisterDef("device_led_brightness", 40541, RegisterType.UINT16),
+    # Setpoints that take effect the moment the matching control method is engaged.
+    RegisterDef("system_power_setpoint", 40542, RegisterType.INT32),
+    RegisterDef("inverter_power_setpoint", 40544, RegisterType.INT32),
+    RegisterDef(INVERTER_CAPACITY_KEY, 40546, RegisterType.UINT32),
+    RegisterDef(RECTIFIER_CAPACITY_KEY, 40548, RegisterType.UINT32),
+    # Rectifying positive, inverting negative.
+    RegisterDef("inverter_output_power", 40550, RegisterType.INT32, optional=True),
+    RegisterDef("battery_capacity", 40552, RegisterType.UINT32),
+    RegisterDef("battery_discharge_power_limit", 40554, RegisterType.UINT32),
+    RegisterDef("battery_charge_power_limit", 40556, RegisterType.UINT32),
+    # Measured at the grid connection, unlike voltage_l1 and current_l1 below which
+    # are the inverter's own phases.
+    RegisterDef("grid_current_l1", 40559, optional=True),
+    RegisterDef("grid_current_l2", 40561, optional=True),
+    RegisterDef("grid_current_l3", 40563, optional=True),
+    RegisterDef("grid_voltage_l1", 40565, optional=True),
+    RegisterDef("grid_voltage_l2", 40567, optional=True),
+    RegisterDef("grid_voltage_l3", 40569, optional=True),
+    RegisterDef("battery_power_setpoint", 40571, RegisterType.INT32),
+    RegisterDef("feed_in_power_max_percent", 40573, RegisterType.UINT16, optional=True),
+    RegisterDef("battery_voltage", 40574),
+    RegisterDef("battery_current", 40576),
+    RegisterDef("battery_temperature", 40578),
+    RegisterDef("voltage_l1", 40580),
+    RegisterDef("voltage_l2", 40582),
+    RegisterDef("voltage_l3", 40584),
+    RegisterDef("current_l1", 40586),
+    RegisterDef("current_l2", 40588),
+    RegisterDef("current_l3", 40590),
+    RegisterDef("inverter_temperature", 40592),
+    RegisterDef("frequency", 40594),
+    RegisterDef("pv1_voltage", 40596),
+    RegisterDef("pv2_voltage", 40598),
+    RegisterDef("pv3_voltage", 40600),
+    RegisterDef("pv1_current", 40602),
+    RegisterDef("pv2_current", 40604),
+    RegisterDef("pv3_current", 40606),
+    # 40609 refuses writes (exception 2 on a PowerOcean Three Phase, issue #89).
+    RegisterDef(FEED_IN_POWER_MAX_EFFECTIVE_KEY, 40609, RegisterType.UINT32),
+    RegisterDef("fault_count", 42049, RegisterType.UINT16),
+    *(
+        RegisterDef(key, 42049 + fault_number, RegisterType.UINT16)
+        for fault_number, key in enumerate(FAULT_KEYS, start=1)
+    ),
+    RegisterDef("battery_count", 42081, RegisterType.UINT16),
+    *(
+        RegisterDef(key, 42081 + battery_number, RegisterType.UINT16)
+        for battery_number, key in enumerate(BATTERY_SOC_KEYS, start=1)
+    ),
+    RegisterDef("grid_import_total", 42161),
+    RegisterDef("grid_import_today", 42163),
+    RegisterDef("grid_export_total", 42177),
+    RegisterDef("grid_export_today", 42179),
+    RegisterDef("inverter_ac_in_total", 42193, optional=True),
+    RegisterDef("inverter_ac_in_today", 42195, optional=True),
+    RegisterDef("inverter_ac_out_total", 42209, optional=True),
+    RegisterDef("inverter_ac_out_today", 42211, optional=True),
+    RegisterDef("bat_charged_total", 42225),
+    RegisterDef("bat_charged_today", 42227),
+    RegisterDef("bat_discharged_total", 42241),
+    RegisterDef("bat_discharged_today", 42243),
+    RegisterDef("solar_total", 42257),
+    RegisterDef("solar_today", 42259),
+)
+
+REGISTERS_BY_KEY: Final = {register.key: register for register in MODBUS_REGISTERS}
+
+
+def register_blocks_for(
+    inverter_model: InverterModel, *, exclude: Collection[str] = ()
+) -> tuple[RegisterBlock, ...]:
+    """Return register blocks resolved for an inverter model.
+
+    The heartbeat register is kept out of them, at the cost of one more read for the
+    effective feed-in cap next to it. The inverter answers a write to a register it
+    is serving a read for with "device busy", and losing the heartbeat that way
+    costs a minute of control. Keys in exclude are not read at all.
+    """
+    return plan_blocks_for_model(
+        MODBUS_REGISTERS,
+        inverter_model,
+        avoid=(HEARTBEAT_REGISTER,),
+        exclude=exclude,
+    )
+
+
+# The control method the device reports in bits 7-10 of the System Status (40530),
+# with a value for any other reading.
+ACTIVE_CONTROL_MODE_OPTIONS: Final = (
+    *(str(mode) for mode in ControlMode),
+    UNKNOWN_STATE,
+)
+
+SENSOR_MAP: list[SensorDef] = [
+    SensorDef(
+        key="system_modes",
+        unit=None,
+        device_class=None,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="house_power",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorDef(
+        key="grid_power",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorDef(
+        key="solar_power",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorDef(
+        key="battery_power",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorDef(
+        key="battery_soc",
+        unit=UNIT_OF_RATIO,
+        device_class=SensorDeviceClass.BATTERY,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    # A setting, not a battery level: as a battery sensor, Home Assistant would show
+    # it as the battery's charge wherever it picks the device's first one.
+    SensorDef(
+        key="min_soc_limit",
+        unit=UNIT_OF_RATIO,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorDef(
+        key="battery_charge_power_limit",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="battery_discharge_power_limit",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="limit_inv_power",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="limit_inv_max",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="battery_capacity",
+        unit=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="battery_voltage",
+        unit=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="battery_current",
+        unit=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="battery_temperature",
+        unit=UnitOfTemperature.CELSIUS,
+        device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="voltage_l1",
+        unit=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="voltage_l2",
+        unit=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="voltage_l3",
+        unit=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="current_l1",
+        unit=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="current_l2",
+        unit=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="current_l3",
+        unit=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="inverter_temperature",
+        unit=UnitOfTemperature.CELSIUS,
+        device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="frequency",
+        unit=UnitOfFrequency.HERTZ,
+        device_class=SensorDeviceClass.FREQUENCY,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="pv1_voltage",
+        unit=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="pv2_voltage",
+        unit=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="pv3_voltage",
+        unit=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="pv1_current",
+        unit=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="pv2_current",
+        unit=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="pv3_current",
+        unit=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    *[
+        SensorDef(
+            key=key,
+            unit=UnitOfPower.WATT,
+            device_class=SensorDeviceClass.POWER,
+            state_class=SensorStateClass.MEASUREMENT,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        for key in (FEED_IN_POWER_MAX_KEY, FEED_IN_POWER_MAX_SETTING_KEY)
+    ],
+    SensorDef(
+        key=FEED_IN_POWER_MAX_EFFECTIVE_KEY,
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        unsupported_models=tuple(
+            model
+            for model in InverterModel
+            if not model.traits.reports_effective_feed_cap
+        ),
+    ),
+    SensorDef(
+        key="feed_in_power_max_percent",
+        unit=UNIT_OF_RATIO,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Accepts and stores any value but acts on none of them (40573 probe).
+        unsupported_models=(InverterModel.POWEROCEAN_PLUS,),
+    ),
+    SensorDef(
+        key="grid_connection_code",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="breaker_capacity",
+        unit=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="inverter_output_power",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    *[
+        SensorDef(
+            key=f"grid_voltage_l{phase}",
+            unit=UnitOfElectricPotential.VOLT,
+            device_class=SensorDeviceClass.VOLTAGE,
+            state_class=SensorStateClass.MEASUREMENT,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        for phase in (1, 2, 3)
+    ],
+    *[
+        SensorDef(
+            key=f"grid_current_l{phase}",
+            unit=UnitOfElectricCurrent.AMPERE,
+            device_class=SensorDeviceClass.CURRENT,
+            state_class=SensorStateClass.MEASUREMENT,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        for phase in (1, 2, 3)
+    ],
+    SensorDef(
+        key="active_control_mode",
+        device_class=SensorDeviceClass.ENUM,
+        options=ACTIVE_CONTROL_MODE_OPTIONS,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        attribute_keys=("system_modes_hex",),
+    ),
+    SensorDef(
+        key="grid_feed_mode",
+        device_class=SensorDeviceClass.ENUM,
+        options=tuple(GridFeedMode),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="inverter_rated_power",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="battery_count",
+        unit=None,
+        device_class=None,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    *[
+        SensorDef(
+            key=key,
+            unit=UNIT_OF_RATIO,
+            device_class=SensorDeviceClass.BATTERY,
+            state_class=SensorStateClass.MEASUREMENT,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        for key in BATTERY_SOC_KEYS
+    ],
+    SensorDef(
+        key="bat_remaining",
+        unit=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY_STORAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorDef(
+        key="pv1_power",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorDef(
+        key="pv2_power",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorDef(
+        key="pv3_power",
+        unit=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    SensorDef(
+        key="bat_net_energy",
+        unit=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="grid_mode",
+        unit=None,
+        device_class=SensorDeviceClass.ENUM,
+        state_class=None,
+        options=tuple(GridMode),
+    ),
+    SensorDef(
+        key="operating_mode",
+        device_class=SensorDeviceClass.ENUM,
+        options=tuple(OperatingMode),
+    ),
+    SensorDef(
+        key="system_alerts",
+        attribute_keys=("system_state_2_hex",),
+    ),
+    *[
+        SensorDef(
+            key=key,
+            unit=UnitOfPower.WATT,
+            device_class=SensorDeviceClass.POWER,
+            state_class=SensorStateClass.MEASUREMENT,
+            entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        for key in (
+            "system_power_setpoint",
+            "inverter_power_setpoint",
+            "battery_power_setpoint",
+        )
+    ],
+    SensorDef(
+        key="fault_count",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        attribute_keys=("system_state_2_hex",),
+    ),
+    SensorDef(
+        key="active_faults",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="coordinator_status",
+        device_class=SensorDeviceClass.ENUM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        options=tuple(CoordinatorStatus),
+    ),
+    SensorDef(
+        key="protocol_version",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorDef(
+        key="device_address",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+]
+
+
+ENERGY_SENSOR_MAP: list[EnergySensorDef] = [
+    EnergySensorDef("grid_import_total", max_power=CONF_MAX_GRID_POWER),
+    EnergySensorDef(
+        "grid_import_today",
+        resets_daily=True,
+        max_power=CONF_MAX_GRID_POWER,
+        total_source="grid_import_total",
+    ),
+    EnergySensorDef("grid_export_total", max_power=CONF_MAX_SOLAR_POWER),
+    EnergySensorDef(
+        "grid_export_today",
+        resets_daily=True,
+        max_power=CONF_MAX_SOLAR_POWER,
+        total_source="grid_export_total",
+    ),
+    EnergySensorDef("bat_charged_total", max_power=CONF_MAX_BATTERY_CHARGED_POWER),
+    EnergySensorDef(
+        "bat_charged_today",
+        resets_daily=True,
+        max_power=CONF_MAX_BATTERY_CHARGED_POWER,
+        total_source="bat_charged_total",
+    ),
+    EnergySensorDef(
+        "bat_discharged_total", max_power=CONF_MAX_BATTERY_DISCHARGED_POWER
+    ),
+    EnergySensorDef(
+        "bat_discharged_today",
+        resets_daily=True,
+        max_power=CONF_MAX_BATTERY_DISCHARGED_POWER,
+        total_source="bat_discharged_total",
+    ),
+    EnergySensorDef("solar_total", max_power=CONF_MAX_SOLAR_POWER),
+    EnergySensorDef(
+        "solar_today",
+        resets_daily=True,
+        max_power=CONF_MAX_SOLAR_POWER,
+        total_source="solar_total",
+    ),
+    EnergySensorDef(
+        "inverter_ac_in_total",
+        max_power=CONF_MAX_GRID_POWER,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    EnergySensorDef(
+        "inverter_ac_in_today",
+        resets_daily=True,
+        max_power=CONF_MAX_GRID_POWER,
+        total_source="inverter_ac_in_total",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    EnergySensorDef(
+        "inverter_ac_out_total",
+        max_power=CONF_MAX_GRID_POWER,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    EnergySensorDef(
+        "inverter_ac_out_today",
+        resets_daily=True,
+        max_power=CONF_MAX_GRID_POWER,
+        total_source="inverter_ac_out_total",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    EnergySensorDef(
+        "house_energy_today",
+        is_calculated=True,
+        resets_daily=True,
+        max_power=CONF_MAX_GRID_POWER,
+    ),
+    EnergySensorDef(
+        "house_energy_total",
+        is_calculated=True,
+        max_power=CONF_MAX_GRID_POWER,
+    ),
+]
+
+# The counters the device reports, as opposed to the calculated ones. They arrive in
+# kWh, or in Wh on a model whose traits say energy_in_watt_hours.
+DEVICE_ENERGY_KEYS: Final = frozenset(
+    energy_sensor.key
+    for energy_sensor in ENERGY_SENSOR_MAP
+    if not energy_sensor.is_calculated
+)
+
+
+# The daily sensors have been shown to not reliably reset at midnight. They are
+# therefore calculated using the respective total sensor, but we still expose the
+# device raw values under a *_raw diagnostic key. This is also used for the initial
+# snapshot when initializing the daily counters for the first time after installing.
+DAILY_ENERGY_SENSORS_DEVICE_RAW: list[SensorDef] = [
+    SensorDef(
+        key=f"{energy_sensor.key}_raw",
+        unit=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    )
+    for energy_sensor in ENERGY_SENSOR_MAP
+    if energy_sensor.total_source is not None
+]
+
+
+# The device's own lifetime counters, next to the validated totals, so a held total
+# can be told apart from a device that reports the same. No state class: a raw
+# counter can glitch or reset, and must never feed the Energy dashboard or its
+# long-term statistics.
+TOTAL_ENERGY_SENSORS_DEVICE_RAW: list[SensorDef] = [
+    SensorDef(
+        key=f"{energy_sensor.key}_raw",
+        unit=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=None,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    )
+    for energy_sensor in ENERGY_SENSOR_MAP
+    if not energy_sensor.is_calculated and not energy_sensor.resets_daily
+]
+
+
+BINARY_SENSOR_MAP: list[BinarySensorDef] = [
+    BinarySensorDef("self_use_mode_ena"),
+    BinarySensorDef("intelligent_mode_ena"),
+    BinarySensorDef(
+        "system_fault",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+    ),
+    BinarySensorDef(
+        "system_power_on",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    # Bits 11 and 12 of the System Status (40530).
+    BinarySensorDef(
+        "device_modbus_control",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    BinarySensorDef(
+        "bms_connected",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+]
+
+# Whether the heartbeat currently holds control authority
+MODBUS_CONTROL_BINARY_SENSOR: Final = BinarySensorDef(
+    key="modbus_control",
+    device_class=BinarySensorDeviceClass.RUNNING,
+)
+
+CONTROL_FEATURES: Final[dict[ControlFeature, ControlFeatureDef]] = {
+    ControlFeature.AUTOMATIC: ControlFeatureDef(method=ControlMode.DEFAULT),
+    ControlFeature.HOLD_BATTERY: ControlFeatureDef(
+        method=ControlMode.BATTERY_LIMITS,
+        setpoint_key="battery_power_setpoint",
+        measure_key="battery_power",
+    ),
+    ControlFeature.CHARGE_BATTERY: ControlFeatureDef(
+        method=ControlMode.BATTERY_LIMITS,
+        setpoint_key="battery_power_setpoint",
+        sign=1,
+        measure_key="battery_power",
+        config_limit_key=CONF_MAX_BATTERY_CHARGED_POWER,
+        default_power=2000.0,
+    ),
+    # Charging has no converter capacity to respect: PV on the DC side can charge
+    # the battery alongside the rectifier, so its capacity alone is no ceiling.
+    ControlFeature.DISCHARGE_BATTERY: ControlFeatureDef(
+        method=ControlMode.BATTERY_LIMITS,
+        setpoint_key="battery_power_setpoint",
+        sign=-1,
+        measure_key="battery_power",
+        config_limit_key=CONF_MAX_BATTERY_DISCHARGED_POWER,
+        capacity_key=INVERTER_CAPACITY_KEY,
+        default_power=2000.0,
+    ),
+    ControlFeature.EXPORT_TO_GRID: ControlFeatureDef(
+        method=ControlMode.SYSTEM_FEED,
+        setpoint_key="system_power_setpoint",
+        sign=-1,
+        measure_key="grid_power",
+        limit_key=FEED_IN_POWER_MAX_KEY,
+        capacity_key=INVERTER_CAPACITY_KEY,
+        default_power=3000.0,
+    ),
+    # The target is the meter reading, so the house counts towards it: bounded by
+    # the grid connection rather than by what the inverter can convert.
+    ControlFeature.IMPORT_FROM_GRID: ControlFeatureDef(
+        method=ControlMode.SYSTEM_FEED,
+        setpoint_key="system_power_setpoint",
+        sign=1,
+        measure_key="grid_power",
+        config_limit_key=CONF_MAX_GRID_POWER,
+        bounded_by_rating=False,
+        default_power=3000.0,
+    ),
+    # Never commanded as such: it runs Automatic, Hold or Export to Grid, whichever
+    # suits the surplus, so the method and setpoint here are those of its hold. Its
+    # power, the Solar Export Limit, goes up to the export cap, or to the most the
+    # inverter can put out without one, and left alone it reads that.
+    ControlFeature.EXPORT_SOLAR_FIRST: ControlFeatureDef(
+        method=ControlMode.BATTERY_LIMITS,
+        setpoint_key="battery_power_setpoint",
+        measure_key="battery_power",
+        capacity_key=INVERTER_CAPACITY_KEY,
+        default_power=float(DEFAULT_MAX_POWER),
+        power_optional=True,
+    ),
+}
+
+# No entity category, so Home Assistant shows the mode and its power next to each
+# other under Controls rather than mixed in with the settings that always apply.
+BATTERY_MODE_SELECT: Final = ControlEntityDef(
+    key="battery_mode",
+    availability=requires_modbus_control,
+)
+
+CHARGE_LIMIT_SOC_NUMBER: Final = ControlEntityDef(
+    key="charge_limit_soc",
+    entity_category=EntityCategory.CONFIG,
+    availability=requires_modbus_control,
+)
+BATTERY_RESERVE_SOC_NUMBER: Final = ControlEntityDef(
+    key="battery_reserve_soc",
+    entity_category=EntityCategory.CONFIG,
+    availability=requires_modbus_control,
+)
+# The inverter's own reserve, the backup reserve the EcoFlow app sets. Written by the
+# Battery Reserve on models that act on it, shown as the App Backup Reserve on the rest.
+BATTERY_RESERVE_REGISTER_KEY: Final = "min_soc_limit"
+# The number that wrote it before the Battery Reserve took over, removed on setup.
+RETIRED_MIN_SOC_NUMBER_KEY: Final = "min_soc_limit_control"
+# Options: native or emulated Battery Reserve, prefilled with the model's.
+CONF_BATTERY_RESERVE: Final = "battery_reserve"
+DEFAULT_CHARGE_LIMIT_SOC: Final = 100.0
+DEFAULT_BATTERY_RESERVE_SOC: Final = 0.0
+
+GUARD_SOC_HYSTERESIS: Final = 5.0
+# How far a battery stopped at a guard's limit must move away before it may move
+# back towards it, so a state of charge flickering by a percent stays stopped.
+GUARD_RETURN_SOC: Final = 2.0
+GUARD_POWER_DEADBAND_W: Final = 200.0
+# Resolution of a guard's tracked setpoint, so an ordinary load does not rewrite it
+# every poll. Always rounded towards zero, which leaves the remainder to the grid.
+GUARD_TRACKING_STEP_W: Final = 100.0
+# Seconds to wait for the battery to reach a new setpoint before correcting it again.
+GUARD_SETTLE_S: Final = 30.0
+# Minimum power in the direction a guard allows before it hands control back.
+GUARD_HANDBACK_W: Final = 500.0
+# On models whose guards do not track a setpoint, the power in the allowed direction
+# that hands control back. Control is taken back once that power reaches zero, so
+# this is also the width of the hysteresis band.
+GUARD_DIRECT_HANDBACK_W: Final = 20.0
+# How long that power must last before a guard hands control back.
+GUARD_HANDBACK_S: Final = 60.0
+# Longest hand-back wait; the wait doubles each time a hand-back ends early.
+GUARD_HANDBACK_MAX_S: Final = 900.0
+MIN_CONTROL_DWELL_S: Final = 60.0
+CONTROL_STATUS_DAMPING_POLLS: Final = 3
+# How many failed reading checks keep a snapshot of the readings for diagnostics.
+READING_CHECK_SNAPSHOTS: Final = 5
+# How long the inverter gets to report a command it was sent, and how often it is
+# sent again when it does not, before the status says it is not accepted.
+FOLLOW_GRACE_S: Final = 15.0
+FOLLOW_RESENDS: Final = 2
+# 0 means "no limit" to the inverter, not "hold at zero", so hold at the lowest
+# power instead.
+HOLD_SETPOINT_W: Final = 1.0
+
+# Not a device register: whether the selected mode is doing anything, and why not.
+CONTROL_STATUS_SENSOR: Final = SensorDef(
+    key="control_status",
+    device_class=SensorDeviceClass.ENUM,
+    options=tuple(str(status) for status in ControlStatus),
+)
+
+# Not a device register: the reserve the battery is actually held at, as the control
+# manager keeps it. The app's reserve it reads is a control input, so always polled.
+EFFECTIVE_RESERVE_SENSOR: Final = SensorDef(
+    key="battery_reserve_effective",
+    unit=UNIT_OF_RATIO,
+    state_class=SensorStateClass.MEASUREMENT,
+)
+
+# The control test the run_control_test action starts; its states are those of
+# control_test.ControlTestState.
+CONTROL_TEST_SENSOR: Final = SensorDef(
+    key="control_test",
+    device_class=SensorDeviceClass.ENUM,
+    entity_category=EntityCategory.DIAGNOSTIC,
+    options=("idle", "running", "done", "aborted", "failed"),
+)
+
+# Ceiling for a mode whose limit registers are all missing or read zero.
+CONTROL_POWER_FALLBACK_MAX: Final = DEFAULT_MAX_POWER
+
+
+# Map of all modbus registers available for writing operations.
+WRITABLE_NUMBERS_MAP: list[NumberWritableDef] = [
+    NumberWritableDef(
+        key="device_led_brightness_control",
+        read_key="device_led_brightness",
+        name="LED Brightness",
+        register=REGISTERS_BY_KEY["device_led_brightness"].address,
+        min_value=0.0,
+        max_value=100.0,
+        step=10.0,
+        unit=UNIT_OF_RATIO,
+    ),
+]

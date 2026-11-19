@@ -1,0 +1,418 @@
+"""Dependency-free tests for the telemetry helpers."""
+
+from __future__ import annotations
+
+import unittest
+
+import pytest
+
+from custom_components.ef_powerocean_hybrid.const import (
+    REGISTERS_BY_KEY,
+    SENSOR_MAP,
+)
+from custom_components.ef_powerocean_hybrid.models import RegisterType
+from custom_components.ef_powerocean_hybrid.telemetry import (
+    TelemetryData,
+    active_fault_codes,
+    calculate_derived_values,
+    decode_firmware_version,
+    decode_register,
+    is_modbus_disabled,
+    system_alerts,
+)
+
+
+@pytest.mark.parametrize(
+    ("serial_number", "inverter_rated_power", "limit_inv_max", "expected"),
+    (
+        ("R123456789", 0, 0, True),
+        ("R123456789", 6000, 0, False),
+        ("R123456789", 0, 5000, False),
+        ("R123456789", None, 0, False),
+        ("unknown", 0, 0, False),
+        (None, 0, 0, False),
+    ),
+)
+def test_detects_disabled_modbus_from_static_capabilities(
+    serial_number: str | None,
+    inverter_rated_power: float | None,
+    limit_inv_max: float | None,
+    expected: bool,
+) -> None:
+    assert (
+        is_modbus_disabled(serial_number, inverter_rated_power, limit_inv_max)
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("registers", "data_type", "expected"),
+    (
+        ([17], RegisterType.UINT16, 17.0),
+        ([0x0000, 0x42F7], RegisterType.FLOAT32, 123.5),
+        ([0x0000, 0x0001], RegisterType.UINT32, 65536.0),
+        # A value that fits the low word alone must decode the same as before.
+        ([15000, 0x0000], RegisterType.UINT32, 15000.0),
+        ([3000, 0x0000], RegisterType.INT32, 3000.0),
+        # Feed-in setpoints are negative, so the sign bit must survive the swap.
+        ([0xF448, 0xFFFF], RegisterType.INT32, -3000.0),
+    ),
+    ids=(
+        "single-register",
+        "word-swapped-float",
+        "uint32-uses-the-high-word",
+        "uint32-low-word-only",
+        "int32-positive",
+        "int32-negative",
+    ),
+)
+def test_decodes_register_values(
+    registers: list[int],
+    data_type: RegisterType,
+    expected: float,
+) -> None:
+    assert decode_register(registers, data_type) == expected
+
+
+# The words below are what a three-phase Ocean 2 answered with in the register scan
+# of issue #86, where every 32-bit value arrives high word first.
+@pytest.mark.parametrize(
+    ("registers", "data_type", "expected"),
+    (
+        ([0x0000, 0x2710], RegisterType.UINT32, 10000.0),
+        ([0x435C, 0xC51F], RegisterType.FLOAT32, 220.77),
+        ([0xFFFF, 0xF448], RegisterType.INT32, -3000.0),
+        # A single word has no order to get wrong.
+        ([96], RegisterType.UINT16, 96.0),
+    ),
+    ids=("uint32", "float32", "int32-negative", "single-register"),
+)
+def test_decodes_register_values_sent_high_word_first(
+    registers: list[int],
+    data_type: RegisterType,
+    expected: float,
+) -> None:
+    assert decode_register(registers, data_type, high_word_first=True) == expected
+
+
+def test_decodes_firmware_version_sent_high_word_first() -> None:
+    assert decode_firmware_version([0x0100, 0x034F], high_word_first=True) == "1.0.3.79"
+    assert decode_firmware_version([0x034F, 0x0100]) == "1.0.3.79"
+
+
+@pytest.mark.parametrize(
+    ("registers", "data_type"),
+    (
+        ([], RegisterType.UINT16),
+        ([0], RegisterType.FLOAT32),
+        ([0], RegisterType.UINT32),
+        ([0, 0x7FC0], RegisterType.FLOAT32),
+        ([0, 0x7F80], RegisterType.FLOAT32),
+        ([0, 0xFF80], RegisterType.FLOAT32),
+        ([0x10000, 0], RegisterType.FLOAT32),
+        ([0x10000, 0], RegisterType.UINT32),
+    ),
+    ids=(
+        "empty",
+        "incomplete-float",
+        "incomplete-uint32",
+        "nan",
+        "positive-infinity",
+        "negative-infinity",
+        "word-out-of-range",
+        "uint32-word-out-of-range",
+    ),
+)
+def test_rejects_invalid_register_values(
+    registers: list[int], data_type: RegisterType
+) -> None:
+    assert decode_register(registers, data_type) is None
+
+
+class CalculateValuesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.data = {
+            "battery_soc": 60,
+            "battery_count": 2,
+            "battery_capacity": 10000.0,
+            "bat_charged_total": 100.5,
+            "bat_discharged_total": 80.25,
+            "solar_today": 20.0,
+            "grid_import_today": 5.0,
+            "grid_export_today": 3.0,
+            "bat_charged_today": 4.0,
+            "bat_discharged_today": 2.0,
+            "solar_total": 2000.0,
+            "grid_import_total": 500.0,
+            "grid_export_total": 300.0,
+            "pv1_current": 5.0,
+            "pv1_voltage": 300.0,
+            "pv2_current": 4.0,
+            "pv2_voltage": 249.9,
+            "pv3_current": 3.0,
+            "pv3_voltage": 250.0,
+            "system_modes": 0b101000,
+        }
+
+    def calculate(
+        self,
+        *,
+        calculate_solar_power: bool = True,
+    ) -> dict:
+        return calculate_derived_values(
+            TelemetryData.from_mapping(self.data),
+            calculate_solar_power=calculate_solar_power,
+            startup_voltage=250,
+        )
+
+    def test_calculates_energy_and_battery_values(self) -> None:
+        result = self.calculate()
+
+        assert result["bat_remaining"] == 6.0
+        assert result["bat_net_energy"] == 20.25
+        assert result["house_energy_today"] == 20.0
+        assert result["house_energy_total"] == 2179.75
+
+    def test_calculates_pv_power_and_honors_voltage_threshold(self) -> None:
+        result = self.calculate()
+
+        assert result["pv1_power"] == 1500.0
+        assert result["pv2_power"] == 0
+        assert result["pv3_power"] == 750.0
+        assert result["solar_power"] == 2250.0
+
+    def test_decodes_system_mode_bits(self) -> None:
+        result = self.calculate()
+
+        assert result["grid_mode"] == "grid"
+        assert result["battery_saver_mode_ena"]
+        assert not result["self_use_mode_ena"]
+        assert result["intelligent_mode_ena"]
+
+    def test_replaces_the_grid_feed_mode_register_with_its_enum(self) -> None:
+        self.data["grid_feed_mode"] = 1.0
+        assert self.calculate()["grid_feed_mode"] == "unlimited"
+
+        self.data["grid_feed_mode"] = 0.0
+        assert self.calculate()["grid_feed_mode"] == "limited"
+
+        del self.data["grid_feed_mode"]
+        assert self.calculate()["grid_feed_mode"] is None
+
+    def test_omits_optional_values_when_their_inputs_are_disabled_or_absent(
+        self,
+    ) -> None:
+        del self.data["system_modes"]
+
+        result = self.calculate(calculate_solar_power=False)
+
+        assert "solar_power" not in result
+        assert "grid_mode" not in result
+        assert "battery_saver_mode_ena" not in result
+        assert "self_use_mode_ena" not in result
+        assert "intelligent_mode_ena" not in result
+
+    def test_returns_none_when_required_inputs_are_missing(self) -> None:
+        del self.data["battery_soc"]
+        del self.data["pv1_current"]
+        del self.data["grid_import_today"]
+        del self.data["solar_total"]
+
+        result = self.calculate()
+
+        assert result["bat_remaining"] is None
+        assert result["pv1_power"] is None
+        assert result["solar_power"] is None
+        assert result["house_energy_today"] is None
+        assert result["house_energy_total"] is None
+
+    def test_treats_zero_as_a_value_and_does_not_mutate_input(self) -> None:
+        self.data.update(dict.fromkeys(self.data, 0))
+        original = self.data.copy()
+
+        result = self.calculate()
+
+        assert self.data == original
+        assert result["bat_remaining"] == 0
+        assert result["bat_net_energy"] == 0
+        assert result["house_energy_today"] == 0
+        assert result["house_energy_total"] == 0
+        assert result["solar_power"] == 0
+        assert result["grid_mode"] == "grid"
+        assert not result["battery_saver_mode_ena"]
+        assert not result["self_use_mode_ena"]
+        assert not result["intelligent_mode_ena"]
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+@pytest.mark.parametrize(
+    ("reports_effective", "expected"), ((True, 4000.0), (False, 10000.0))
+)
+def test_the_export_ceiling_follows_the_cap_the_model_reports(
+    reports_effective: bool, expected: float
+) -> None:
+    calculated = calculate_derived_values(
+        TelemetryData(
+            feed_in_power_max_setting=10000.0, feed_in_power_max_effective=4000.0
+        ),
+        calculate_solar_power=False,
+        startup_voltage=0,
+        reports_effective_feed_cap=reports_effective,
+    )
+
+    assert calculated["feed_in_power_max"] == expected
+
+
+def test_the_export_ceiling_falls_back_when_its_register_is_missing() -> None:
+    calculated = calculate_derived_values(
+        TelemetryData(feed_in_power_max_setting=10000.0),
+        calculate_solar_power=False,
+        startup_voltage=0,
+    )
+
+    assert calculated["feed_in_power_max"] == 10000.0
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    ((0, "limited"), (1, "unlimited"), (2, "limited_percent"), (7, None), (None, None)),
+)
+def test_decodes_every_grid_feed_mode(raw, expected) -> None:
+    calculated = calculate_derived_values(
+        TelemetryData(grid_feed_mode=raw),
+        calculate_solar_power=False,
+        startup_voltage=0,
+    )
+
+    assert calculated["grid_feed_mode"] == expected
+
+
+@pytest.mark.parametrize(
+    ("method_bits", "expected"),
+    (
+        (0, "default"),
+        (1, "system_feed"),
+        (2, "inverter_feed"),
+        (3, "battery_limits"),
+        (9, "unknown"),
+    ),
+)
+def test_decodes_the_active_control_method_from_the_system_status(
+    method_bits: int, expected: str
+) -> None:
+    """Bits 7-10 of 40530 carry the control method the device is following."""
+    word = (method_bits << 7) | (1 << 11) | (1 << 12) | 0b10100
+    calculated = calculate_derived_values(
+        TelemetryData(system_modes=float(word)),
+        calculate_solar_power=False,
+        startup_voltage=0,
+    )
+
+    assert calculated["active_control_mode"] == expected
+    assert calculated["device_modbus_control"] is True
+    assert calculated["bms_connected"] is True
+    assert calculated["system_modes_hex"] == f"0x{word:08X}"
+    # The low bits keep decoding as before.
+    assert calculated["operating_mode"] == "self_consumption"
+    assert calculated["system_power_on"] is True
+
+
+def test_system_state_2_is_published_raw_and_only_when_read() -> None:
+    flags = (1 << 1) | (1 << 3)
+    read = calculate_derived_values(
+        TelemetryData.from_mapping({"system_state_2": float(flags)}),
+        calculate_solar_power=False,
+        startup_voltage=0,
+    )
+    unread = calculate_derived_values(
+        TelemetryData(), calculate_solar_power=False, startup_voltage=0
+    )
+
+    assert read["system_state_2_hex"] == "0x0000000A"
+    assert read["system_alerts"] == "upgrade_shutdown,low_power_mode"
+    assert "system_state_2_hex" not in unread
+    assert "system_alerts" not in unread
+
+
+def test_system_state_2_rides_on_the_fault_count() -> None:
+    fault_count = next(sensor for sensor in SENSOR_MAP if sensor.key == "fault_count")
+
+    assert fault_count.attribute_keys == ("system_state_2_hex",)
+    assert REGISTERS_BY_KEY["system_state_2"].address == 40532
+
+
+@pytest.mark.parametrize(
+    ("state_2", "expected"),
+    (
+        (0, "none"),
+        (1 << 4, "fan_failure"),
+        ((1 << 13) | (1 << 0), "system_shutdown,battery_overheating"),
+        (1 << 22, "parallel_meter_fault"),
+        (1 << 23, "none"),
+        ((1 << 23) | (1 << 4), "fan_failure"),
+    ),
+)
+def test_system_alerts_names_each_bit(state_2: int, expected: str) -> None:
+    assert system_alerts(state_2) == expected
+
+
+def test_system_alerts_fit_in_a_state_and_count_the_rest() -> None:
+    every_bit = (1 << 32) - 1
+
+    alerts = system_alerts(every_bit)
+
+    assert len(alerts) <= 255
+    shown, hidden = alerts.rsplit(",+", 1)
+    assert len(shown.split(",")) + int(hidden) == 23
+
+
+@pytest.mark.parametrize(
+    ("field", "mode", "self_use", "intelligent"),
+    (
+        (0, "standby", False, False),
+        (1, "self_consumption", True, False),
+        (2, "ai", False, True),
+        (3, "unknown", False, False),
+        (7, "unknown", False, False),
+    ),
+)
+def test_the_operating_status_is_one_enumeration_not_three_flags(
+    field: int, mode: str, self_use: bool, intelligent: bool
+) -> None:
+    calculated = calculate_derived_values(
+        TelemetryData(system_modes=float(field << 4)),
+        calculate_solar_power=False,
+        startup_voltage=0,
+    )
+
+    assert calculated["operating_mode"] == mode
+    assert calculated["self_use_mode_ena"] is self_use
+    assert calculated["intelligent_mode_ena"] is intelligent
+
+
+def test_lists_the_active_fault_codes_in_decimal() -> None:
+    """As the EcoFlow app and portal show them, one code per Fault Event register."""
+    calculated = calculate_derived_values(
+        TelemetryData(fault_codes=(521.0, 0.0, 100.0)),
+        calculate_solar_power=False,
+        startup_voltage=0,
+    )
+
+    assert calculated["active_faults"] == "521, 100"
+
+
+def test_no_fault_codes_read_as_none() -> None:
+    calculated = calculate_derived_values(
+        TelemetryData(fault_codes=(0.0, None)),
+        calculate_solar_power=False,
+        startup_voltage=0,
+    )
+
+    assert calculated["active_faults"] == "none"
+
+
+def test_active_fault_codes_leave_out_empty_registers() -> None:
+    assert active_fault_codes([100.0, 0.0, None, 521.0]) == [100, 521]

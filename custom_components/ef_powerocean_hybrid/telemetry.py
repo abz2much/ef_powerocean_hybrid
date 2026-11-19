@@ -1,0 +1,375 @@
+"""Decode and derive PowerOcean telemetry values."""
+
+from __future__ import annotations
+
+import math
+import struct
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, fields
+
+from .models import (
+    REGISTER_SIZES,
+    UNKNOWN_STATE,
+    ControlMode,
+    GridFeedMode,
+    GridMode,
+    OperatingMode,
+    RegisterType,
+    SystemAlert,
+)
+
+# Bits 4-6 of the System Status (40530): one enumeration, not three flags.
+_OPERATING_MODE_SHIFT = 4
+_OPERATING_MODE_MASK = 0b111
+_SELF_USE_MODE = 1
+_INTELLIGENT_MODE = 2
+
+SYSTEM_ALERTS_NONE = "none"
+# Home Assistant shows a longer state as unknown; all 23 codes run to 463.
+_STATE_MAX_LEN = 255
+
+# Bit layout of the System Status (40530) beyond the low flags.
+_CONTROL_MODE_SHIFT = 7
+_CONTROL_MODE_MASK = 0xF
+# Set on the PowerOcean Plus while Modbus has control.
+_MODBUS_CONTROL_BIT = 11
+_BMS_CONNECTED_BIT = 12
+
+
+def _order_words(registers: list[int], high_word_first: bool) -> tuple[int, int]:
+    """Return the words as (low, high), whichever order the device sends them in."""
+    if high_word_first:
+        return registers[1], registers[0]
+    return registers[0], registers[1]
+
+
+def decode_serial_number(registers: list[int] | None) -> str | None:
+    """Decode a serial number from Modbus registers."""
+    if not registers:
+        return None
+
+    serial_number = (
+        "".join(
+            chr((register >> 8) & 0xFF) + chr(register & 0xFF) for register in registers
+        )
+        .strip()
+        .replace("\x00", "")
+    )
+    return serial_number or None
+
+
+def decode_firmware_version(
+    registers: list[int] | None, high_word_first: bool = False
+) -> str | None:
+    """Decode the UINT32 firmware version as a dotted string."""
+    if not registers or len(registers) < 2:
+        return None
+
+    low, high = _order_words(registers, high_word_first)
+    firmware = (high << 16) | low
+    if not firmware:
+        return None
+
+    return ".".join(str((firmware >> shift) & 0xFF) for shift in (24, 16, 8, 0))
+
+
+def is_modbus_disabled(
+    serial_number: str | None,
+    inverter_rated_power: float | None,
+    limit_inv_max: float | None,
+) -> bool:
+    """Return whether Modbus responds but telemetry appears disabled."""
+    return bool(
+        serial_number
+        and serial_number != "unknown"
+        and inverter_rated_power == 0
+        and limit_inv_max == 0
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class TelemetryData:
+    """Raw telemetry values used to calculate derived values."""
+
+    battery_soc: float | None = None
+    bat_charged_total: float | None = None
+    bat_discharged_total: float | None = None
+    solar_today: float | None = None
+    grid_import_today: float | None = None
+    bat_discharged_today: float | None = None
+    grid_export_today: float | None = None
+    bat_charged_today: float | None = None
+    solar_total: float | None = None
+    grid_import_total: float | None = None
+    grid_export_total: float | None = None
+    pv1_current: float | None = None
+    pv1_voltage: float | None = None
+    pv2_current: float | None = None
+    pv2_voltage: float | None = None
+    pv3_current: float | None = None
+    pv3_voltage: float | None = None
+    system_modes: float | None = None
+    system_state_2: float | None = None
+    battery_capacity: float | None = None
+    grid_feed_mode: float | None = None
+    fault_codes: tuple[float | None, ...] = ()
+    feed_in_power_max_setting: float | None = None
+    feed_in_power_max_effective: float | None = None
+
+    # Read for the Modbus-disabled check, which needs both.
+    inverter_rated_power: float | None = None
+    limit_inv_max: float | None = None
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, float | None]) -> TelemetryData:
+        """Create calculation input from the coordinator's raw telemetry."""
+        faults = sorted(
+            (int(key.removeprefix(_FAULT_PREFIX)), value)
+            for key, value in data.items()
+            if is_fault_key(key)
+        )
+        return cls(
+            **{name: data.get(name) for name in _value_fields(cls)},
+            fault_codes=tuple(value for _, value in faults),
+        )
+
+    @classmethod
+    def keys(cls, register_keys: Iterable[str]) -> frozenset[str]:
+        """Return the data keys the derived values are made from.
+
+        The faults are read as one register each, so they are picked out of the
+        register keys rather than named here.
+        """
+        return frozenset(_value_fields(cls)) | {
+            key for key in register_keys if is_fault_key(key)
+        }
+
+
+_FAULT_PREFIX = "fault_"
+
+
+def is_fault_key(key: str) -> bool:
+    """Return whether *key* is one of the fault code registers."""
+    return key.startswith(_FAULT_PREFIX) and key.removeprefix(_FAULT_PREFIX).isdigit()
+
+
+def _value_fields(cls: type[TelemetryData]) -> tuple[str, ...]:
+    return tuple(field.name for field in fields(cls) if field.name != "fault_codes")
+
+
+def _is_bit_set(value: int, bit_position: int) -> bool:
+    return bool(value & (1 << bit_position))
+
+
+def _calculate_house_energy(
+    *,
+    solar: float | None,
+    grid_import: float | None,
+    battery_discharged: float | None,
+    grid_export: float | None,
+    battery_charged: float | None,
+    precision: int,
+) -> float | None:
+    if (
+        solar is None
+        or grid_import is None
+        or battery_discharged is None
+        or grid_export is None
+        or battery_charged is None
+    ):
+        return None
+    return round(
+        solar + grid_import + battery_discharged - grid_export - battery_charged,
+        precision,
+    )
+
+
+def decode_register(
+    registers: list[int], data_type: RegisterType, high_word_first: bool = False
+) -> float | None:
+    """Decode a register's words, which are stored low word first by default."""
+    if len(registers) < REGISTER_SIZES[data_type]:
+        return None
+    if data_type is RegisterType.UINT16:
+        return round(float(registers[0]), 2)
+
+    try:
+        raw = struct.pack("<HH", *_order_words(registers, high_word_first))
+    except (struct.error, TypeError):
+        return None
+
+    if data_type is RegisterType.UINT32:
+        return float(struct.unpack("<I", raw)[0])
+
+    if data_type is RegisterType.INT32:
+        return float(struct.unpack("<i", raw)[0])
+
+    value = float(struct.unpack("<f", raw)[0])
+    if not math.isfinite(value) or abs(value) > 1e9:
+        return None
+    return round(value, 2)
+
+
+def _calculate_pv_power(
+    current: float | None, voltage: float | None, startup_voltage: int
+) -> float | None:
+    if current is None or voltage is None:
+        return None
+
+    if voltage < startup_voltage:
+        return 0.0
+
+    return round(current * voltage, 1)
+
+
+_OPERATING_MODES = {
+    0: OperatingMode.STANDBY,
+    1: OperatingMode.SELF_CONSUMPTION,
+    2: OperatingMode.AI,
+}
+
+
+def system_alerts(state_2: int) -> str:
+    """Return the active alert codes in bit order, or none.
+
+    Undocumented bits are left out. Codes that would overrun a state are
+    counted in a closing +N.
+    """
+    active = [alert.code for alert in SystemAlert(state_2)]
+    if not active:
+        return SYSTEM_ALERTS_NONE
+    shown: list[str] = []
+    for index, code in enumerate(active):
+        rest = len(active) - index - 1
+        candidate = ",".join([*shown, code]) + (f",+{rest}" if rest else "")
+        if len(candidate) > _STATE_MAX_LEN:
+            break
+        shown.append(code)
+    hidden = len(active) - len(shown)
+    return ",".join(shown) + (f",+{hidden}" if hidden else "")
+
+
+def active_fault_codes(fault_codes: Iterable[float | None]) -> list[int]:
+    """Return the codes of the Fault Event registers that hold one, in order.
+
+    Each register holds one code, and an empty one reads 0.
+    """
+    return [int(code) for code in fault_codes if code]
+
+
+def _format_active_faults(fault_codes: tuple[float | None, ...]) -> str:
+    """Return the codes in decimal, as the EcoFlow app and portal show them."""
+    active = [str(code) for code in active_fault_codes(fault_codes)]
+    return ", ".join(active) if active else "none"
+
+
+def calculate_derived_values(
+    data: TelemetryData,
+    *,
+    calculate_solar_power: bool,
+    startup_voltage: int,
+    reports_effective_feed_cap: bool = True,
+) -> dict[str, float | bool | str | None]:
+    """Calculate values derived from raw PowerOcean telemetry."""
+    calculated: dict[str, float | bool | str | None] = {}
+
+    # The cap the export ceiling follows. A model that does not report the effective
+    # cap falls back to the configured one, and so does a read that came back empty.
+    preferred, fallback = (
+        (data.feed_in_power_max_effective, data.feed_in_power_max_setting)
+        if reports_effective_feed_cap
+        else (data.feed_in_power_max_setting, data.feed_in_power_max_effective)
+    )
+    calculated["feed_in_power_max"] = preferred if preferred is not None else fallback
+
+    battery_soc = data.battery_soc
+    # The device reports its pack capacity in Wh.
+    battery_capacity = data.battery_capacity
+    calculated["bat_remaining"] = (
+        round(battery_capacity / 1000 * battery_soc / 100, 2)
+        if battery_soc is not None and battery_capacity is not None
+        else None
+    )
+
+    battery_charged_total = data.bat_charged_total
+    battery_discharged_total = data.bat_discharged_total
+    calculated["bat_net_energy"] = (
+        round(battery_charged_total - battery_discharged_total, 2)
+        if battery_charged_total is not None and battery_discharged_total is not None
+        else None
+    )
+
+    calculated["house_energy_today"] = _calculate_house_energy(
+        solar=data.solar_today,
+        grid_import=data.grid_import_today,
+        battery_discharged=data.bat_discharged_today,
+        grid_export=data.grid_export_today,
+        battery_charged=data.bat_charged_today,
+        precision=2,
+    )
+
+    calculated["house_energy_total"] = _calculate_house_energy(
+        solar=data.solar_total,
+        grid_import=data.grid_import_total,
+        battery_discharged=data.bat_discharged_total,
+        grid_export=data.grid_export_total,
+        battery_charged=data.bat_charged_total,
+        precision=2,
+    )
+
+    pv_powers = [
+        _calculate_pv_power(current, voltage, startup_voltage)
+        for current, voltage in (
+            (data.pv1_current, data.pv1_voltage),
+            (data.pv2_current, data.pv2_voltage),
+            (data.pv3_current, data.pv3_voltage),
+        )
+    ]
+    for pv_number, pv_power in enumerate(pv_powers, start=1):
+        calculated[f"pv{pv_number}_power"] = pv_power
+
+    if calculate_solar_power:
+        calculated["solar_power"] = (
+            None if None in pv_powers else sum(p for p in pv_powers if p is not None)
+        )
+
+    if data.system_modes is not None:
+        system_modes = int(data.system_modes)
+        calculated["grid_mode"] = (
+            GridMode.ISLANDED if _is_bit_set(system_modes, 0) else GridMode.GRID
+        )
+        calculated["system_fault"] = _is_bit_set(system_modes, 1)
+        calculated["system_power_on"] = _is_bit_set(system_modes, 2)
+        calculated["battery_saver_mode_ena"] = _is_bit_set(system_modes, 3)
+        operating_mode = system_modes >> _OPERATING_MODE_SHIFT & _OPERATING_MODE_MASK
+        calculated["self_use_mode_ena"] = operating_mode == _SELF_USE_MODE
+        calculated["intelligent_mode_ena"] = operating_mode == _INTELLIGENT_MODE
+        calculated["operating_mode"] = _OPERATING_MODES.get(
+            operating_mode, OperatingMode.UNKNOWN
+        )
+        # What the device says it follows, as opposed to what was commanded.
+        active_mode = ControlMode.from_status(
+            (system_modes >> _CONTROL_MODE_SHIFT) & _CONTROL_MODE_MASK
+        )
+        calculated["active_control_mode"] = (
+            str(active_mode) if active_mode is not None else UNKNOWN_STATE
+        )
+        calculated["device_modbus_control"] = _is_bit_set(
+            system_modes, _MODBUS_CONTROL_BIT
+        )
+        calculated["bms_connected"] = _is_bit_set(system_modes, _BMS_CONNECTED_BIT)
+        calculated["system_modes_hex"] = f"0x{system_modes:08X}"
+
+    # Unread is not the same as no alerts.
+    if data.system_state_2 is not None:
+        state_2 = int(data.system_state_2)
+        calculated["system_state_2_hex"] = f"0x{state_2:08X}"
+        calculated["system_alerts"] = system_alerts(state_2)
+
+    calculated["active_faults"] = _format_active_faults(data.fault_codes)
+
+    # Replaces the register's own 0/1 with the enum the sensor and the grid feed
+    # switch both read.
+    calculated["grid_feed_mode"] = GridFeedMode.from_register(data.grid_feed_mode)
+
+    return calculated

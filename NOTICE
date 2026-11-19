@@ -1,0 +1,12 @@
+EF PowerOcean Hybrid
+
+This integration is based on EF-PowerOcean-TcpModbus by MaxGrmm
+(https://github.com/MaxGrmm/EF-PowerOcean-TcpModbus), MIT licence,
+Copyright (c) 2026 MaxGrmm.
+
+- Base: commit 431a806 (v2.9.5 with the entity availability fix #219).
+- Ported from commit 8569232 (in v2.10.0-beta.2): the 3 s request timeout on
+  the shared connection, dropping a shared connection after a timed-out
+  request, and the shorter reconnect delays.
+
+The upstream copyright and permission notice is kept in LICENSE.

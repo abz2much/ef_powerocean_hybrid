@@ -1,0 +1,2343 @@
+"""Unit tests for the control manager without Home Assistant."""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.util import dt as dt_util
+
+from custom_components.ef_powerocean_hybrid import const, models
+from custom_components.ef_powerocean_hybrid import control as control_module
+from custom_components.ef_powerocean_hybrid import heartbeat as heartbeat_module
+from custom_components.ef_powerocean_hybrid.coordinator import EcoflowCoordinator
+from custom_components.ef_powerocean_hybrid.modbus import (
+    ModbusClient,
+    ModbusRejected,
+)
+from custom_components.ef_powerocean_hybrid.reading_checks import ReadingChecks
+from custom_components.ef_powerocean_hybrid.switch import (
+    GRID_FEED_SWITCH,
+    EcoFlowSwitch,
+)
+
+HEARTBEAT_START = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def control():
+    blocks = const.register_blocks_for(const.DEFAULT_INVERTER_MODEL)
+    manager = control_module.ControlManager(
+        cast(
+            ModbusClient,
+            SimpleNamespace(
+                connected=True, writes_allowed=True, async_write=AsyncMock()
+            ),
+        ),
+        registers_by_key={
+            register.key: register for block in blocks for register in block.registers
+        },
+        limits={
+            const.CONF_MAX_GRID_POWER: 15_000,
+            const.CONF_MAX_SOLAR_POWER: 12_000,
+            const.CONF_MAX_BATTERY_CHARGED_POWER: 5_000,
+            const.CONF_MAX_BATTERY_DISCHARGED_POWER: 6_600,
+        },
+        inverter_model=const.DEFAULT_INVERTER_MODEL,
+        enabled=True,
+        scan_interval_s=const.DEFAULT_SCAN_INTERVAL_S,
+        on_update=Mock(),
+        on_refresh=AsyncMock(),
+        write_setting=AsyncMock(),
+        on_command_expired=Mock(),
+    )
+    # A fresh manager assumes the device may still be following an earlier run; the
+    # tests start from a settled state and say so where they mean otherwise.
+    manager._control_stale = False
+    return manager
+
+
+def allow_writes(control, monkeypatch: pytest.MonkeyPatch, *, rejected=False):
+    """Put the manager in control of a device that answers, and return the writes."""
+    monkeypatch.setattr(dt_util, "now", lambda: HEARTBEAT_START)
+    control._modbus_client.connected = True
+    control._modbus_client.async_write = AsyncMock(
+        side_effect=ModbusRejected("rejected") if rejected else None
+    )
+    # The device has answered a heartbeat, so it is following us.
+    control._heartbeat._supported = True
+    control._heartbeat._last_success = HEARTBEAT_START
+    return control._modbus_client.async_write
+
+
+Feature = models.ControlFeature
+Status = models.ControlStatus
+Feed = models.GridFeedMode
+
+
+def commands(write) -> list[tuple[int, list[int]]]:
+    """Return the (address, words) of each command, without the heartbeats between."""
+    return [
+        call.args
+        for call in write.await_args_list
+        if call.args[0] != const.HEARTBEAT_REGISTER
+    ]
+
+
+def advance(control, monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Move the clock as polling would, keeping control authority alive."""
+    now = HEARTBEAT_START + timedelta(seconds=seconds)
+    monkeypatch.setattr(dt_util, "now", lambda: now)
+    control._heartbeat._last_success = now
+
+
+def beat(control, now: datetime, monkeypatch: pytest.MonkeyPatch) -> bool:
+    monkeypatch.setattr(dt_util, "now", lambda: now)
+    # asyncio.run() builds a fresh loop per call, and a lock binds to the first one.
+    control._heartbeat._lock = asyncio.Lock()
+    return asyncio.run(control._heartbeat.async_ensure_fresh())
+
+
+def test_a_recent_beat_is_reused_and_a_stale_one_is_rewritten(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command needs the window held open, not another frame to answer."""
+    write = allow_writes(control, monkeypatch)
+
+    fresh = HEARTBEAT_START + timedelta(seconds=const.HEARTBEAT_REUSE_S - 1)
+    assert beat(control, fresh, monkeypatch) is True
+    assert write.await_count == 0
+
+    stale = HEARTBEAT_START + timedelta(seconds=const.HEARTBEAT_REUSE_S + 1)
+    assert beat(control, stale, monkeypatch) is True
+    assert write.await_args.args == (const.HEARTBEAT_REGISTER, [const.HEARTBEAT_VALUE])
+
+
+def test_no_heartbeat_reaches_a_device_with_an_unverified_identity(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(control, monkeypatch)
+    control._modbus_client.writes_allowed = False
+
+    stale = HEARTBEAT_START + timedelta(seconds=const.HEARTBEAT_REUSE_S + 1)
+    assert beat(control, stale, monkeypatch) is False
+    write.assert_not_awaited()
+
+
+def test_a_busy_inverter_is_retried_but_an_invalid_request_latches_off(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Device busy faults the moment; an illegal address faults the request."""
+    allow_writes(control, monkeypatch)
+    control._heartbeat._retry_delays = (0.0, 0.0)
+    control._heartbeat._supported = None
+    control._heartbeat._last_success = None
+
+    control._modbus_client.async_write = AsyncMock(
+        side_effect=(ModbusRejected("busy", exception_code=0x06), None)
+    )
+    assert beat(control, HEARTBEAT_START, monkeypatch) is True
+    assert control.heartbeat_supported is True
+
+    control._heartbeat._last_success = None
+    write = AsyncMock(side_effect=ModbusRejected("illegal", exception_code=0x02))
+    control._modbus_client.async_write = write
+
+    assert beat(control, HEARTBEAT_START, monkeypatch) is False
+    assert control.heartbeat_supported is False
+    assert write.await_count == 1
+
+    control._heartbeat._supported = None
+    control._modbus_client.async_write = AsyncMock(
+        side_effect=HomeAssistantError("connection reset")
+    )
+
+    assert beat(control, HEARTBEAT_START, monkeypatch) is False
+    assert control.heartbeat_supported is None
+
+
+@pytest.mark.parametrize(
+    ("scan_interval", "expected"),
+    (
+        (2, (0.0, *(2.0,) * 7)),
+        (5, (0.0, 5.0, 5.0, 5.0)),
+        (30, (0.0, 15.0)),
+    ),
+)
+def test_a_retry_waits_a_whole_poll_cycle(scan_interval, expected) -> None:
+    """Retrying inside the cycle that caused the busy answer only asks too early."""
+    assert heartbeat_module.retry_delays(scan_interval) == expected
+
+
+def test_a_reconnect_keeps_control_unless_the_window_lapsed(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inverter counts its own deadline and knows nothing of our socket, so a
+    blip must not report control lost nor rewrite a command it never dropped."""
+    allow_writes(control, monkeypatch)
+    control._heartbeat._supported = False
+
+    control.mark_stale()
+
+    # A new socket can mean a different device state, so the refusal goes with it.
+    assert control.heartbeat_supported is None
+    assert control.in_control is True
+    assert control._control_stale is False
+
+    lapsed = HEARTBEAT_START + timedelta(seconds=const.HEARTBEAT_WINDOW_S + 1)
+    monkeypatch.setattr(dt_util, "now", lambda: lapsed)
+    control.mark_stale()
+
+    assert control.in_control is False
+    assert control._control_stale is True
+
+
+def test_a_failed_beat_is_retried_before_the_deadline_not_after_it(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retries come out of the interval: spending them and then waiting a whole one
+    on top leaves the deadline to pass, and the inverter reverts to the app."""
+    allow_writes(control, monkeypatch)
+    heartbeat = control._heartbeat
+
+    assert heartbeat._delay_before_next_write() == const.HEARTBEAT_INTERVAL_S
+
+    for age, expected in ((12, 8), (const.HEARTBEAT_RETRY_TOTAL_S, 5), (40, 5)):
+        now = HEARTBEAT_START + timedelta(seconds=age)
+        monkeypatch.setattr(dt_util, "now", lambda now=now: now)
+        assert heartbeat._delay_before_next_write() == expected
+
+    heartbeat._supported = False
+    assert heartbeat._delay_before_next_write() == const.HEARTBEAT_UNSUPPORTED_RETRY_S
+
+
+def test_a_mode_writes_its_setpoint_then_its_method_word(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A setpoint without the method nibble is stored and ignored by the device."""
+    write = allow_writes(control, monkeypatch)
+    control._battery_saver = True
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, 2500))
+
+    asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+
+    assert control.power == 2500.0
+    # The device parses multi-register writes high word first, unlike its reads.
+    assert commands(write) == [
+        (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0x0000, 0x09C4]),
+        (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0038]),
+    ]
+
+
+def test_discharge_sends_the_magnitude_as_a_negative_setpoint(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One number in the UI; the sign belongs to the mode."""
+    write = allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(control.async_select_feature(Feature.DISCHARGE_BATTERY))
+
+    asyncio.run(control.async_set_feature_power(Feature.DISCHARGE_BATTERY, 1500))
+
+    assert control.power == 1500.0
+    # The method is already selected, so the new setpoint is the last thing sent.
+    assert commands(write)[-1] == (
+        const.REGISTERS_BY_KEY["battery_power_setpoint"].address,
+        [0xFFFF, 0xFA24],
+    )
+
+
+def test_holding_the_battery_commands_one_watt_not_zero(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Zero reads as 'no limit' on this device, so it would resume self-consumption."""
+    write = allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+
+    asyncio.run(control.async_select_feature(Feature.HOLD_BATTERY))
+
+    assert control.power == 1.0
+    setpoint = const.REGISTERS_BY_KEY["battery_power_setpoint"].address
+    assert commands(write)[0] == (setpoint, [0x0000, 0x0001])
+
+
+def test_a_full_battery_is_held_against_the_house_but_not_against_the_sun(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full battery cannot charge, so a limit set against a surplus only curtails."""
+    write = allow_writes(control, monkeypatch)
+    setpoint = const.REGISTERS_BY_KEY["battery_power_setpoint"].address
+    control._inputs = control_module.ControlInputs.from_mapping(
+        {"battery_soc": 100.0, "solar_power": 100.0, "house_power": 900.0}
+    )
+
+    asyncio.run(control.async_select_feature(Feature.HOLD_BATTERY))
+
+    assert commands(write) == [
+        (setpoint, [0x0000, 0x0001]),
+        (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0030]),
+    ]
+
+    write.reset_mock()
+    advance(control, monkeypatch, const.MIN_CONTROL_DWELL_S + 1)
+    asyncio.run(
+        control.async_apply(
+            {"battery_soc": 100.0, "solar_power": 5000.0, "house_power": 1000.0}
+        )
+    )
+
+    assert control.selected_feature is Feature.HOLD_BATTERY
+    assert control.power == 0.0
+    assert control.status is Status.HOLD_NOT_NEEDED
+    assert commands(write) == [
+        (setpoint, [0x0000, 0x0000]),
+        (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0000]),
+    ]
+
+    # Anything short of a clear surplus counts as a draw, so the hold is back before
+    # the house can reach the battery.
+    advance(control, monkeypatch, 2 * const.MIN_CONTROL_DWELL_S + 2)
+    asyncio.run(
+        control.async_apply(
+            {"battery_soc": 100.0, "solar_power": 1000.0, "house_power": 1000.0}
+        )
+    )
+
+    assert control.power == 1.0
+
+
+def test_power_is_clamped_to_the_lowest_ceiling_that_applies(control) -> None:
+    """The app's battery limit is ignored by Modbus control, so it must not cap us."""
+    control._inputs = control_module.ControlInputs.from_mapping(
+        {"battery_charge_power_limit": 500.0}
+    )
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, 9999))
+    assert control.feature_power(Feature.CHARGE_BATTERY) == 5000.0
+
+    # A limit the firmware publishes is real, and so is the inverter's AC rating.
+    control._limits[const.CONF_MAX_BATTERY_CHARGED_POWER] = 25_000
+    control._inputs = control_module.ControlInputs.from_mapping(
+        {"feed_in_power_max": 9000.0, "inverter_rated_power": 11000.0}
+    )
+    assert control.feature_power_max(Feature.EXPORT_TO_GRID) == 9000.0
+    assert control.feature_power_max(Feature.CHARGE_BATTERY) == 11000.0
+
+    # A battery count of zero bounds nothing, so the slider keeps a sane maximum.
+    control._limits[const.CONF_MAX_BATTERY_CHARGED_POWER] = 0
+    control._inputs = control_module.ControlInputs.from_mapping({})
+    assert control.feature_power_max(Feature.CHARGE_BATTERY) == float(
+        const.CONTROL_POWER_FALLBACK_MAX
+    )
+
+
+def test_a_mode_cannot_be_selected_without_modbus_control(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(control, monkeypatch)
+    control._enabled = False
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+
+    assert control.selected_feature is Feature.AUTOMATIC
+    write.assert_not_awaited()
+
+
+def test_selecting_automatic_returns_control_to_the_device(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default method alone leaves the device holding the setpoint we wrote."""
+    write = allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+
+    asyncio.run(control.async_select_feature(Feature.AUTOMATIC))
+
+    assert control.status is Status.AUTOMATIC
+    assert commands(write)[-2:] == [
+        (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0x0000, 0x0000]),
+        (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0000]),
+    ]
+
+
+def test_import_from_grid_pins_the_meter_at_a_draw(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The system setpoint with a positive sign, under the system feed method."""
+    write = allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping(
+        {"battery_soc": 50.0, "grid_power": 400.0}
+    )
+
+    asyncio.run(control.async_select_feature(Feature.IMPORT_FROM_GRID))
+
+    assert control.method is models.ControlMode.SYSTEM_FEED
+    assert commands(write) == [
+        (const.REGISTERS_BY_KEY["system_power_setpoint"].address, [0x0000, 0x0BB8]),
+        (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0010]),
+    ]
+
+
+def test_import_from_grid_holds_once_the_charge_limit_is_reached(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    control._charge_limit_soc = 80.0
+    control._inputs = control_module.ControlInputs.from_mapping(
+        {"battery_soc": 80.0, "grid_power": 400.0}
+    )
+
+    asyncio.run(control.async_select_feature(Feature.IMPORT_FROM_GRID))
+
+    assert control.status is Status.CHARGE_LIMIT_REACHED
+    assert control.power == const.HOLD_SETPOINT_W
+    assert control.method is models.ControlMode.BATTERY_LIMITS
+
+
+@pytest.mark.parametrize(
+    ("frame", "limit", "expected"),
+    (
+        # Left alone, or set at the cap, the meter is held just under the cap.
+        ({"grid_feed_mode": Feed.LIMITED, "feed_in_power_max": 6000.0}, None, 5900.0),
+        ({"grid_feed_mode": Feed.LIMITED, "feed_in_power_max": 6000.0}, 6000.0, 5900.0),
+        (
+            {
+                "grid_feed_mode": Feed.LIMITED_PERCENT,
+                "feed_in_power_max_percent": 60.0,
+                "inverter_rated_power": 10_000.0,
+            },
+            None,
+            5900.0,
+        ),
+        # Without a cap it is all the inverter can put out.
+        (
+            {"grid_feed_mode": Feed.UNLIMITED, "inverter_rated_power": 10_000.0},
+            None,
+            10_000.0,
+        ),
+        (
+            {
+                "grid_feed_mode": Feed.UNLIMITED,
+                const.INVERTER_CAPACITY_KEY: 8000.0,
+                "inverter_rated_power": 10_000.0,
+            },
+            None,
+            8000.0,
+        ),
+        # A limit set below the cap is used as it is, with or without one.
+        ({"grid_feed_mode": Feed.UNLIMITED}, 3000.0, 3000.0),
+        ({"grid_feed_mode": Feed.LIMITED, "feed_in_power_max": 6000.0}, 3000.0, 3000.0),
+        # Nothing is exported, so there is nothing to export first.
+        ({"grid_feed_mode": Feed.LIMITED, "feed_in_power_max": 0.0}, 3000.0, None),
+        ({"grid_feed_mode": Feed.LIMITED, "feed_in_power_max": 100.0}, None, None),
+        ({"feed_in_power_max": 6000.0}, None, None),
+    ),
+)
+def test_export_solar_first_holds_the_meter_at_its_limit_under_the_cap(
+    control, frame, limit, expected
+) -> None:
+    control._inputs = control_module.ControlInputs.from_mapping(frame)
+    if limit is not None:
+        control._feature_power[Feature.EXPORT_SOLAR_FIRST] = limit
+
+    assert (
+        control._solar_export_target(control_module.ControlInputs.from_mapping(frame))
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("frame", "maximum"),
+    (
+        ({"grid_feed_mode": Feed.LIMITED, "feed_in_power_max": 6000.0}, 6000.0),
+        (
+            {
+                "grid_feed_mode": Feed.LIMITED_PERCENT,
+                "feed_in_power_max_percent": 60.0,
+                "inverter_rated_power": 10_000.0,
+            },
+            6000.0,
+        ),
+        # Without a cap, the most the inverter can put out.
+        (
+            {
+                "grid_feed_mode": Feed.UNLIMITED,
+                const.INVERTER_CAPACITY_KEY: 8000.0,
+                "inverter_rated_power": 10_000.0,
+            },
+            # The capacity moves from poll to poll, so it caps only what is sent.
+            10_000.0,
+        ),
+        (
+            {"grid_feed_mode": Feed.UNLIMITED, "inverter_rated_power": 10_000.0},
+            10_000.0,
+        ),
+        # A cap the inverter cannot reach bounds nothing the inverter does not.
+        (
+            {
+                "grid_feed_mode": Feed.LIMITED,
+                "feed_in_power_max": 15_000.0,
+                "inverter_rated_power": 10_000.0,
+            },
+            10_000.0,
+        ),
+    ),
+)
+def test_the_solar_export_limit_goes_up_to_the_cap_itself(
+    control, frame, maximum
+) -> None:
+    """The number ends where users expect: at the export cap, or at the inverter's
+    maximum without one. Left alone it reads that maximum."""
+    control._inputs = control_module.ControlInputs.from_mapping(frame)
+
+    assert control.feature_power_max(Feature.EXPORT_SOLAR_FIRST) == maximum
+    assert (
+        min(
+            control.feature_power(Feature.EXPORT_SOLAR_FIRST),
+            control.feature_power_max(Feature.EXPORT_SOLAR_FIRST),
+        )
+        == maximum
+    )
+
+
+def test_the_solar_export_limit_survives_the_export_off(control) -> None:
+    """A value set while the Grid Feed-in switch holds the export off is kept for when
+    it comes back, rather than cut to nothing."""
+    control._inputs = control_module.ControlInputs.from_mapping(
+        {
+            "grid_feed_mode": Feed.LIMITED,
+            "feed_in_power_max": 0.0,
+            "inverter_rated_power": 10_000.0,
+        }
+    )
+    asyncio.run(control.async_set_feature_power(Feature.EXPORT_SOLAR_FIRST, 3000.0))
+
+    assert control.feature_power(Feature.EXPORT_SOLAR_FIRST) == 3000.0
+
+
+def test_the_control_word_refuses_off_grid_and_shutdown_bits(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = allow_writes(control, monkeypatch)
+    # Nothing composable through the public API sets them, so bend the bit to reach
+    # the guard: battery saver now lands on BIT0, which takes the system off-grid.
+    monkeypatch.setattr(control_module, "CONTROL_COMMAND_BATTERY_SAVER_BIT", 0)
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(control.async_set_battery_saver(True))
+
+    write.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("setter", "limit", "soc", "solar", "house", "expected", "feature", "power"),
+    (
+        (
+            "async_set_battery_reserve_soc",
+            20,
+            20.0,
+            100.0,
+            900.0,
+            Status.RESERVE_REACHED,
+            Feature.HOLD_BATTERY,
+            1.0,
+        ),
+        (
+            "async_set_battery_reserve_soc",
+            20,
+            20.0,
+            2000.0,
+            500.0,
+            Status.RESERVE_REACHED,
+            Feature.CHARGE_BATTERY,
+            1500.0,
+        ),
+        (
+            "async_set_charge_limit_soc",
+            80,
+            80.0,
+            2000.0,
+            500.0,
+            Status.CHARGE_LIMIT_REACHED,
+            Feature.HOLD_BATTERY,
+            1.0,
+        ),
+        (
+            "async_set_charge_limit_soc",
+            80,
+            80.0,
+            100.0,
+            900.0,
+            Status.CHARGE_LIMIT_REACHED,
+            Feature.DISCHARGE_BATTERY,
+            800.0,
+        ),
+    ),
+)
+def test_a_guard_runs_self_consumption_minus_the_direction_it_protects(
+    control,
+    monkeypatch: pytest.MonkeyPatch,
+    setter: str,
+    limit: int,
+    soc: float,
+    solar: float,
+    house: float,
+    expected,
+    feature,
+    power: float,
+) -> None:
+    """A latched guard commands the balance the inverter would have struck anyway,
+    clamped to the allowed side, even when that balance points the allowed way: only
+    one that lasts is handed back, never the poll the guard latches on."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(getattr(control, setter)(limit))
+
+    asyncio.run(
+        control.async_apply(
+            {"battery_soc": soc, "solar_power": solar, "house_power": house}
+        )
+    )
+
+    assert control.status is expected
+    assert control._commanded_feature is feature
+    assert control.power == power
+
+
+def test_a_guard_holds_a_chosen_mode_rather_than_turning_it_around(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tracking the house is only right for the inverter's own mode. Asked to charge,
+    the most a guard may do is refuse; draining the battery was never requested."""
+    allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 80.0})
+    asyncio.run(control.async_set_charge_limit_soc(80))
+    asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+
+    asyncio.run(
+        control.async_apply(
+            {
+                "battery_soc": 80.0,
+                "solar_power": 100.0,
+                "house_power": 900.0,
+                "grid_power": 800.0,
+                "battery_power": 0.0,
+            }
+        )
+    )
+
+    assert control.status is Status.CHARGE_LIMIT_REACHED
+    assert control._commanded_feature is Feature.HOLD_BATTERY
+    assert control.power == 1.0
+
+
+def test_a_charge_guard_blocks_a_trickle_too_small_to_read_as_a_surplus(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The battery charges from any surplus at all, so a guard that only acted on a
+    clear one let the battery charge past its limit while the weather stayed dull."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_charge_limit_soc(80))
+
+    asyncio.run(
+        control.async_apply(
+            {
+                "battery_soc": 80.0,
+                "solar_power": 550.0,
+                "house_power": 400.0,
+                "grid_power": 0.0,
+                "battery_power": 150.0,
+            }
+        )
+    )
+
+    assert control.status is Status.CHARGE_LIMIT_REACHED
+    assert control.power == 1.0
+
+
+def test_a_charge_guard_leaves_the_battery_free_to_serve_the_house(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A charge limit says nothing about discharging, and the hold that blocks
+    charging blocks that too, so the draw has to be commanded back explicitly."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_charge_limit_soc(80))
+
+    asyncio.run(
+        control.async_apply(
+            {
+                "battery_soc": 80.0,
+                "solar_power": 250.0,
+                "house_power": 400.0,
+                "grid_power": 150.0,
+                "battery_power": 0.0,
+            }
+        )
+    )
+
+    assert control.status is Status.CHARGE_LIMIT_REACHED
+    assert control.selected_feature is Feature.AUTOMATIC
+    # The whole draw, so the grid is not left carrying the remainder.
+    assert control.power == 150.0
+
+
+def test_a_held_charge_guard_ignores_the_surplus_its_own_hold_removed(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinning the battery takes away the sink, the array is curtailed to what the
+    house and the export ceiling can absorb, and the surplus the guard was watching
+    disappears. Reading that as permission would hand the battery straight back."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_charge_limit_soc(80))
+    charging = {
+        "battery_soc": 80.0,
+        "solar_power": 2000.0,
+        "house_power": 400.0,
+        "grid_power": -1600.0,
+        "battery_power": 1600.0,
+    }
+    asyncio.run(control.async_apply(charging))
+    assert control.status is Status.CHARGE_LIMIT_REACHED
+
+    # The array is now curtailed, so solar and house sit on top of each other.
+    curtailed = {
+        "battery_soc": 80.0,
+        "solar_power": 400.0,
+        "house_power": 400.0,
+        "grid_power": 0.0,
+        "battery_power": 0.0,
+    }
+    for poll in range(1, 11):
+        advance(control, monkeypatch, poll * (const.MIN_CONTROL_DWELL_S + 1))
+        asyncio.run(control.async_apply(curtailed))
+        assert control.status is Status.CHARGE_LIMIT_REACHED
+
+
+def test_a_held_charge_guard_covers_the_house_without_changing_method(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The draw the hold created is met from the battery rather than by handing the
+    inverter back, which would let it charge again and start the whole cycle over."""
+    write = allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_charge_limit_soc(80))
+    asyncio.run(
+        control.async_apply(
+            {
+                "battery_soc": 80.0,
+                "solar_power": 2000.0,
+                "house_power": 400.0,
+                "grid_power": -1600.0,
+                "battery_power": 1600.0,
+            }
+        )
+    )
+    assert control.status is Status.CHARGE_LIMIT_REACHED
+    write.reset_mock()
+
+    importing = {
+        "battery_soc": 80.0,
+        "solar_power": 100.0,
+        "house_power": 400.0,
+        "grid_power": 300.0,
+        "battery_power": 0.0,
+    }
+    for poll in range(1, 6):
+        advance(control, monkeypatch, poll * (const.MIN_CONTROL_DWELL_S + 1))
+        asyncio.run(control.async_apply(importing))
+        assert control.status is Status.CHARGE_LIMIT_REACHED
+
+    assert control.power == 300.0
+    # One retune and nothing else: the method is already the battery limits, and the
+    # inverter acts on the setpoint register without being told again.
+    assert commands(write) == [
+        (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0xFFFF, 0xFED4]),
+    ]
+
+
+def test_a_guard_the_inverter_does_not_follow_reports_the_miss(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #107: the guard asked for the house's whole draw while the battery gave
+    only about half of it, and the status only said "charge limit reached". The miss
+    must show, and changing the power every poll must not reset it."""
+    write = allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_charge_limit_soc(60))
+    asyncio.run(
+        control.async_apply(
+            {
+                "battery_soc": 67.0,
+                "solar_power": 2000.0,
+                "house_power": 400.0,
+                "grid_power": -1600.0,
+                "battery_power": 0.0,
+            }
+        )
+    )
+    write.reset_mock()
+
+    for poll, house in enumerate((3000.0, 3600.0, 4200.0, 4800.0), start=1):
+        advance(control, monkeypatch, poll * const.DEFAULT_SCAN_INTERVAL_S)
+        asyncio.run(
+            control.async_apply(
+                {
+                    "battery_soc": 67.0,
+                    "solar_power": 1400.0,
+                    "house_power": house,
+                    "grid_power": house - 1400.0 - 1200.0,
+                    "battery_power": -1200.0,
+                }
+            )
+        )
+
+    # One setpoint write per poll.
+    assert len(commands(write)) == 4
+    assert control.status is Status.RAMPING
+    assert control.active_guard is Status.CHARGE_LIMIT_REACHED
+
+
+def test_a_new_power_for_a_chosen_mode_is_judged_afresh(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Polls spent missing the old setpoint say nothing about the new one."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, 1000.0))
+    asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+    frame = {"battery_soc": 50.0, "battery_power": 0.0}
+
+    for poll in range(1, const.CONTROL_STATUS_DAMPING_POLLS):
+        advance(control, monkeypatch, poll * const.DEFAULT_SCAN_INTERVAL_S)
+        asyncio.run(control.async_apply(frame))
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, 3000.0))
+
+    assert control.status is Status.ACTIVE
+
+
+def test_a_held_guard_keeps_holding_when_the_frame_loses_the_battery_and_grid(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial read must not read as permission to charge."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_charge_limit_soc(80))
+    asyncio.run(
+        control.async_apply(
+            {
+                "battery_soc": 80.0,
+                "solar_power": 2000.0,
+                "house_power": 400.0,
+                "grid_power": -1600.0,
+                "battery_power": 1600.0,
+            }
+        )
+    )
+    assert control.status is Status.CHARGE_LIMIT_REACHED
+
+    for poll in range(1, 6):
+        advance(control, monkeypatch, poll * (const.MIN_CONTROL_DWELL_S + 1))
+        asyncio.run(control.async_apply({"battery_soc": 80.0}))
+        assert control.status is Status.CHARGE_LIMIT_REACHED
+
+
+def test_setting_a_limit_keeps_the_latch_when_the_state_of_charge_is_unknown(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Setting a limit clears the latch so the new one starts its hysteresis afresh,
+    but only where the frame can work it out again."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_charge_limit_soc(80))
+    asyncio.run(
+        control.async_apply(
+            {
+                "battery_soc": 80.0,
+                "solar_power": 2000.0,
+                "house_power": 400.0,
+                "grid_power": -1600.0,
+                "battery_power": 1600.0,
+            }
+        )
+    )
+    assert control.status is Status.CHARGE_LIMIT_REACHED
+
+    # A read that failed part way through leaves the state of charge behind.
+    advance(control, monkeypatch, const.MIN_CONTROL_DWELL_S + 1)
+    asyncio.run(control.async_apply({"solar_power": 2000.0, "house_power": 400.0}))
+
+    asyncio.run(control.async_set_charge_limit_soc(70))
+
+    assert control._charge_guard is True
+    assert control.status is Status.CHARGE_LIMIT_REACHED
+
+
+def test_writing_the_same_limit_again_changes_nothing(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An automation may write the limit it already has every few minutes. Starting
+    the hysteresis afresh each time would release a guard inside its band."""
+    write = allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_charge_limit_soc(60))
+    asyncio.run(control.async_apply({"battery_soc": 60.0}))
+    asyncio.run(control.async_apply({"battery_soc": 57.0}))
+    write.reset_mock()
+
+    asyncio.run(control.async_set_charge_limit_soc(60))
+
+    assert control._charge_guard is True
+    write.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("reserve", "phase"),
+    (
+        # Still at or above the state of charge, so the guard stays on.
+        (52, control_module.HandbackPhase.HANDED_BACK),
+        # Now below it, so the guard is off and there is nothing to hand back.
+        (40, control_module.HandbackPhase.TRACKING),
+    ),
+)
+def test_a_new_limit_keeps_the_hand_back_only_while_its_guard_stays_on(
+    control, monkeypatch: pytest.MonkeyPatch, reserve: int, phase
+) -> None:
+    """A new value that leaves the guard as it was changes nothing about who should
+    run the house, so the inverter is not taken back for a minute."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_battery_reserve_soc(51))
+    surplus = {
+        "battery_soc": 50.0,
+        "solar_power": 3000.0,
+        "house_power": 800.0,
+        "grid_power": 0.0,
+        "battery_power": 2200.0,
+    }
+    for poll in range(int(const.GUARD_HANDBACK_S // 5) + 2):
+        advance(control, monkeypatch, poll * 5)
+        asyncio.run(control.async_apply(surplus))
+    assert control._handback.phase is control_module.HandbackPhase.HANDED_BACK
+
+    asyncio.run(control.async_set_battery_reserve_soc(reserve))
+
+    assert control._handback.phase is phase
+
+
+def test_a_command_sets_its_limit_before_its_mode_reaches_the_inverter(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Choosing charge and then lowering the Charge Limit would charge for one write
+    past the new limit. A command sets both before anything is sent."""
+    write = allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 85.0})
+
+    asyncio.run(
+        control.async_set_command(
+            Feature.CHARGE_BATTERY, power=3000.0, charge_limit_soc=80.0, expire_in_s=900
+        )
+    )
+
+    assert control.selected_feature is Feature.CHARGE_BATTERY
+    assert control.feature_power(Feature.CHARGE_BATTERY) == 3000.0
+    assert control.charge_limit_soc == 80.0
+    assert control.expires_at == HEARTBEAT_START + timedelta(seconds=900)
+    # Only the hold goes out: setpoint 1 W, then the method word.
+    setpoint = const.REGISTERS_BY_KEY["battery_power_setpoint"].address
+    assert len(commands(write)) == 2
+    assert commands(write)[0] == (setpoint, [0, 1])
+
+
+def test_repeating_a_command_only_moves_its_expiry(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A planner sends its command again every few minutes, which must cost no write."""
+    write = allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    command = control.async_set_command
+    asyncio.run(command(Feature.DISCHARGE_BATTERY, power=2000.0, expire_in_s=900))
+    write.reset_mock()
+
+    advance(control, monkeypatch, 300)
+    asyncio.run(command(Feature.DISCHARGE_BATTERY, power=2000.0, expire_in_s=900))
+
+    assert commands(write) == []
+    assert control.expires_at == HEARTBEAT_START + timedelta(seconds=1200)
+
+
+def test_a_command_not_renewed_returns_to_automatic_and_keeps_its_limit(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the mode is undone. The limit stays where it was set."""
+    allow_writes(control, monkeypatch)
+    frame = {"battery_soc": 50.0}
+    control._inputs = control_module.ControlInputs.from_mapping(frame)
+    asyncio.run(
+        control.async_set_command(
+            Feature.CHARGE_BATTERY, power=2000.0, charge_limit_soc=80.0, expire_in_s=600
+        )
+    )
+
+    advance(control, monkeypatch, 599)
+    asyncio.run(control.async_apply(frame))
+    assert control.selected_feature is Feature.CHARGE_BATTERY
+
+    advance(control, monkeypatch, 600)
+    asyncio.run(control.async_apply(frame))
+    assert control.selected_feature is Feature.AUTOMATIC
+    assert control._commanded_feature is Feature.AUTOMATIC
+    assert control.charge_limit_soc == 80.0
+    control._on_command_expired.assert_called_once_with(Feature.CHARGE_BATTERY)
+
+
+def test_automatic_has_nothing_to_expire(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A planner's stop command may carry an expiry too, which must not later report
+    a return to automatic that never happened."""
+    allow_writes(control, monkeypatch)
+    frame = {"battery_soc": 50.0}
+    control._inputs = control_module.ControlInputs.from_mapping(frame)
+    asyncio.run(control.async_set_command(Feature.AUTOMATIC, expire_in_s=60))
+
+    advance(control, monkeypatch, 61)
+    asyncio.run(control.async_apply(frame))
+
+    assert control.expires_at is None
+    control._on_command_expired.assert_not_called()
+
+
+def test_choosing_a_mode_by_hand_cancels_a_commands_expiry(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(
+        control.async_set_command(Feature.CHARGE_BATTERY, power=2000.0, expire_in_s=60)
+    )
+    asyncio.run(control.async_select_feature(Feature.DISCHARGE_BATTERY))
+
+    advance(control, monkeypatch, 61)
+    asyncio.run(control.async_apply({"battery_soc": 50.0}))
+
+    assert control.selected_feature is Feature.DISCHARGE_BATTERY
+
+
+def test_a_command_needs_modbus_control_unless_it_only_sets_the_limit(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused command must not leave half of itself behind."""
+    write = allow_writes(control, monkeypatch)
+    control._enabled = False
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(
+            control.async_set_command(
+                Feature.CHARGE_BATTERY, power=2000.0, charge_limit_soc=80.0
+            )
+        )
+    assert control.charge_limit_soc == 100.0
+
+    asyncio.run(control.async_set_command(Feature.AUTOMATIC, charge_limit_soc=80.0))
+    assert control.charge_limit_soc == 80.0
+    write.assert_not_awaited()
+
+
+def test_a_guard_releases_only_past_the_hysteresis_band(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A whole-percent state of charge would chase a narrow band."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_battery_reserve_soc(20))
+    drawing = {"solar_power": 100.0, "house_power": 900.0}
+
+    asyncio.run(control.async_apply({"battery_soc": 20.0, **drawing}))
+    assert control.status is Status.RESERVE_REACHED
+
+    advance(control, monkeypatch, const.MIN_CONTROL_DWELL_S + 1)
+    asyncio.run(control.async_apply({"battery_soc": 24.0, **drawing}))
+    assert control.status is Status.RESERVE_REACHED
+
+    advance(control, monkeypatch, 2 * const.MIN_CONTROL_DWELL_S + 2)
+    asyncio.run(control.async_apply({"battery_soc": 25.0, **drawing}))
+    assert control.status is Status.AUTOMATIC
+
+
+def test_a_guard_engages_at_once_but_releases_only_after_the_dwell(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Protecting the battery late is worse than a command too soon after the last."""
+    write = allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_battery_reserve_soc(20))
+    drawing = {"solar_power": 100.0, "house_power": 900.0}
+    # A command went out a moment ago, so the dwell timer is running.
+    control._last_control_write_time = HEARTBEAT_START
+
+    asyncio.run(control.async_apply({"battery_soc": 20.0, **drawing}))
+    assert control.status is Status.RESERVE_REACHED
+    assert write.await_count > 0
+    write.reset_mock()
+
+    asyncio.run(control.async_apply({"battery_soc": 40.0, **drawing}))
+    assert control.status is Status.RESERVE_REACHED
+    write.assert_not_awaited()
+
+    advance(control, monkeypatch, const.MIN_CONTROL_DWELL_S + 1)
+    asyncio.run(control.async_apply({"battery_soc": 40.0, **drawing}))
+    assert control.status is Status.AUTOMATIC
+
+
+def test_an_untouched_install_never_takes_control(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ceiling of 100 is off, so a full battery must not make us seize control."""
+    write = allow_writes(control, monkeypatch)
+
+    asyncio.run(
+        control.async_apply(
+            {"battery_soc": 100.0, "solar_power": 3000.0, "house_power": 500.0}
+        )
+    )
+
+    assert control.status is Status.AUTOMATIC
+    write.assert_not_awaited()
+
+
+def test_polls_write_nothing_while_modbus_control_is_off(control) -> None:
+    control._enabled = False
+
+    for _ in range(3):
+        asyncio.run(control.async_poll({"battery_soc": 50.0}))
+
+    control._modbus_client.async_write.assert_not_awaited()
+
+
+def test_switching_modbus_control_off_hands_back_and_on_takes_control_again(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Letting the heartbeat lapse is the hand-back, so nothing is written for it."""
+    write = allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+    write.reset_mock()
+
+    asyncio.run(control.async_set_enabled(False))
+    asyncio.run(control.async_poll({"battery_soc": 50.0}))
+
+    write.assert_not_awaited()
+    assert control.status is Status.HANDING_BACK
+    assert control.hands_back_at == HEARTBEAT_START + timedelta(
+        seconds=const.HEARTBEAT_WINDOW_S
+    )
+    assert control.selected_feature is Feature.AUTOMATIC
+
+    lapsed = HEARTBEAT_START + timedelta(seconds=const.HEARTBEAT_WINDOW_S + 1)
+    monkeypatch.setattr(dt_util, "now", lambda: lapsed)
+    assert control.status is Status.NO_MODBUS_CONTROL
+    assert control.hands_back_at is None
+
+    control._heartbeat.start = Mock()
+    asyncio.run(control.async_set_enabled(True))
+    # The restarted heartbeat has landed.
+    advance(control, monkeypatch, const.HEARTBEAT_WINDOW_S + 2)
+    asyncio.run(control.async_poll({"battery_soc": 50.0}))
+
+    control._heartbeat.start.assert_called_once()
+    # The inverter may still follow the old command, so the default is re-sent.
+    assert commands(write) == [(const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0000])]
+    assert control.status is Status.AUTOMATIC
+
+
+def test_a_reserve_of_zero_disables_the_guard(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An external optimiser needs a way to take the floor off entirely."""
+    write = allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_battery_reserve_soc(0))
+
+    asyncio.run(
+        control.async_apply(
+            {"battery_soc": 0.0, "solar_power": 100.0, "house_power": 900.0}
+        )
+    )
+
+    assert control.status is Status.AUTOMATIC
+    write.assert_not_awaited()
+
+
+def test_a_command_is_re_sent_only_once_authority_has_lapsed(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """40532 reads 0 on a PowerOcean Plus, so polling must never second-guess us,
+    but a lapse hands the device back to the app and loses the setpoint too."""
+    write = allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+    write.reset_mock()
+
+    asyncio.run(control.async_apply())
+    write.assert_not_awaited()
+
+    control._control_stale = True
+    asyncio.run(control.async_apply())
+
+    assert [address for address, _ in commands(write)] == [
+        const.REGISTERS_BY_KEY["battery_power_setpoint"].address,
+        const.CONTROL_COMMAND_REGISTER,
+    ]
+    assert control._control_stale is False
+
+
+def test_a_failed_write_does_not_break_the_poll_and_is_retried(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recording a command the device never got would strand it in the old mode."""
+    allow_writes(control, monkeypatch)
+    control._feature = Feature.CHARGE_BATTERY
+    control._modbus_client.async_write = AsyncMock(
+        side_effect=HomeAssistantError("connection reset")
+    )
+
+    asyncio.run(control.async_poll({"battery_soc": 50.0}))
+
+    assert control.selected_feature is Feature.CHARGE_BATTERY
+    assert control.method is models.ControlMode.DEFAULT
+
+    write = allow_writes(control, monkeypatch)
+    asyncio.run(control.async_apply({"battery_soc": 50.0}))
+
+    assert write.await_count > 0
+    assert control.method is models.ControlMode.BATTERY_LIMITS
+
+
+def test_a_brief_excursion_leaves_the_control_status_alone(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A load step pulls the measurement wide until the battery absorbs it."""
+    allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(control.async_select_feature(Feature.EXPORT_TO_GRID))
+    settled = {"battery_soc": 50.0, "grid_power": -3000.0}
+    excursion = {"battery_soc": 50.0, "grid_power": -2100.0}
+
+    asyncio.run(control.async_apply(settled))
+    assert control.status is Status.ACTIVE
+
+    for _ in range(const.CONTROL_STATUS_DAMPING_POLLS - 1):
+        asyncio.run(control.async_apply(excursion))
+        assert control.status is Status.ACTIVE
+
+    asyncio.run(control.async_apply(excursion))
+    assert control.status is Status.RAMPING
+
+    asyncio.run(control.async_apply(settled))
+    assert control.status is Status.ACTIVE
+
+
+def test_battery_saver_applies_without_taking_control_from_the_app(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bit 3 applies like the LED does; only a control method locks the app out."""
+    write = allow_writes(control, monkeypatch)
+    control._enabled = False
+
+    asyncio.run(control.async_set_battery_saver(True))
+
+    assert control.battery_saver_commanded is True
+    assert commands(write) == [(const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0008])]
+
+
+def test_a_refused_command_rolls_back_the_commanded_state(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The UI must not report a write the device threw out."""
+    allow_writes(control, monkeypatch, rejected=True)
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(control.async_set_battery_saver(True))
+
+    assert control.battery_saver_commanded is False
+
+
+def test_the_status_reports_no_control_until_the_device_answers(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Modbus control being configured is not the same as the device following us."""
+    allow_writes(control, monkeypatch)
+    control._heartbeat._supported = None
+    control._heartbeat._last_success = None
+
+    assert control.status is Status.NO_MODBUS_CONTROL
+
+
+def test_the_parameters_survive_a_restart_but_the_selected_mode_does_not(
+    control,
+) -> None:
+    """Re-arming a mode the user cannot see would command the inverter silently."""
+    control._feature_power[Feature.CHARGE_BATTERY] = 4000.0
+    control._charge_limit_soc = 80.0
+    # A restart does not clear battery saver on the device, so it must not lie.
+    control._battery_saver = True
+    control._grid_feed_restore = {"mode": 1, "power": 9000}
+    control._grid_feed_stopped = True
+    control._feature = Feature.CHARGE_BATTERY
+
+    stored = control.dump_state()
+    control._enabled = False
+    control._feature_power[Feature.CHARGE_BATTERY] = 0.0
+    control._battery_saver = False
+    control._grid_feed_restore = None
+    control._grid_feed_stopped = False
+    control._feature = Feature.AUTOMATIC
+    control.load_state(stored)
+
+    assert control.enabled is True
+    assert control.feature_power(Feature.CHARGE_BATTERY) == 4000.0
+    assert control.charge_limit_soc == 80.0
+    assert control.battery_saver_commanded is True
+    assert control.grid_feed_restore == {"mode": 1, "power": 9000}
+    assert control._grid_feed_stopped is True
+    assert control.selected_feature is Feature.AUTOMATIC
+
+
+# Unlimited mode ignores the cap, so it allows export even with a zero cap.
+@pytest.mark.parametrize(
+    ("mode", "power"),
+    ((Feed.LIMITED, 9000), (Feed.UNLIMITED, 0), (Feed.UNLIMITED, 9000)),
+)
+def test_the_grid_feed_switch_stops_the_export_and_restores_it_exactly(
+    control, monkeypatch: pytest.MonkeyPatch, mode: models.GridFeedMode, power: int
+) -> None:
+    allow_writes(control, monkeypatch)
+    switch = EcoFlowSwitch.__new__(EcoFlowSwitch)
+    switch._definition = GRID_FEED_SWITCH
+    switch.coordinator = cast(
+        EcoflowCoordinator, SimpleNamespace(control=control, data={})
+    )
+    writes: list[tuple[str, int]] = []
+    control._write_setting = AsyncMock(
+        side_effect=lambda register, value, **_: writes.append((register.key, value))
+    )
+
+    def poll(mode: models.GridFeedMode, power: int) -> None:
+        switch.coordinator.data = {
+            "grid_feed_mode": mode,
+            "feed_in_power_max_setting": power,
+        }
+        control._inputs = control_module.ControlInputs.from_mapping(
+            switch.coordinator.data
+        )
+        control._track_grid_feed_restore(
+            control_module.ControlInputs.from_mapping(switch.coordinator.data)
+        )
+
+    poll(mode, power)
+    assert switch.is_on
+    asyncio.run(control.async_set_grid_feed(False))
+    poll(Feed.LIMITED, 0)
+    assert not switch.is_on
+    asyncio.run(control.async_set_grid_feed(True))
+
+    # Each order keeps the export from ever being briefly uncapped.
+    assert writes == [
+        ("grid_feed_mode", 0),
+        ("feed_in_power_max_setting", 0),
+        ("feed_in_power_max_setting", power),
+        ("grid_feed_mode", mode.register_value),
+    ]
+
+
+def test_the_restore_keeps_the_configured_cap_not_the_effective_one(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A derated effective cap written back would lower the configured one for good."""
+    allow_writes(control, monkeypatch)
+    control._track_grid_feed_restore(
+        control_module.ControlInputs.from_mapping(
+            {
+                "grid_feed_mode": Feed.LIMITED,
+                "feed_in_power_max_setting": 10000.0,
+                "feed_in_power_max_effective": 4000.0,
+                "feed_in_power_max": 4000.0,
+            }
+        )
+    )
+
+    assert control.grid_feed_restore == {"mode": 0, "power": 10000}
+
+
+def test_the_percentage_mode_is_never_adopted_or_switched(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restoring it as a watt limit or as unlimited would change the installer's cap."""
+    allow_writes(control, monkeypatch)
+    frame = {
+        "grid_feed_mode": Feed.LIMITED_PERCENT,
+        "feed_in_power_max_setting": 10000.0,
+        "feed_in_power_max_percent": 70.0,
+    }
+    control._inputs = control_module.ControlInputs.from_mapping(frame)
+    control._track_grid_feed_restore(control_module.ControlInputs.from_mapping(frame))
+
+    assert control.grid_feed_restore is None
+    assert control.grid_feed_allowed(frame) is True
+
+    # Even with a restore remembered from before the mode changed.
+    control._grid_feed_restore = {"mode": 1, "power": 9000}
+    assert control.grid_feed_switchable is False
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(control.async_set_grid_feed(False))
+    control._write_setting.assert_not_awaited()
+
+
+def test_an_export_limit_raised_on_the_device_is_adopted(control) -> None:
+    """An installer lifting the limit should not need the entry to be set up again."""
+    control._track_grid_feed_restore(
+        control_module.ControlInputs.from_mapping(
+            {"grid_feed_mode": Feed.LIMITED, "feed_in_power_max_setting": 9000.0}
+        )
+    )
+    control._track_grid_feed_restore(
+        control_module.ControlInputs.from_mapping(
+            {"grid_feed_mode": Feed.UNLIMITED, "feed_in_power_max_setting": 15000.0}
+        )
+    )
+
+    assert control.grid_feed_restore == {"mode": 1, "power": 15000}
+
+
+@pytest.mark.parametrize(
+    ("restore", "enabled"),
+    (
+        ({"grid_feed_mode": Feed.LIMITED, "feed_in_power_max": 0.0}, True),
+        ({"feed_in_power_max": 9000.0}, True),
+        ({"grid_feed_mode": Feed.UNLIMITED, "feed_in_power_max": 0.0}, False),
+    ),
+    ids=["limited-to-zero", "mode-not-read", "modbus-control-off"],
+)
+def test_the_grid_feed_switch_refuses_without_a_restore_or_modbus_control(
+    control, monkeypatch: pytest.MonkeyPatch, restore: dict, enabled: bool
+) -> None:
+    allow_writes(control, monkeypatch)
+    control._enabled = enabled
+    control._track_grid_feed_restore(control_module.ControlInputs.from_mapping(restore))
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(control.async_set_grid_feed(False))
+    control._write_setting.assert_not_awaited()
+
+
+def test_discharge_and_export_are_capped_by_the_inverter_capacity(control) -> None:
+    """40546 is the most the inverter turns from DC into AC. It moves with the
+    battery, so it caps what is sent, while the numbers go up to the rating."""
+    control._limits[const.CONF_MAX_BATTERY_DISCHARGED_POWER] = 25_000
+    control._limits[const.CONF_MAX_BATTERY_CHARGED_POWER] = 25_000
+    control._inputs = control_module.ControlInputs.from_mapping(
+        {
+            const.INVERTER_CAPACITY_KEY: 8000.0,
+            const.RECTIFIER_CAPACITY_KEY: 4000.0,
+            "feed_in_power_max": 12000.0,
+            "inverter_rated_power": 10000.0,
+        }
+    )
+
+    assert control._clamp_power(25_000, Feature.DISCHARGE_BATTERY) == 8000.0
+    assert control._clamp_power(25_000, Feature.EXPORT_TO_GRID) == 8000.0
+    assert control.feature_power_max(Feature.DISCHARGE_BATTERY) == 10000.0
+    assert control.feature_power_max(Feature.EXPORT_TO_GRID) == 10000.0
+    # PV on the DC side charges alongside the rectifier, so its capacity is no cap.
+    assert control.feature_power_max(Feature.CHARGE_BATTERY) == 10000.0
+
+
+@pytest.mark.parametrize(
+    "feature",
+    (Feature.DISCHARGE_BATTERY, Feature.EXPORT_TO_GRID, Feature.EXPORT_SOLAR_FIRST),
+)
+def test_a_moving_inverter_capacity_leaves_the_power_numbers_alone(
+    control, feature: Feature
+) -> None:
+    """40546 moves with the battery from poll to poll. As the numbers' maximum it
+    changed their capabilities so often that Home Assistant warned about it, and a
+    value set while it was low was cut to it for good. It caps only what is sent."""
+    control._limits[const.CONF_MAX_BATTERY_DISCHARGED_POWER] = 25_000
+    maxima = set()
+    for capacity in (8000.0, 7400.0, 7900.0, 6100.0):
+        control._inputs = control_module.ControlInputs.from_mapping(
+            {
+                const.INVERTER_CAPACITY_KEY: capacity,
+                "grid_feed_mode": Feed.UNLIMITED,
+                "inverter_rated_power": 10_000.0,
+            }
+        )
+        maxima.add(control.feature_power_max(feature))
+    assert maxima == {10_000.0}
+
+    asyncio.run(control.async_set_feature_power(feature, 9000))
+    assert control.feature_power(feature) == 9000.0
+    assert control._clamp_power(control.feature_power(feature), feature) == 6100.0
+
+
+def test_import_from_grid_is_capped_by_the_grid_connection_not_the_inverter(
+    control,
+) -> None:
+    """The house counts towards a meter target, so it can exceed the AC rating."""
+    control._limits[const.CONF_MAX_GRID_POWER] = 15_000
+    control._inputs = control_module.ControlInputs.from_mapping(
+        {
+            const.INVERTER_CAPACITY_KEY: 6850.0,
+            const.RECTIFIER_CAPACITY_KEY: 5000.0,
+            "inverter_rated_power": 8000.0,
+        }
+    )
+
+    assert control.feature_power_max(Feature.IMPORT_FROM_GRID) == 15_000.0
+    asyncio.run(control.async_set_feature_power(Feature.IMPORT_FROM_GRID, 12_000))
+    assert control.feature_power(Feature.IMPORT_FROM_GRID) == 12_000.0
+    # Export still has to pass the inverter, so its capacity keeps capping it.
+    assert control._clamp_power(15_000, Feature.EXPORT_TO_GRID) == 6850.0
+
+    # An unconfigured grid connection bounds nothing.
+    control._limits[const.CONF_MAX_GRID_POWER] = 0
+    assert control.feature_power_max(Feature.IMPORT_FROM_GRID) == float(
+        const.CONTROL_POWER_FALLBACK_MAX
+    )
+
+
+def test_an_unreported_inverter_capacity_bounds_nothing(control) -> None:
+    control._limits[const.CONF_MAX_BATTERY_DISCHARGED_POWER] = 25_000
+    control._inputs = control_module.ControlInputs.from_mapping(
+        {const.INVERTER_CAPACITY_KEY: 0.0, "inverter_rated_power": 10000.0}
+    )
+
+    assert control.feature_power_max(Feature.DISCHARGE_BATTERY) == 10000.0
+
+
+def test_the_effective_cap_alone_is_never_remembered_for_a_restore(
+    control,
+) -> None:
+    """Without the configured cap there is nothing safe to write back."""
+    control._track_grid_feed_restore(
+        control_module.ControlInputs.from_mapping(
+            {"grid_feed_mode": Feed.LIMITED, "feed_in_power_max": 4000.0}
+        )
+    )
+
+    assert control.grid_feed_restore is None
+
+
+def make_single_phase_control(
+    inverter_model: models.InverterModel = models.InverterModel.POWEROCEAN_SINGLE_PHASE,
+):
+    blocks = const.register_blocks_for(inverter_model)
+    manager = control_module.ControlManager(
+        cast(
+            ModbusClient,
+            SimpleNamespace(
+                connected=True, writes_allowed=True, async_write=AsyncMock()
+            ),
+        ),
+        registers_by_key={
+            register.key: register for block in blocks for register in block.registers
+        },
+        limits={
+            const.CONF_MAX_GRID_POWER: 15_000,
+            const.CONF_MAX_SOLAR_POWER: 12_000,
+            const.CONF_MAX_BATTERY_CHARGED_POWER: 5_000,
+            const.CONF_MAX_BATTERY_DISCHARGED_POWER: 6_600,
+        },
+        inverter_model=inverter_model,
+        enabled=True,
+        scan_interval_s=const.DEFAULT_SCAN_INTERVAL_S,
+        on_update=Mock(),
+        on_refresh=AsyncMock(),
+        write_setting=AsyncMock(),
+        on_command_expired=Mock(),
+    )
+    manager._control_stale = False
+    return manager
+
+
+@pytest.mark.parametrize(
+    "model",
+    (
+        models.InverterModel.POWEROCEAN_SINGLE_PHASE,
+        models.InverterModel.OCEAN_2_SINGLE_PHASE,
+    ),
+)
+def test_single_phase_charge_guard_hands_back_to_automatic_when_house_exceeds_solar(
+    model: models.InverterModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On single-phase models where Modbus cannot drive self-consumption discharge,
+    a charge limit hands control back to Automatic whenever the house uses more
+    than solar power, letting the inverter supplement house load without grid draw."""
+    sp_control = make_single_phase_control(model)
+    allow_writes(sp_control, monkeypatch)
+    asyncio.run(sp_control.async_set_charge_limit_soc(88))
+
+    # Surplus solar: hold battery to prevent charging above limit.
+    surplus_frame = {
+        "battery_soc": 88.0,
+        "solar_power": 1379.0,
+        "house_power": 186.0,
+        "grid_power": -1193.0,
+        "battery_power": 0.0,
+    }
+    asyncio.run(sp_control.async_apply(surplus_frame))
+    assert sp_control.status is Status.CHARGE_LIMIT_REACHED
+    assert sp_control._commanded_feature is Feature.HOLD_BATTERY
+    assert sp_control.power == 1.0
+
+    # A deficit inside the settling window (<= 30 s) keeps HOLD_BATTERY.
+    deficit_frame = {
+        "battery_soc": 88.0,
+        "solar_power": 1404.0,
+        "house_power": 1542.0,
+        "grid_power": 0.0,
+        "battery_power": -138.0,
+    }
+    asyncio.run(sp_control.async_apply(deficit_frame))
+    assert sp_control._commanded_feature is Feature.HOLD_BATTERY
+
+    # Once settled, a house 138 W over solar hands back to native Automatic.
+    advance(sp_control, monkeypatch, const.GUARD_SETTLE_S)
+    asyncio.run(sp_control.async_apply(deficit_frame))
+    assert sp_control.status is Status.CHARGE_LIMIT_REACHED
+    assert sp_control._commanded_feature is Feature.AUTOMATIC
+    assert sp_control.power == 0.0
+
+    # After the dwell time in Automatic, a clear surplus holds the battery again.
+    advance(sp_control, monkeypatch, 2 * const.GUARD_SETTLE_S)
+    asyncio.run(sp_control.async_apply(surplus_frame))
+    assert sp_control.status is Status.CHARGE_LIMIT_REACHED
+    assert sp_control._commanded_feature is Feature.HOLD_BATTERY
+    assert sp_control.power == 1.0
+
+
+def test_single_phase_reserve_guard_hands_back_to_automatic_when_solar_exceeds_house(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On single-phase models, a battery reserve hands control back to Automatic
+    whenever solar exceeds house load, allowing solar to recharge the battery."""
+    sp_control = make_single_phase_control()
+    allow_writes(sp_control, monkeypatch)
+    asyncio.run(sp_control.async_set_battery_reserve_soc(20))
+
+    # House deficit: hold battery to protect reserve.
+    deficit_frame = {
+        "battery_soc": 20.0,
+        "solar_power": 100.0,
+        "house_power": 900.0,
+        "grid_power": 800.0,
+        "battery_power": 0.0,
+    }
+    asyncio.run(sp_control.async_apply(deficit_frame))
+    assert sp_control.status is Status.RESERVE_REACHED
+    assert sp_control._commanded_feature is Feature.HOLD_BATTERY
+    assert sp_control.power == 1.0
+
+    # Settling window elapses: solar surplus hands back to native Automatic to recharge.
+    advance(sp_control, monkeypatch, const.GUARD_SETTLE_S)
+    surplus_frame = {
+        "battery_soc": 20.0,
+        "solar_power": 2000.0,
+        "house_power": 500.0,
+        "grid_power": 0.0,
+        "battery_power": 1500.0,
+    }
+    asyncio.run(sp_control.async_apply(surplus_frame))
+    assert sp_control.status is Status.RESERVE_REACHED
+    assert sp_control._commanded_feature is Feature.AUTOMATIC
+    assert sp_control.power == 0.0
+
+
+def test_natural_from_grid_side_and_solar_side(control) -> None:
+    """_natural_from_grid_side reads battery - grid, and _natural_from_solar_side
+    reads solar - house."""
+    data = {
+        "battery_power": 868.0,
+        "grid_power": 758.0,
+        "solar_power": 1375.0,
+        "house_power": 1381.0,
+    }
+    assert (
+        control._natural_from_grid_side(control_module.ControlInputs.from_mapping(data))
+        == 110.0
+    )
+    assert (
+        control._natural_from_solar_side(
+            control_module.ControlInputs.from_mapping(data)
+        )
+        == -6.0
+    )
+    assert (
+        control._natural_battery_power(control_module.ControlInputs.from_mapping(data))
+        == 110.0
+    )
+
+
+def test_single_phase_guarded_command_uses_minimum_surplus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When grid-side and solar-side estimates disagree, single-phase models
+    choose the smaller surplus (min) so false surplus from grid charging does not
+    block handback under a charge limit."""
+    sp_control = make_single_phase_control()
+    allow_writes(sp_control, monkeypatch)
+    asyncio.run(sp_control.async_set_charge_limit_soc(88))
+    # After settling window
+    advance(sp_control, monkeypatch, const.GUARD_SETTLE_S)
+    data = {
+        "battery_soc": 88.0,
+        "battery_power": 868.0,
+        "grid_power": 758.0,
+        "solar_power": 1375.0,
+        "house_power": 1450.0,
+    }
+    # from_grid_side is +110 W, but from_solar_side is -75 W.
+    # min(+110, -75) = -75 W, so wanted = +75 W, past the 20 W deadband:
+    # hands back to AUTOMATIC.
+    asyncio.run(sp_control.async_apply(data))
+    assert sp_control._commanded_feature is Feature.AUTOMATIC
+
+
+def test_single_phase_guard_handback_deadband_hysteresis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Small fluctuations around equilibrium (<= 20W) do not toggle between HOLD
+    and AUTOMATIC; once handed back it stays in AUTOMATIC until a clear surplus."""
+    sp_control = make_single_phase_control()
+    allow_writes(sp_control, monkeypatch)
+    asyncio.run(sp_control.async_set_charge_limit_soc(88))
+
+    # 1. Clear surplus: holds battery.
+    asyncio.run(
+        sp_control.async_apply(
+            {"battery_soc": 88.0, "solar_power": 1000.0, "house_power": 900.0}
+        )
+    )
+    assert sp_control._commanded_feature is Feature.HOLD_BATTERY
+
+    # 2. A 10 W draw (inside the 20 W deadband) after settling keeps HOLD_BATTERY.
+    advance(sp_control, monkeypatch, const.GUARD_SETTLE_S)
+    asyncio.run(
+        sp_control.async_apply(
+            {"battery_soc": 88.0, "solar_power": 1000.0, "house_power": 1010.0}
+        )
+    )
+    assert sp_control._commanded_feature is Feature.HOLD_BATTERY
+
+    # 3. Clear draw of 30 W (> 20 W deadband): hands back to AUTOMATIC.
+    asyncio.run(
+        sp_control.async_apply(
+            {"battery_soc": 88.0, "solar_power": 1000.0, "house_power": 1030.0}
+        )
+    )
+    assert sp_control._commanded_feature is Feature.AUTOMATIC
+
+    # 4. Load drops back to 10 W draw (> -20 W): hysteresis keeps it in AUTOMATIC.
+    asyncio.run(
+        sp_control.async_apply(
+            {"battery_soc": 88.0, "solar_power": 1000.0, "house_power": 1010.0}
+        )
+    )
+    assert sp_control._commanded_feature is Feature.AUTOMATIC
+
+    # 5. A 10 W surplus (inside the deadband) stays in AUTOMATIC after the dwell.
+    advance(sp_control, monkeypatch, 2 * const.GUARD_SETTLE_S)
+    asyncio.run(
+        sp_control.async_apply(
+            {"battery_soc": 88.0, "solar_power": 1010.0, "house_power": 1000.0}
+        )
+    )
+    assert sp_control._commanded_feature is Feature.AUTOMATIC
+
+    # 6. A clear surplus (solar 1030 W, house 1000 W) takes control back to HOLD.
+    asyncio.run(
+        sp_control.async_apply(
+            {"battery_soc": 88.0, "solar_power": 1030.0, "house_power": 1000.0}
+        )
+    )
+    assert sp_control._commanded_feature is Feature.HOLD_BATTERY
+
+    # 7. Minor 10 W noise draw again: stays in HOLD_BATTERY without chattering.
+    advance(sp_control, monkeypatch, 3 * const.GUARD_SETTLE_S)
+    asyncio.run(
+        sp_control.async_apply(
+            {"battery_soc": 88.0, "solar_power": 1000.0, "house_power": 1010.0}
+        )
+    )
+    assert sp_control._commanded_feature is Feature.HOLD_BATTERY
+
+
+def test_a_battery_overruled_by_the_inverter_is_reported_once_settled(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A charge met with a discharge is a firmware limit, not slow ramping."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_command(Feature.CHARGE_BATTERY, power=1500.0))
+    overruled = {"battery_soc": 45.0, "battery_power": -2847.0, "grid_power": 3270.0}
+
+    # Turning around from a discharge passes the far side of zero, so a new
+    # command is given time first.
+    for _ in range(const.CONTROL_STATUS_DAMPING_POLLS):
+        asyncio.run(control.async_apply(overruled))
+    assert control.status is Status.RAMPING
+
+    advance(control, monkeypatch, const.GUARD_SETTLE_S + 1)
+    for _ in range(const.CONTROL_STATUS_DAMPING_POLLS):
+        asyncio.run(control.async_apply(overruled))
+    assert control.status is Status.LIMITED_BY_INVERTER
+
+
+def test_charge_to_reserve_charges_from_the_grid_then_holds_the_floor(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Like the app's backup reserve: up to it from the grid, then never below."""
+    write = allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, 2500.0))
+    asyncio.run(control.async_set_battery_reserve_soc(50))
+    asyncio.run(control.async_set_reserve_charge(True))
+    drawing = {"solar_power": 0.0, "house_power": 900.0, "grid_power": 900.0}
+
+    asyncio.run(control.async_apply({"battery_soc": 40.0, **drawing}))
+    assert control.status is Status.CHARGING_TO_RESERVE
+    assert control._commanded_feature is Feature.CHARGE_BATTERY
+    assert control._commanded_power == 2500.0
+    assert control.active_guard is Status.CHARGING_TO_RESERVE
+    assert write.await_count > 0
+
+    advance(control, monkeypatch, const.MIN_CONTROL_DWELL_S + 1)
+    asyncio.run(control.async_apply({"battery_soc": 50.0, **drawing}))
+    assert control.status is Status.RESERVE_REACHED
+    assert control._commanded_feature is not Feature.CHARGE_BATTERY
+
+
+def test_charge_to_reserve_leaves_the_reserve_a_floor_when_off_or_without_power(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_battery_reserve_soc(50))
+    drawing = {"solar_power": 0.0, "house_power": 900.0, "grid_power": 900.0}
+
+    asyncio.run(control.async_apply({"battery_soc": 40.0, **drawing}))
+    assert control.status is Status.RESERVE_REACHED
+
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, 0.0))
+    asyncio.run(control.async_set_reserve_charge(True))
+    asyncio.run(control.async_apply({"battery_soc": 40.0, **drawing}))
+    assert control.status is Status.RESERVE_REACHED
+
+
+def test_the_charge_limit_outranks_charging_to_the_reserve(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A limit the user set against charging is never charged through."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_charge_limit_soc(30))
+    asyncio.run(control.async_set_battery_reserve_soc(50))
+    asyncio.run(control.async_set_reserve_charge(True))
+
+    asyncio.run(
+        control.async_apply(
+            {"battery_soc": 40.0, "solar_power": 0.0, "house_power": 900.0}
+        )
+    )
+    assert control._commanded_feature is not Feature.CHARGE_BATTERY
+    assert control.status is not Status.CHARGING_TO_RESERVE
+
+
+def test_charge_to_reserve_survives_a_restart(control) -> None:
+    control._reserve_charge = True
+    stored = control.dump_state()
+    control._reserve_charge = False
+
+    control.load_state(stored)
+
+    assert control.reserve_charge is True
+
+
+@pytest.fixture
+def native_control(control):
+    """A manager on a model whose inverter keeps the Battery Reserve itself."""
+    control._reserve_native = True
+    return control
+
+
+def test_only_the_three_phase_keeps_its_own_reserve_unless_overridden() -> None:
+    native = [
+        model
+        for model in models.InverterModel
+        if model.traits.battery_reserve is models.ReserveSupport.NATIVE
+    ]
+    assert native == [models.InverterModel.POWEROCEAN_THREE_PHASE]
+
+    plus = models.InverterModel.POWEROCEAN_PLUS
+    assert models.battery_reserve_for(plus, None) is models.ReserveSupport.EMULATED
+    assert models.battery_reserve_for(plus, "native") is models.ReserveSupport.NATIVE
+
+
+def test_a_native_reserve_is_written_to_the_inverter_without_control(
+    native_control,
+) -> None:
+    """A setting, so it applies with Modbus Control off, as the app's does."""
+    native_control._enabled = False
+
+    asyncio.run(native_control.async_set_battery_reserve_soc(30.4))
+
+    native_control._write_setting.assert_awaited_once()
+    register, value = native_control._write_setting.await_args.args
+    assert register.key == const.BATTERY_RESERVE_REGISTER_KEY
+    assert value == 30
+    assert native_control.battery_reserve_soc == 30.0
+
+
+def test_a_native_reserve_follows_a_change_made_in_the_app(
+    native_control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(native_control, monkeypatch)
+
+    asyncio.run(
+        native_control.async_apply(
+            {"battery_soc": 60.0, const.BATTERY_RESERVE_REGISTER_KEY: 40}
+        )
+    )
+
+    assert native_control.battery_reserve_soc == 40.0
+
+
+def test_a_native_reserve_is_left_to_the_inverter_in_automatic_only(
+    native_control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inverter keeps it while it runs itself; a manual command outranks it."""
+    allow_writes(native_control, monkeypatch)
+    below = {
+        "battery_soc": 20.0,
+        const.BATTERY_RESERVE_REGISTER_KEY: 30,
+        "solar_power": 0.0,
+        "house_power": 900.0,
+        "grid_power": 0.0,
+        "battery_power": -900.0,
+    }
+
+    asyncio.run(native_control.async_apply(below))
+    assert native_control.status is Status.AUTOMATIC
+    assert native_control._commanded_feature is Feature.AUTOMATIC
+
+    asyncio.run(
+        native_control.async_set_command(Feature.DISCHARGE_BATTERY, power=2000.0)
+    )
+    asyncio.run(native_control.async_apply(below))
+    assert native_control.status is Status.RESERVE_REACHED
+    assert native_control._commanded_feature is not Feature.DISCHARGE_BATTERY
+
+
+@pytest.mark.parametrize(
+    ("app_reserve", "left_to_inverter"), ((20, True), (30, True), (10, False))
+)
+def test_an_emulated_reserve_is_left_to_the_inverter_at_the_app_reserve(
+    control, monkeypatch: pytest.MonkeyPatch, app_reserve: int, left_to_inverter: bool
+) -> None:
+    """At the app's reserve the inverter keeps it as it does a native one, in
+    Automatic only. An app reserve below ours would let it discharge past ours."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_battery_reserve_soc(20))
+    at_reserve = {
+        "battery_soc": 20.0,
+        const.BATTERY_RESERVE_REGISTER_KEY: app_reserve,
+        "solar_power": 0.0,
+        "house_power": 900.0,
+        "grid_power": 900.0,
+        "battery_power": 0.0,
+    }
+
+    asyncio.run(control.async_apply(at_reserve))
+    if left_to_inverter:
+        assert control.status is Status.AUTOMATIC
+        assert control._commanded_feature is Feature.AUTOMATIC
+    else:
+        assert control.status is Status.RESERVE_REACHED
+        assert control._commanded_feature is not Feature.AUTOMATIC
+
+    asyncio.run(control.async_set_command(Feature.DISCHARGE_BATTERY, power=2000.0))
+    asyncio.run(control.async_apply(at_reserve))
+    assert control.status is Status.RESERVE_REACHED
+    assert control._commanded_feature is not Feature.DISCHARGE_BATTERY
+
+
+RESERVE_FRAME = {
+    "battery_soc": 50.0,
+    "solar_power": 0.0,
+    "house_power": 900.0,
+    "grid_power": 0.0,
+    "battery_power": -900.0,
+}
+App = models.ReserveSource.APP
+Ours = models.ReserveSource.BATTERY_RESERVE
+
+
+@pytest.mark.parametrize(
+    ("app", "ours", "expected"),
+    (
+        (10, 30, (30.0, Ours)),  # the guard keeps ours above the inverter's
+        (40, 30, (40.0, App)),  # the inverter keeps the app's above ours
+        (10, 0, (10.0, App)),  # an unset Battery Reserve keeps nothing
+        (None, 30, (30.0, Ours)),
+    ),
+)
+def test_in_automatic_the_higher_kept_reserve_holds(
+    control, monkeypatch: pytest.MonkeyPatch, app, ours, expected
+) -> None:
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_battery_reserve_soc(ours))
+    asyncio.run(
+        control.async_apply({**RESERVE_FRAME, const.BATTERY_RESERVE_REGISTER_KEY: app})
+    )
+
+    assert control._commanded_feature is Feature.AUTOMATIC
+    assert control.reserve_in_force == expected
+
+
+@pytest.mark.parametrize("ours", (30, 0))
+def test_a_manual_command_outranks_the_app_reserve(
+    control, monkeypatch: pytest.MonkeyPatch, ours
+) -> None:
+    """Only the guard holds under a command, so the app's reserve is not in force."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_battery_reserve_soc(ours))
+    asyncio.run(control.async_set_command(Feature.DISCHARGE_BATTERY, power=2000.0))
+    asyncio.run(
+        control.async_apply({**RESERVE_FRAME, const.BATTERY_RESERVE_REGISTER_KEY: 40})
+    )
+
+    assert control._commanded_feature is Feature.DISCHARGE_BATTERY
+    assert control.reserve_in_force == (float(ours), Ours)
+
+
+def test_without_control_the_inverter_keeps_the_app_reserve(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_battery_reserve_soc(30))
+    asyncio.run(
+        control.async_apply({**RESERVE_FRAME, const.BATTERY_RESERVE_REGISTER_KEY: 10})
+    )
+    asyncio.run(control.async_set_enabled(False))
+
+    assert control.reserve_in_force == (10.0, App)
+
+
+def test_a_native_reserve_is_the_inverter_s_until_a_command_outranks_it(
+    native_control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(native_control, monkeypatch)
+    frame = {**RESERVE_FRAME, const.BATTERY_RESERVE_REGISTER_KEY: 25}
+    asyncio.run(native_control.async_apply(frame))
+    assert native_control.reserve_in_force == (25.0, App)
+
+    asyncio.run(
+        native_control.async_set_command(Feature.DISCHARGE_BATTERY, power=2000.0)
+    )
+    asyncio.run(native_control.async_apply(frame))
+    assert native_control.reserve_in_force == (25.0, Ours)
+
+
+def test_no_reserve_is_known_before_a_read_or_during_the_control_test(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control._enabled = False
+    assert control.reserve_in_force == (None, None)
+
+    allow_writes(control, monkeypatch)
+    control._enabled = True
+    asyncio.run(
+        control.async_apply({**RESERVE_FRAME, const.BATTERY_RESERVE_REGISTER_KEY: 10})
+    )
+    asyncio.run(control.async_begin_test())
+    assert control.reserve_in_force == (None, None)
+
+
+def test_the_app_reserve_above_the_soc_turns_charge_to_reserve_on(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inverter charges up to its app reserve by itself, so the option is on
+    until the battery gets there, cannot be turned off meanwhile, and keeps what it
+    was set to for afterwards."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_battery_reserve_soc(30))
+    below = {
+        "battery_soc": 22.0,
+        const.BATTERY_RESERVE_REGISTER_KEY: 25,
+        "solar_power": 0.0,
+        "house_power": 900.0,
+        "grid_power": 900.0,
+        "battery_power": 0.0,
+    }
+
+    asyncio.run(control.async_apply(below))
+    assert control.reserve_charge_forced is True
+    assert control.reserve_charge is False
+    assert control.status is Status.CHARGING_TO_RESERVE
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(control.async_set_reserve_charge(False))
+
+    asyncio.run(control.async_apply({**below, "battery_soc": 25.0}))
+    assert control.reserve_charge_forced is False
+    assert control.status is Status.RESERVE_REACHED
+    asyncio.run(control.async_set_reserve_charge(False))
+
+
+def test_a_native_reserve_is_never_charged_by_the_app_reserve_rule(
+    native_control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native reserve is the app's reserve, which the inverter charges itself."""
+    allow_writes(native_control, monkeypatch)
+    asyncio.run(
+        native_control.async_apply(
+            {
+                "battery_soc": 20.0,
+                const.BATTERY_RESERVE_REGISTER_KEY: 30,
+                "solar_power": 0.0,
+                "house_power": 900.0,
+            }
+        )
+    )
+
+    assert native_control.reserve_charge_forced is False
+    assert native_control.status is not Status.CHARGING_TO_RESERVE
+
+
+def test_a_native_reserve_never_charges_in_the_integration(
+    native_control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inverter charges up to its own reserve, as it does for the app's."""
+    allow_writes(native_control, monkeypatch)
+    asyncio.run(native_control.async_set_reserve_charge(True))
+
+    asyncio.run(
+        native_control.async_apply(
+            {
+                "battery_soc": 20.0,
+                const.BATTERY_RESERVE_REGISTER_KEY: 50,
+                "solar_power": 0.0,
+                "house_power": 900.0,
+            }
+        )
+    )
+
+    assert native_control.status is not Status.CHARGING_TO_RESERVE
+    assert native_control._commanded_feature is not Feature.CHARGE_BATTERY
+
+
+def test_turning_charge_to_reserve_off_mid_charge_is_not_an_empty_battery(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Below a raised reserve, a battery still winding down a charge is not empty."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, 2500.0))
+    asyncio.run(control.async_set_battery_reserve_soc(50))
+    asyncio.run(control.async_set_reserve_charge(True))
+    charging = {
+        "battery_soc": 40.0,
+        "battery_power": 2500.0,
+        "grid_power": 3400.0,
+        "solar_power": 0.0,
+        "house_power": 900.0,
+    }
+    asyncio.run(control.async_apply(charging))
+    assert control.status is Status.CHARGING_TO_RESERVE
+
+    asyncio.run(control.async_set_reserve_charge(False))
+    for _ in range(const.CONTROL_STATUS_DAMPING_POLLS + 1):
+        asyncio.run(control.async_apply(charging))
+
+    # The reserve now only holds the floor, and the charge is still winding down.
+    assert control.status in (Status.RESERVE_REACHED, Status.RAMPING)
+
+
+def status_word(
+    method: int = 0, *, manual: bool = True, bms: bool = True, off_grid: bool = False
+) -> int:
+    """System Status (40530) as the inverter reports it."""
+    return (
+        (method << 7)
+        | (manual << 11)
+        | (bms << 12)
+        | int(off_grid)
+        | 0x14  # on work, self-consumption
+    )
+
+
+def test_the_status_words_decode_to_what_the_inverter_is_doing() -> None:
+    report = models.DeviceReport.from_data(
+        {"system_modes": 0x1994, "system_state_2": 0}
+    )
+    assert report == models.DeviceReport(
+        method=models.ControlMode.BATTERY_LIMITS,
+        manual=True,
+        off_grid=False,
+        bms_connected=True,
+        fault=False,
+    )
+    # Emergency power off in System State 2.
+    stopped = models.DeviceReport.from_data(
+        {"system_modes": 0x1014, "system_state_2": 1 << 2}
+    )
+    assert stopped is not None
+    assert stopped.fault
+    assert models.DeviceReport.from_data({}) is None
+
+
+def test_a_command_the_inverter_does_not_report_is_sent_again_then_flagged(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Heartbeats keep succeeding after an inverter restart forgot the command."""
+    write = allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_command(Feature.CHARGE_BATTERY, power=1500.0))
+    # The inverter first shows it reports what it follows, then forgets it.
+    asyncio.run(
+        control.async_apply({"battery_soc": 50.0, "system_modes": status_word(3)})
+    )
+    forgotten = {"battery_soc": 50.0, "system_modes": status_word(0)}
+
+    elapsed = const.FOLLOW_GRACE_S + 1
+    advance(control, monkeypatch, elapsed)
+    for resend in range(1, const.FOLLOW_RESENDS + 1):
+        before = write.await_count
+        for _ in range(const.CONTROL_STATUS_DAMPING_POLLS + 1):
+            asyncio.run(control.async_apply(forgotten))
+        assert write.await_count > before, f"resend {resend} was not written"
+        assert control.status is not Status.NOT_ACCEPTED
+        elapsed += const.FOLLOW_GRACE_S + 1
+        advance(control, monkeypatch, elapsed)
+
+    for _ in range(const.CONTROL_STATUS_DAMPING_POLLS):
+        asyncio.run(control.async_apply(forgotten))
+    assert control.status is Status.NOT_ACCEPTED
+
+    followed = {"battery_soc": 50.0, "system_modes": status_word(3)}
+    asyncio.run(control.async_apply(followed))
+    assert control.status is not Status.NOT_ACCEPTED
+
+
+def test_control_steps_aside_off_grid_and_comes_back_with_the_grid(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_command(Feature.CHARGE_BATTERY, power=1500.0))
+
+    outage = {"battery_soc": 50.0, "system_modes": status_word(3, off_grid=True)}
+    asyncio.run(control.async_poll(outage))
+    assert control._commanded_feature is Feature.CHARGE_BATTERY, "one read is enough"
+    for _ in range(const.CONTROL_STATUS_DAMPING_POLLS - 1):
+        asyncio.run(control.async_poll(outage))
+    assert control.status is Status.OFF_GRID
+    assert control._commanded_feature is Feature.AUTOMATIC
+
+    back = {"battery_soc": 50.0, "system_modes": status_word(0)}
+    advance(control, monkeypatch, const.MIN_CONTROL_DWELL_S + 1)
+    asyncio.run(control.async_poll(back))
+    assert control._commanded_feature is Feature.CHARGE_BATTERY
+    assert control.selected_feature is Feature.CHARGE_BATTERY
+
+
+def test_a_battery_is_only_missing_once_one_has_been_seen(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model that never sets the BMS bit must still be controlled."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_command(Feature.CHARGE_BATTERY, power=1500.0))
+    no_bit = {"battery_soc": 50.0, "system_modes": status_word(3, bms=False)}
+
+    asyncio.run(control.async_poll(no_bit))
+    assert control._commanded_feature is Feature.CHARGE_BATTERY
+
+    asyncio.run(
+        control.async_poll({"battery_soc": 50.0, "system_modes": status_word(3)})
+    )
+    for _ in range(const.CONTROL_STATUS_DAMPING_POLLS):
+        asyncio.run(control.async_poll(no_bit))
+    assert control.status is Status.BATTERY_DISCONNECTED
+    assert control._commanded_feature is Feature.AUTOMATIC
+
+
+def test_a_battery_seen_before_a_restart_is_missed_after_it(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    asyncio.run(
+        control.async_poll({"battery_soc": 50.0, "system_modes": status_word(3)})
+    )
+    stored = control.dump_state()
+
+    control._checks = ReadingChecks()
+    control.load_state(stored)
+    no_bit = {"battery_soc": 50.0, "system_modes": status_word(3, bms=False)}
+    for _ in range(const.CONTROL_STATUS_DAMPING_POLLS):
+        asyncio.run(control.async_poll(no_bit))
+
+    assert control.status is Status.BATTERY_DISCONNECTED
+
+
+def test_an_inverter_fault_is_named_without_changing_the_command(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_command(Feature.CHARGE_BATTERY, power=1500.0))
+
+    failed = {
+        "battery_soc": 50.0,
+        "system_modes": status_word(3),
+        "system_state_2": 1 << 10,  # PCS failure
+    }
+    for _ in range(const.CONTROL_STATUS_DAMPING_POLLS):
+        asyncio.run(control.async_apply(failed))
+
+    assert control.status is Status.INVERTER_FAULT
+    assert control._commanded_feature is Feature.CHARGE_BATTERY
+
+
+def test_a_model_that_never_reports_following_is_left_alone(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without bit 11 or the method bits, nothing is resent and nothing is flagged."""
+    write = allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_command(Feature.CHARGE_BATTERY, power=1500.0))
+    silent = {"battery_soc": 50.0, "system_modes": status_word(0, manual=False)}
+
+    advance(control, monkeypatch, const.FOLLOW_GRACE_S + 1)
+    sent = write.await_count
+    for _ in range(4 * const.CONTROL_STATUS_DAMPING_POLLS):
+        asyncio.run(control.async_apply(silent))
+
+    assert write.await_count == sent
+    assert control.status is not Status.NOT_ACCEPTED
+
+
+def test_user_actions_do_not_count_as_polls(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pressing buttons must not hurry a device state past its damping."""
+    allow_writes(control, monkeypatch)
+    asyncio.run(
+        control.async_apply(
+            {"battery_soc": 50.0, "system_modes": status_word(0, off_grid=True)}
+        )
+    )
+    for _ in range(const.CONTROL_STATUS_DAMPING_POLLS):
+        asyncio.run(control.async_set_command(Feature.CHARGE_BATTERY, power=1500.0))
+
+    assert control.status is not Status.OFF_GRID
+    assert control._commanded_feature is Feature.CHARGE_BATTERY
+
+
+def test_a_flicker_of_a_device_state_does_not_interrupt_the_mode(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_command(Feature.CHARGE_BATTERY, power=1500.0))
+    normal = {"battery_soc": 50.0, "system_modes": status_word(3)}
+    glitch = {"battery_soc": 50.0, "system_modes": status_word(3, off_grid=True)}
+
+    for data in (normal, glitch, glitch, normal, glitch, normal):
+        asyncio.run(control.async_apply(data))
+        assert control._commanded_feature is Feature.CHARGE_BATTERY
+    assert control.status is not Status.OFF_GRID

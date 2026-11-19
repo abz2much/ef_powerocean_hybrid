@@ -1,0 +1,235 @@
+"""Dynamic number entities configuration platform for EF PowerOcean Hybrid."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import replace
+from typing import Any
+
+from homeassistant.components.number import (
+    NumberDeviceClass,
+    NumberEntity,
+    NumberMode,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory, UnitOfPower
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from .const import (
+    BATTERY_RESERVE_SOC_NUMBER,
+    CHARGE_LIMIT_SOC_NUMBER,
+    CONTROL_FEATURES,
+    DOMAIN,
+    RETIRED_MIN_SOC_NUMBER_KEY,
+    UNIT_OF_RATIO,
+    WRITABLE_NUMBERS_MAP,
+)
+from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
+from .entity import EcoFlowBaseEntity
+from .models import (
+    ControlEntityDef,
+    ControlFeature,
+    NumberWritableDef,
+    requires_modbus_control,
+)
+
+# One write to the inverter at a time.
+PARALLEL_UPDATES = 1
+
+_LOGGER = logging.getLogger(__name__)
+
+# Ranges wider than this get a text box; a slider over tens of kilowatts is unusable.
+SLIDER_MAX_RANGE = 1000
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: EcoflowConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up the control numbers and the writable registers."""
+    coordinator = entry.runtime_data
+
+    entities: list[NumberEntity] = [
+        EcoFlowFeaturePowerNumber(coordinator, entry, feature)
+        for feature, definition in CONTROL_FEATURES.items()
+        if definition.has_power
+    ]
+    entities.append(
+        EcoFlowSocLimitNumber(
+            coordinator,
+            entry,
+            CHARGE_LIMIT_SOC_NUMBER,
+            coordinator.control.async_set_charge_limit_soc,
+            lambda: coordinator.control.charge_limit_soc,
+        )
+    )
+    native = coordinator.control.reserve_native
+    entities.append(
+        EcoFlowSocLimitNumber(
+            coordinator,
+            entry,
+            # The inverter keeps a native reserve without us, so it needs no control.
+            replace(BATTERY_RESERVE_SOC_NUMBER, availability=None)
+            if native
+            else BATTERY_RESERVE_SOC_NUMBER,
+            coordinator.control.async_set_battery_reserve_soc,
+            lambda: coordinator.control.battery_reserve_soc,
+            attributes=lambda: {"implementation": "native" if native else "emulated"},
+        )
+    )
+    # The Battery Reserve took over the number that wrote the reserve register.
+    registry = er.async_get(hass)
+    if retired := registry.async_get_entity_id(
+        "number", DOMAIN, f"{entry.entry_id}_{RETIRED_MIN_SOC_NUMBER_KEY}"
+    ):
+        registry.async_remove(retired)
+    entities.extend(
+        EcoFlowGenericNumber(coordinator, entry, number_def)
+        for number_def in WRITABLE_NUMBERS_MAP
+        if coordinator.inverter_model not in number_def.unsupported_models
+    )
+
+    async_add_entities(entities)
+
+
+class EcoFlowFeaturePowerNumber(EcoFlowBaseEntity[ControlEntityDef], NumberEntity):
+    """How much power one mode asks for while it is running.
+
+    Always editable, whether or not that mode is selected, so a command can be set
+    up long before it is needed. Only the selected mode's value reaches the wire.
+    """
+
+    # A precise figure matters more than dragging across an inverter's whole range.
+    _attr_mode = NumberMode.BOX
+    _attr_native_min_value = 0.0
+    _attr_native_step = 100.0
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = NumberDeviceClass.POWER
+
+    def __init__(
+        self,
+        coordinator: EcoflowCoordinator,
+        entry: ConfigEntry,
+        feature: ControlFeature,
+    ) -> None:
+        super().__init__(
+            coordinator,
+            entry,
+            ControlEntityDef(
+                key=f"{feature}_power",
+                availability=requires_modbus_control,
+            ),
+        )
+        self._feature = feature
+
+    @property
+    def native_max_value(self) -> float:
+        # The device publishes its own ceiling, and it moves with the battery.
+        return self.coordinator.control.feature_power_max(self._feature)
+
+    @property
+    def native_value(self) -> float:
+        return min(
+            self.coordinator.control.feature_power(self._feature), self.native_max_value
+        )
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self.coordinator.control.async_set_feature_power(self._feature, value)
+
+
+class EcoFlowSocLimitNumber(EcoFlowBaseEntity[ControlEntityDef], NumberEntity):
+    """A state-of-charge guard that applies whatever mode is selected.
+
+    One ceiling for charging and one floor for discharging. They are properties of
+    the battery rather than of any command, so they also bound the inverter while
+    it is running itself.
+    """
+
+    _attr_mode = NumberMode.BOX
+    _attr_native_min_value = 0.0
+    _attr_native_max_value = 100.0
+    _attr_native_step = 1.0
+    _attr_native_unit_of_measurement = UNIT_OF_RATIO
+    _attr_device_class = NumberDeviceClass.BATTERY
+
+    def __init__(
+        self,
+        coordinator: EcoflowCoordinator,
+        entry: ConfigEntry,
+        definition: ControlEntityDef,
+        setter: Callable[[float], Awaitable[None]],
+        getter: Callable[[], float],
+        attributes: Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(coordinator, entry, definition)
+        self._setter = setter
+        self._getter = getter
+        self._attributes = attributes
+        self._attr_entity_category = definition.entity_category
+
+    @property
+    def native_value(self) -> float:
+        return self._getter()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        return self._attributes() if self._attributes else None
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._setter(value)
+
+
+class EcoFlowGenericNumber(EcoFlowBaseEntity[NumberWritableDef], NumberEntity):
+    """A writable register, read back from its register key."""
+
+    def __init__(
+        self,
+        coordinator: EcoflowCoordinator,
+        entry: ConfigEntry,
+        definition: NumberWritableDef,
+    ) -> None:
+        super().__init__(coordinator, entry, definition)
+        self._last_written_value: float | None = None
+
+        # Raw register access the control mode already covers.
+        self._attr_entity_registry_enabled_default = not definition.advanced
+
+        self._attr_native_min_value = definition.min_value
+        self._attr_native_max_value = definition.max_value
+        self._attr_native_step = definition.step
+        self._attr_native_unit_of_measurement = definition.unit
+        self._attr_device_class = definition.device_class
+        self._attr_mode = (
+            NumberMode.BOX
+            if definition.max_value - definition.min_value > SLIDER_MAX_RANGE
+            else NumberMode.SLIDER
+        )
+
+        self._attr_entity_category = EntityCategory.CONFIG
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # Kept, should a later poll leave the register out.
+        initial_value = self.native_value
+        if initial_value is not None:
+            self._last_written_value = initial_value
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._last_written_value = self.native_value
+        self._async_write_if_changed(self._last_written_value)
+
+    @property
+    def native_value(self) -> float | None:
+        value = (self.coordinator.data or {}).get(self._definition.read_key)
+        return float(value) if value is not None else self._last_written_value
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self.coordinator.async_write_modbus_register(
+            entity_def=self._definition,
+            value=round(value),
+        )

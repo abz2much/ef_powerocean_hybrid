@@ -1,0 +1,1323 @@
+"""DataUpdateCoordinator for EcoFlow PowerOcean Plus."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections import deque
+from collections.abc import Callable, Mapping
+from datetime import datetime, timedelta
+from functools import partial
+from typing import Any
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import ATTR_DEVICE_ID, ATTR_ENTITY_ID, Platform
+from homeassistant.core import Context, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry, entity_registry
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt
+from pymodbus import __version__ as pyModbusVersion
+from pymodbus.exceptions import ModbusException
+
+from .const import (
+    ATTR_CHECK,
+    ATTR_MODE,
+    ATTR_STATUS,
+    BATTERY_CHARGE_W_PER_WH,
+    BATTERY_DISCHARGE_W_PER_WH,
+    BATTERY_MODE_SELECT,
+    BATTERY_MODULES,
+    CONF_BATTERY_COUNT,
+    CONF_BATTERY_RESERVE,
+    CONF_CALC_SOLAR_POWER,
+    CONF_ENERGY_OFFSETS,
+    CONF_HOST,
+    CONF_INVERTER_MODEL,
+    CONF_MAX_BATTERY_CHARGED_POWER,
+    CONF_MAX_BATTERY_DISCHARGED_POWER,
+    CONF_MAX_GRID_POWER,
+    CONF_MAX_SOLAR_POWER,
+    CONF_MODBUS_CONTROL,
+    CONF_PORT,
+    CONF_SCAN_INTERVAL,
+    DEFAULT_BATTERY_COUNT,
+    DEFAULT_INVERTER_MODEL,
+    DEFAULT_MAX_GRID_POWER,
+    DEFAULT_MAX_SOLAR_POWER,
+    DEFAULT_PORT,
+    DEFAULT_SCAN_INTERVAL_S,
+    DEVICE_ENERGY_KEYS,
+    DEVICE_INFO_BLOCK,
+    DEVICE_INFO_EXTRA,
+    DOMAIN,
+    ECOFLOW_PORTAL_TOTALS,
+    ENERGY_SENSOR_MAP,
+    EVENT_COMMAND_EXPIRED,
+    EVENT_READING_CHECK_CLEARED,
+    EVENT_READING_CHECK_FAILED,
+    FIRMWARE_VERSION,
+    HELD_TOTAL_ISSUE_AFTER_S,
+    MAX_BATTERY_CAPACITY_WH,
+    MODBUS_DISABLED_READ_THRESHOLD,
+    MODBUS_POLL_BUDGET_S,
+    OPTIONAL_STALLS_TO_DROP,
+    PRODUCT_CATEGORY,
+    PRODUCT_NUMBER,
+    READING_CHECK_SNAPSHOTS,
+    REGISTERS_BY_KEY,
+    SERIAL_NUMBER,
+    STATE_SAVE_DELAY_S,
+    STORAGE_VERSION,
+    register_blocks_for,
+)
+from .control import ControlManager
+from .control_test import ControlTest
+from .energy_processor import (
+    DEVICE_TOTAL_KEYS,
+    ENERGY_KEYS,
+    EnergyProcessor,
+    HeldTotal,
+    offsets_from,
+)
+from .modbus import ModbusClient, ModbusReadRejected, create_client
+from .models import (
+    ControlFeature,
+    CoordinatorStatus,
+    DeviceIdentity,
+    InverterModel,
+    NumberWritableDef,
+    RegisterBlock,
+    RegisterDef,
+    battery_reserve_for,
+    encode_register,
+)
+from .reading_checks import KEYS_BY_CHECK, Finding
+from .telemetry import (
+    TelemetryData,
+    calculate_derived_values,
+    decode_firmware_version,
+    decode_register,
+    decode_serial_number,
+    is_modbus_disabled,
+)
+from .util import parse_datetime
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def identity_mismatch_issue_id(entry: ConfigEntry) -> str:
+    return f"identity_mismatch_{entry.entry_id}"
+
+
+def held_totals_issue_id(entry: ConfigEntry) -> str:
+    return f"energy_totals_held_{entry.entry_id}"
+
+
+def battery_power_limits(capacity_wh: float) -> tuple[int, int]:
+    """Return the charge and discharge power of a battery of this capacity."""
+    return (
+        round(capacity_wh * BATTERY_CHARGE_W_PER_WH),
+        round(capacity_wh * BATTERY_DISCHARGE_W_PER_WH),
+    )
+
+
+type EcoflowConfigEntry = ConfigEntry[EcoflowCoordinator]
+
+
+class IdentityMismatch(UpdateFailed):
+    """Another device answers at the configured address."""
+
+
+def state_store(hass: HomeAssistant, entry_id: str) -> Store[dict[str, Any]]:
+    """Return the store that keeps an entry's counters and control state."""
+    return Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry_id}.state")
+
+
+class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Polls the inverter over Modbus TCP and runs its control."""
+
+    config_entry: EcoflowConfigEntry
+
+    # Optional registers the device refused to read, which are no longer polled.
+    _unsupported_keys: frozenset[str] = frozenset()
+    # The data keys something asks for, which decide the registers polled. None
+    # reads everything, which the poll does until the entities have all been
+    # added: a poll in between would leave out what they have yet to ask for.
+    _wanted_keys: frozenset[str] | None = None
+    _on_demand: bool = False
+    _identity_verified: bool = False
+    _identity_mismatch: bool = False
+    # For entries still keyed by host:port.
+    _pinned_serial: str | None = None
+    # The totals the held-totals issue was last raised for.
+    _held_issue_keys: frozenset[str] = frozenset()
+    # The failed reading check last announced.
+    _announced_finding: Finding | None = None
+    # The checks the last poll failed and the words it read, to tell when one
+    # starts failing and to show what came before.
+    _failing_before: frozenset[str] = frozenset()
+    _raw_before: dict[int, list[int]] | None = None
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: EcoflowConfigEntry,
+    ) -> None:
+        self.host: str = config_entry.data[CONF_HOST]
+        # Polls in a row each optional block failed, by its start address.
+        self._optional_stalls: dict[int, int] = {}
+        # The last plausible pack capacity, kept across restarts. The inverter reads 0
+        # while the battery sleeps at its reserve, which is not a battery of no size.
+        self._battery_capacity_wh: float | None = None
+        self.port: int = config_entry.data.get(CONF_PORT, DEFAULT_PORT)
+        self.scan_interval: int = config_entry.options.get(
+            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_S
+        )
+        battery_count = config_entry.options.get(
+            CONF_BATTERY_COUNT, DEFAULT_BATTERY_COUNT
+        )
+        # Until the capacity is read, count every module as the largest kind.
+        largest_module_wh = max(module.reported_wh for module in BATTERY_MODULES)
+        charge_w, discharge_w = battery_power_limits(battery_count * largest_module_wh)
+        self.limits = {
+            CONF_BATTERY_COUNT: battery_count,
+            CONF_MAX_GRID_POWER: config_entry.options.get(
+                CONF_MAX_GRID_POWER, DEFAULT_MAX_GRID_POWER
+            ),
+            CONF_MAX_SOLAR_POWER: config_entry.options.get(
+                CONF_MAX_SOLAR_POWER, DEFAULT_MAX_SOLAR_POWER
+            ),
+            CONF_MAX_BATTERY_CHARGED_POWER: charge_w,
+            CONF_MAX_BATTERY_DISCHARGED_POWER: discharge_w,
+        }
+        self._ena_calc_solar_power = config_entry.options.get(
+            CONF_CALC_SOLAR_POWER, False
+        )
+        self.inverter_model = InverterModel(
+            config_entry.options.get(CONF_INVERTER_MODEL, DEFAULT_INVERTER_MODEL)
+        )
+        self._register_blocks = register_blocks_for(self.inverter_model)
+        # The words the last poll read, by the address each read started at.
+        self._raw_blocks: dict[int, list[int]] = {}
+        self._registers_by_key = {
+            register.key: register
+            for block in self._register_blocks
+            for register in block.registers
+        }
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=config_entry,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=self.scan_interval),
+        )
+
+        self.identity = DeviceIdentity()
+        self._last_inverter_temperature: float | None = None
+        self._consecutive_modbus_disabled_reads = 0
+        self._modbus_client = create_client(hass, config_entry, self.host, self.port)
+        self._modbus_client.block_writes("identity_unverified")
+        self._last_checked_data: dict[str, Any] = {}
+        self._last_checked_time: datetime | None = None
+
+        self.control = ControlManager(
+            self._modbus_client,
+            registers_by_key=self._registers_by_key,
+            limits=self.limits,
+            inverter_model=self.inverter_model,
+            enabled=config_entry.options.get(CONF_MODBUS_CONTROL, False),
+            scan_interval_s=self.scan_interval,
+            on_update=self.async_update_listeners,
+            on_refresh=self.async_refresh,
+            write_setting=self._async_write_register,
+            on_command_expired=self._command_expired,
+            # A background task of the entry's: Home Assistant cancels it when the
+            # entry unloads or its setup fails, and does not wait for it at startup.
+            start_task=lambda coro, name: config_entry.async_create_background_task(
+                hass, coro, name
+            ),
+            battery_reserve=battery_reserve_for(
+                self.inverter_model,
+                config_entry.options.get(CONF_BATTERY_RESERVE),
+            ),
+        )
+        self.control_test = ControlTest(self)
+        # Context of the last expiry event, taken once by the Battery Mode select so its
+        # change to automatic shows the expiry as the cause.
+        self._command_expired_context: Context | None = None
+        self._energy_processor = EnergyProcessor(self.limits)
+        # Only totals EcoFlow's portal shows are corrected; the others are the
+        # inverter's value as it is.
+        self._energy_offsets = offsets_from(
+            config_entry.options.get(CONF_ENERGY_OFFSETS), ECOFLOW_PORTAL_TOTALS
+        )
+        self._status: CoordinatorStatus | None = None
+        self._store: Store[dict[str, Any]] | None = state_store(
+            hass, config_entry.entry_id
+        )
+        # Not saved until loaded: a setup that fails before then would otherwise
+        # overwrite the saved totals with empty ones.
+        self._state_loaded = False
+        # The readings when a check last started failing, newest last.
+        self._check_snapshots: deque[dict[str, Any]] = deque(
+            maxlen=READING_CHECK_SNAPSHOTS
+        )
+
+    # ── Properties ────────────────────────────────────────────────────────────
+
+    @property
+    def connected(self) -> bool:
+        return self._modbus_client.connected
+
+    @property
+    def modbus_client(self) -> ModbusClient:
+        return self._modbus_client
+
+    @property
+    def registers_by_key(self) -> dict[str, RegisterDef]:
+        """Return the registers this model polls, by key."""
+        return self._registers_by_key
+
+    @property
+    def status(self) -> CoordinatorStatus | None:
+        return self._status
+
+    @property
+    def identity_verified(self) -> bool:
+        return self._identity_verified
+
+    @property
+    def is_modbus_disabled(self) -> bool:
+        """Return whether the last telemetry read indicates Modbus is disabled."""
+        return self._consecutive_modbus_disabled_reads >= MODBUS_DISABLED_READ_THRESHOLD
+
+    def get_pymodbus_version(self) -> str:
+        return pyModbusVersion
+
+    # ── Command expiry ────────────────────────────────────────────────────────
+
+    @callback
+    def _command_expired(self, feature: ControlFeature) -> None:
+        """Fire an event for a command that was not renewed in time."""
+        entry_id = self.config_entry.entry_id
+        devices = device_registry.async_entries_for_config_entry(
+            device_registry.async_get(self.hass), entry_id
+        )
+        select_id = entity_registry.async_get(self.hass).async_get_entity_id(
+            Platform.SELECT, DOMAIN, f"{entry_id}_{BATTERY_MODE_SELECT.key}"
+        )
+        context = Context()
+        self.hass.bus.async_fire(
+            EVENT_COMMAND_EXPIRED,
+            {
+                ATTR_DEVICE_ID: devices[0].id if devices else None,
+                ATTR_ENTITY_ID: select_id,
+                ATTR_MODE: str(feature),
+            },
+            context=context,
+        )
+        self._command_expired_context = context
+
+    def pop_command_expired_context(self) -> Context | None:
+        """Return the context of the last expiry once, for the mode change it caused."""
+        context, self._command_expired_context = self._command_expired_context, None
+        return context
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _persisted_state(self) -> dict[str, Any]:
+        """Return the state in a JSON-serializable form."""
+        return {
+            "energy_state_revision": self.inverter_model.traits.energy_state_revision,
+            "last_checked_data": self._last_checked_data,
+            "last_checked_time": self._last_checked_time.isoformat()
+            if self._last_checked_time is not None
+            else None,
+            "battery_capacity_wh": self._battery_capacity_wh,
+            "reading_check_snapshots": list(self._check_snapshots),
+            **self.control.dump_state(),
+            **self._energy_processor.dump_state(),
+        }
+
+    async def async_load_persisted_state(self) -> None:
+        """Seed the state from disk so the first poll is validated."""
+        stored = await self._store.async_load() if self._store is not None else None
+        if stored is not None:
+            self._load_stored_state(stored)
+        # Offsets changed since the state was saved move their totals here, once.
+        self._last_checked_data = self._energy_processor.change_offsets(
+            self._energy_offsets, self._last_checked_data
+        )
+        self._state_loaded = True
+
+    def _load_stored_state(self, stored: dict[str, Any]) -> None:
+        self.control.load_state(stored)
+        # Kept across restarts, which several of the episodes in #200 followed.
+        self._check_snapshots.extend(
+            _with_int_addresses(snapshot)
+            for snapshot in stored.get("reading_check_snapshots") or []
+        )
+        # So a battery asleep at its reserve across a restart keeps its capacity.
+        self._hold_battery_capacity(stored.get("battery_capacity_wh"))
+
+        revision = self.inverter_model.traits.energy_state_revision
+        if stored.get("energy_state_revision", 0) != revision:
+            _LOGGER.info(
+                "Saved energy counters predate a fix to how they are read; "
+                "starting them afresh."
+            )
+            return
+
+        self._last_checked_data = stored.get("last_checked_data") or {}
+        self._last_checked_time = parse_datetime(stored.get("last_checked_time"))
+        self._energy_processor.load_state(stored)
+
+    # ── Connection ────────────────────────────────────────────────────────────
+
+    async def _async_setup(self) -> None:
+        """Load the saved state and connect, once, before the first poll.
+
+        Called by the first refresh. A failure here makes Home Assistant retry
+        the setup with its own backoff, and clean up through async_shutdown, so a
+        single attempt is enough: the reconnect backoff is for an inverter lost
+        while running, not one that is not there at startup.
+        """
+        await self.async_load_persisted_state()
+        if not await self._modbus_client.async_connect():
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+                translation_placeholders={"host": self.host, "port": str(self.port)},
+            )
+        await self.async_read_device_info()
+        _LOGGER.info(
+            "Modbus TCP is connected to %s:%s (SN: %s)",
+            self.host,
+            self.port,
+            self.identity.serial_number,
+        )
+        # From here on the heartbeat skips beats while the connection is down and
+        # beats again the moment a reconnect succeeds.
+        self.control.start()
+
+    async def async_shutdown(self) -> None:
+        """Hand control back, save the state and close the connection.
+
+        The base class registers this with the config entry, so Home Assistant
+        calls it both when the entry unloads and when its setup fails.
+        """
+        _LOGGER.debug("Closing the connection to %s:%s", self.host, self.port)
+        # First, while the connection is still open to hand control back.
+        await self.control_test.async_cancel()
+        if self._store is not None and self._state_loaded:
+            await self._store.async_save(self._persisted_state())
+        await self.control.async_stop()
+        await self._modbus_client.async_close()
+        await super().async_shutdown()
+
+    async def async_read_device_info(self) -> None:
+        """Populate the device identity from the device.
+
+        Run on every connect, not only the first, because a firmware update reboots
+        the inverter and drops the connection. A failed read keeps what an earlier
+        one found and leaves the connection open; if it is dead, the poll finds out.
+        The product registers are only kept for diagnostics: the configured model
+        decides how the device is read.
+        """
+        identity = self.identity
+        if identity.serial_number is None:
+            identity.serial_number = "unknown"
+        self._mark_identity_unverified()
+
+        try:
+            raw = await self._modbus_client.async_read(
+                DEVICE_INFO_BLOCK.start, DEVICE_INFO_BLOCK.count
+            )
+        except ModbusException as err:
+            _LOGGER.warning("Can not read device information: %s", err)
+            self._accept_unreadable_identity()
+            return
+
+        if not raw or len(raw) < DEVICE_INFO_BLOCK.count:
+            self._accept_unreadable_identity()
+            return
+
+        registers_for = partial(DEVICE_INFO_BLOCK.registers_for, raw)
+
+        serial = decode_serial_number(registers_for(SERIAL_NUMBER))
+        if not self._check_identity(serial):
+            return
+        identity.serial_number = serial or "unknown"
+        identity.product_number = registers_for(PRODUCT_NUMBER)[0]
+        identity.product_category = registers_for(PRODUCT_CATEGORY)[0]
+
+        if firmware := decode_firmware_version(
+            registers_for(FIRMWARE_VERSION), self.inverter_model.traits.high_word_first
+        ):
+            previous = identity.firmware_version
+            identity.firmware_version = firmware
+            if previous is not None and firmware != previous:
+                self._firmware_changed(previous, firmware)
+
+        await self._async_read_device_info_extra()
+
+    # ── Identity ──────────────────────────────────────────────────────────────
+
+    def _expected_serial(self) -> str | None:
+        unique_id = self.config_entry.unique_id
+        if unique_id and ":" not in unique_id:
+            return unique_id
+        return self._pinned_serial
+
+    def _mark_identity_unverified(self) -> None:
+        self._identity_verified = False
+        self._modbus_client.block_writes("identity_unverified")
+
+    def _accept_unreadable_identity(self) -> None:
+        # Nothing to compare against: keep the behaviour from before the check.
+        if self._expected_serial() is None:
+            self._set_identity_verified()
+
+    def _check_identity(self, serial: str | None) -> bool:
+        """Block reads and writes to a device with another serial.
+
+        Otherwise a changed DHCP lease could hand us Modbus control of an
+        inverter nobody configured.
+        """
+        if not serial:
+            self._accept_unreadable_identity()
+            return self._identity_verified
+
+        expected = self._expected_serial()
+        if expected is not None and serial != expected:
+            reason = (
+                f"the device at {self.host} reports serial {serial}, not {expected}"
+            )
+            self._modbus_client.block_writes(
+                "identity_mismatch",
+                {"host": self.host, "found": serial, "expected": expected},
+            )
+            if not self._identity_mismatch:
+                _LOGGER.warning(
+                    "%s. Nothing is read from or written to it. Check the address, "
+                    "or remove the entry and add the new inverter",
+                    reason[0].upper() + reason[1:],
+                )
+                ir.async_create_issue(
+                    self.hass,
+                    DOMAIN,
+                    identity_mismatch_issue_id(self.config_entry),
+                    is_fixable=False,
+                    is_persistent=False,
+                    severity=ir.IssueSeverity.ERROR,
+                    translation_key="identity_mismatch",
+                    translation_placeholders={
+                        "host": str(self.host),
+                        "expected": expected,
+                        "found": serial,
+                    },
+                )
+            self._identity_mismatch = True
+            return False
+
+        self._pinned_serial = self._pinned_serial or serial
+        self._set_identity_verified()
+        return True
+
+    def _set_identity_verified(self) -> None:
+        self._identity_verified = True
+        self._modbus_client.allow_writes()
+        if self._identity_mismatch:
+            _LOGGER.info("The device at %s shows the expected serial again", self.host)
+            ir.async_delete_issue(
+                self.hass, DOMAIN, identity_mismatch_issue_id(self.config_entry)
+            )
+        self._identity_mismatch = False
+
+    @callback
+    def _firmware_changed(self, previous: str, firmware: str) -> None:
+        """Retry what the old firmware refused, and show the new version.
+
+        An update can add registers, so the ones refused before may now be there.
+        Those still missing are refused and dropped again on the next poll.
+        """
+        if self._unsupported_keys:
+            _LOGGER.info(
+                "Firmware changed from %s to %s; retrying %s",
+                previous,
+                firmware,
+                ", ".join(sorted(self._unsupported_keys)),
+            )
+            self._unsupported_keys = frozenset()
+            self._plan_reads()
+        else:
+            _LOGGER.info("Firmware changed from %s to %s", previous, firmware)
+
+        # Only written when the entities are created, so it would show the old
+        # version until a reload.
+        registry = device_registry.async_get(self.hass)
+        for device in device_registry.async_entries_for_config_entry(
+            registry, self.config_entry.entry_id
+        ):
+            registry.async_update_device(device.id, sw_version=firmware)
+
+    async def _async_read_device_info_extra(self) -> None:
+        """Read the protocol version and device address, where the device has them.
+
+        Each on its own read, and a refusal only leaves the value unknown.
+        """
+        values: dict[str, int | None] = {}
+        for register in DEVICE_INFO_EXTRA:
+            try:
+                raw = await self._modbus_client.async_read(
+                    register.address, register.size
+                )
+            except ModbusException as err:
+                _LOGGER.debug("Could not read %s: %s", register.key, err)
+                values[register.key] = None
+                continue
+            value = decode_register(
+                raw, register.data_type, self.inverter_model.traits.high_word_first
+            )
+            values[register.key] = int(value) if value is not None else None
+
+        self.identity.protocol_version = values.get("protocol_version")
+        self.identity.device_address = values.get("device_address")
+
+    def _device_info_values(self) -> dict[str, Any]:
+        """Return the values read on connect, in the form the sensors show."""
+        return {
+            "protocol_version": self.identity.protocol_version,
+            "device_address": self.identity.device_address,
+        }
+
+    async def async_reconnect(self) -> bool:
+        """Reconnect, and assume the device stopped following us while we were away.
+
+        The device info is read again: the outage may have been a firmware update,
+        or the first connect may have failed before it could be read at all.
+        """
+        if not await self._modbus_client.async_reconnect():
+            return False
+        self.control.mark_stale()
+        await self.async_read_device_info()
+        return True
+
+    async def async_get_raw_data(self) -> dict[str, Any] | None:
+        """Read every planned register block, or None if the read failed."""
+        data: dict[str, Any] = {}
+
+        # ── Check Connection, if not -> start reconnection ──
+        if not self._modbus_client.connected and not await self.async_reconnect():
+            raise UpdateFailed("Reconnect failed!")
+
+        try:
+            # The reconnect above has its own backoff, so it is not budgeted.
+            async with asyncio.timeout(MODBUS_POLL_BUDGET_S):
+                if not self._identity_verified:
+                    await self.async_read_device_info()
+                    if self._identity_mismatch:
+                        raise IdentityMismatch(
+                            f"The device at {self.host} is not the inverter this "
+                            "entry belongs to"
+                        )
+                    if not self._identity_verified:
+                        _LOGGER.debug(
+                            "Serial number not confirmed yet; skipping this poll"
+                        )
+                        return None
+
+                self._raw_blocks = {}
+                # A probe may replan the blocks.
+                for register_block in tuple(self._register_blocks):
+                    await self._async_read_block(register_block, data)
+        except TimeoutError:
+            # A late answer to the cancelled request would confuse the next one.
+            _LOGGER.debug(
+                "Poll exceeded its %ss budget. Connection closing...",
+                MODBUS_POLL_BUDGET_S,
+            )
+            self._read_failed()
+            return None
+        except (ModbusException, ConnectionError) as err:
+            _LOGGER.debug("%s. Connection closing...", err)
+            self._read_failed()
+            return None
+        # Anything else is a bug: let the coordinator log its traceback.
+
+        telemetry = TelemetryData.from_mapping(data)
+        if is_modbus_disabled(
+            self.identity.serial_number,
+            telemetry.inverter_rated_power,
+            telemetry.limit_inv_max,
+        ):
+            self._consecutive_modbus_disabled_reads += 1
+        else:
+            self._consecutive_modbus_disabled_reads = 0
+        return data
+
+    def _read_failed(self) -> None:
+        self._modbus_client.close()
+        # A shared link can reconnect without us seeing it drop.
+        self._mark_identity_unverified()
+
+    def _held_over_a_day(self) -> dict[str, HeldTotal]:
+        now = dt.now()
+        return {
+            key: held
+            for key, held in self._energy_processor.held.items()
+            if held.device > 0
+            and held.since is not None
+            and (now - held.since).total_seconds() >= HELD_TOTAL_ISSUE_AFTER_S
+        }
+
+    @property
+    def long_held_totals(self) -> dict[str, HeldTotal]:
+        """Return the totals in EcoFlow's portal held for over a day.
+
+        A healthy system never holds a total that long. What is left is a counter
+        the device reset, or a wrong value accepted earlier, which only the user
+        can tell apart, against the portal: they are asked in a repairs issue.
+        """
+        return {
+            key: held
+            for key, held in self._held_over_a_day().items()
+            if key in ECOFLOW_PORTAL_TOTALS
+        }
+
+    def _take_long_held_inverter_only_totals(self) -> None:
+        """Take the inverter's value for a total not in the portal, held for a day.
+
+        The user has nothing to check such a total against, so it is not raised
+        in repairs: it continues from what the inverter reports.
+        """
+        held = [
+            key for key in self._held_over_a_day() if key not in ECOFLOW_PORTAL_TOTALS
+        ]
+        for key, value in self._energy_processor.take_device_totals(held).items():
+            self._last_checked_data[key] = value
+            _LOGGER.warning(
+                "Took the inverter's %s of %s kWh after holding it for a day",
+                key,
+                value,
+            )
+
+    def describe_held_totals(self) -> str:
+        """Return one line per long-held total, for the repairs issue."""
+        registry = entity_registry.async_get(self.hass)
+        lines = []
+        for key, held in sorted(self.long_held_totals.items()):
+            entity_id = registry.async_get_entity_id(
+                Platform.SENSOR, DOMAIN, f"{self.config_entry.entry_id}_{key}"
+            )
+            since = (
+                dt.as_local(held.since).strftime("%Y-%m-%d %H:%M")
+                if held.since is not None
+                else "?"
+            )
+            lines.append(
+                f"- {entity_id or key}: {held.published:.2f} kWh in Home Assistant, "
+                f"{held.device:.2f} kWh on the inverter, held since {since}"
+            )
+        return "\n".join(lines)
+
+    @callback
+    def _async_update_held_totals_issue_safely(self) -> None:
+        """Update the held-totals issue without ever failing the poll it follows.
+
+        The issue is a convenience; an error in it must not make every entity
+        unavailable.
+        """
+        try:
+            self._async_update_held_totals_issue()
+        except Exception:
+            _LOGGER.exception("Could not update the held energy totals issue")
+
+    # ── Control stepping aside ────────────────────────────────────────────────
+
+    def _async_track_reading_checks_safely(self) -> None:
+        """Announce a failed reading check without ever failing the poll it follows."""
+        try:
+            self._async_track_reading_checks()
+        except Exception:
+            _LOGGER.exception("Could not announce a failed reading check")
+
+    @callback
+    def _async_track_reading_checks(self) -> None:
+        """Announce a failed check and its end as events, which the logbook shows.
+
+        Not raised in repairs: what fails one, an outage, a battery the battery
+        saver turned off or an inverter fault, is nothing the user can fix, and
+        Control Status already shows why control stepped aside.
+        """
+        finding = self.control.reading_checks.active
+        previous, self._announced_finding = self._announced_finding, finding
+        # Another check standing for the same state is not news.
+        if (finding and finding.status) != (previous and previous.status):
+            if previous is not None:
+                self._fire_check_event(EVENT_READING_CHECK_CLEARED, previous)
+            if finding is not None:
+                self._fire_check_event(EVENT_READING_CHECK_FAILED, finding)
+
+    def _record_check_snapshots(self, data: Mapping[str, Any]) -> None:
+        """Keep the readings of a poll in which a check starts failing.
+
+        So diagnostics downloaded later, once the user notices, still show what the
+        inverter sent then: the words it read, those of the poll before, and the
+        readings the check judged.
+        """
+        raw = self.raw_registers
+        failing = self.control.reading_checks.failing
+        for check in sorted(failing - self._failing_before):
+            self._check_snapshots.append(
+                {
+                    "check": check,
+                    "at": dt.now().isoformat(),
+                    "readings": {
+                        key: data.get(key) for key in sorted(KEYS_BY_CHECK[check])
+                    },
+                    "raw_registers": raw,
+                    "raw_registers_before": self._raw_before,
+                }
+            )
+        self._failing_before, self._raw_before = failing, raw
+
+    @property
+    def reading_check_snapshots(self) -> list[dict[str, Any]]:
+        """Return the readings of the checks that last started failing, oldest first."""
+        return list(self._check_snapshots)
+
+    @callback
+    def _fire_check_event(self, event_type: str, finding: Finding) -> None:
+        devices = device_registry.async_entries_for_config_entry(
+            device_registry.async_get(self.hass), self.config_entry.entry_id
+        )
+        self.hass.bus.async_fire(
+            event_type,
+            {
+                ATTR_DEVICE_ID: devices[0].id if devices else None,
+                ATTR_STATUS: str(finding.status),
+                ATTR_CHECK: finding.check,
+            },
+        )
+
+    @callback
+    def _async_update_held_totals_issue(self) -> None:
+        """Raise the held-totals issue when the set of long-held totals changes."""
+        keys = frozenset(self.long_held_totals)
+        if keys == self._held_issue_keys:
+            return
+        self._held_issue_keys = keys
+        issue_id = held_totals_issue_id(self.config_entry)
+        if not keys:
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            return
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=True,
+            is_persistent=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="energy_totals_held",
+            translation_placeholders={"host": str(self.host)},
+            data={"entry_id": self.config_entry.entry_id},
+        )
+
+    async def async_take_device_totals(self) -> dict[str, float]:
+        """Take the inverter's value for every long-held total, as the user asked.
+
+        Each total continues from the inverter's value from the next poll on.
+        """
+        taken = self._energy_processor.take_device_totals(self.long_held_totals)
+        for key, value in taken.items():
+            self._last_checked_data[key] = value
+            _LOGGER.warning(
+                "Took the inverter's %s of %s kWh, as confirmed in repairs", key, value
+            )
+        if self._store is not None:
+            self._store.async_delay_save(self._persisted_state, STATE_SAVE_DELAY_S)
+        self._async_update_held_totals_issue()
+        await self.async_request_refresh()
+        return taken
+
+    @callback
+    def async_keep_shown_totals(self) -> None:
+        """Correct every long-held total to count on from its value in Home Assistant.
+
+        The offset that brings the device's value up to the shown one is added to
+        the total's offset, saved to the entry and applied by its reload.
+        """
+        offsets = dict(self._energy_offsets)
+        for key, held in self.long_held_totals.items():
+            offsets[key] = round(
+                offsets.get(key, 0.0) + held.published - held.device, 3
+            )
+            _LOGGER.warning(
+                "Correcting %s by %s kWh to continue from %s kWh, as confirmed in "
+                "repairs",
+                key,
+                round(held.published - held.device, 3),
+                held.published,
+            )
+        self.async_set_energy_offsets(offsets)
+
+    @property
+    def correctable_totals(self) -> dict[str, float]:
+        """Return the value shown for each total in EcoFlow's portal, above 0."""
+        data = self.data or {}
+        return {
+            key: value
+            for key in DEVICE_TOTAL_KEYS
+            if key in ECOFLOW_PORTAL_TOTALS
+            and isinstance(value := data.get(key), (int, float))
+            and isinstance(device := data.get(f"{key}_raw"), (int, float))
+            and device > 0
+        }
+
+    def energy_offsets_for(self, totals: Mapping[str, float]) -> dict[str, float]:
+        """Return the offsets with which each given total shows the given value.
+
+        Totals not given keep their offset.
+        """
+        data = self.data or {}
+        offsets = dict(self._energy_offsets)
+        for key, value in totals.items():
+            device = data.get(f"{key}_raw")
+            if isinstance(device, (int, float)) and device > 0:
+                offsets[key] = round(value - device, 3)
+        return offsets_from(offsets, ECOFLOW_PORTAL_TOTALS)
+
+    @callback
+    def async_set_energy_offsets(self, offsets: Mapping[str, float]) -> None:
+        """Save new offsets to the entry, whose reload then applies them."""
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            options={
+                **self.config_entry.options,
+                CONF_ENERGY_OFFSETS: offsets_from(offsets, ECOFLOW_PORTAL_TOTALS),
+            },
+        )
+
+    @property
+    def energy_report(self) -> dict[str, Any]:
+        """Return the energy counters at every stage, for the diagnostics.
+
+        Published values next to what the device reports, with the time each total
+        was last accepted and the limits it is checked against, show whether a
+        total is held and why.
+        """
+        data = self.data or {}
+        processor = self._energy_processor
+        return {
+            "last_checked_time": self._last_checked_time.isoformat()
+            if self._last_checked_time is not None
+            else None,
+            "limits_w": dict(processor.limits),
+            "published": {
+                energy_sensor.key: data.get(energy_sensor.key)
+                for energy_sensor in ENERGY_SENSOR_MAP
+            },
+            "device_totals": {
+                key: data.get(key) for key in sorted(processor.raw_total_values({}))
+            },
+            "device_daily": {
+                key: data.get(key) for key in sorted(processor.raw_daily_values({}))
+            },
+            "held": {
+                key: {
+                    "published": held.published,
+                    "device": held.device,
+                    "since": held.since.isoformat() if held.since else None,
+                }
+                for key, held in processor.held.items()
+            },
+            **processor.dump_state(),
+        }
+
+    @property
+    def unsupported_registers(self) -> frozenset[str]:
+        """Return the optional registers the device refused, which are not polled."""
+        return self._unsupported_keys
+
+    @property
+    def raw_registers(self) -> dict[int, list[int]]:
+        """Return the words the last poll read, by the address each read started at.
+
+        Undecoded, so a report reproduces exactly what the device sent, word order
+        and units included.
+        """
+        return dict(sorted(self._raw_blocks.items()))
+
+    @property
+    def polled_registers(self) -> frozenset[str]:
+        """Return the keys of the registers the poll reads."""
+        return frozenset(
+            register.key
+            for block in self._register_blocks
+            for register in block.registers
+        )
+
+    # ── Demand-driven reads ───────────────────────────────────────────────────
+    #
+    # A register is polled because something asks for it. Each listener's context
+    # is the set of data keys it needs: an entity the keys it shows, the control
+    # loop the fields of ControlInputs. The coordinator adds what it needs itself,
+    # the derived values and the energy counters.
+
+    @property
+    def _own_keys(self) -> frozenset[str]:
+        """Return the keys the coordinator's own processing reads."""
+        return TelemetryData.keys(REGISTERS_BY_KEY) | ENERGY_KEYS
+
+    def _plan_reads(self) -> None:
+        """Group the registers to read, leaving out what nothing asks for."""
+        exclude = set(self._unsupported_keys)
+        if self._wanted_keys is not None:
+            exclude |= REGISTERS_BY_KEY.keys() - self._wanted_keys
+        self._register_blocks = register_blocks_for(
+            self.inverter_model, exclude=exclude
+        )
+
+    @callback
+    def async_add_listener(
+        self, update_callback: Callable[[], None], context: Any = None
+    ) -> Callable[[], None]:
+        """Track the keys the listeners ask for, as well as the listeners."""
+        remove_listener = super().async_add_listener(update_callback, context)
+        self._async_track_wanted_keys()
+
+        @callback
+        def remove() -> None:
+            remove_listener()
+            self._async_track_wanted_keys()
+
+        return remove
+
+    @callback
+    def async_require(self, keys: frozenset[str]) -> Callable[[], None]:
+        """Keep *keys* polled for something that is not an entity, until removed."""
+        return self.async_add_listener(lambda: None, keys)
+
+    @callback
+    def async_poll_on_demand(self) -> None:
+        """Stop reading everything, once everything that asks has been added."""
+        self._on_demand = True
+        self._async_track_wanted_keys()
+
+    @callback
+    def _async_track_wanted_keys(self) -> None:
+        if not self._on_demand:
+            return
+        wanted = self._own_keys.union(
+            *(
+                context
+                for context in self.async_contexts()
+                if isinstance(context, (set, frozenset))
+            )
+        )
+        if wanted == self._wanted_keys:
+            return
+        previous = self._wanted_keys
+        self._wanted_keys = wanted
+        self._plan_reads()
+        # Something that starts asking after the first poll would otherwise show
+        # nothing until the next interval.
+        if previous is not None and wanted - previous and self.data is not None:
+            self.hass.async_create_task(self.async_request_refresh())
+
+    async def _async_read_block(
+        self, register_block: RegisterBlock, data: dict[str, Any]
+    ) -> None:
+        """Read one block into data.
+
+        A required block that fails fails the poll. An optional block that fails
+        is kept from failing it again:
+
+        - refused as an invalid address: read register by register, and each one
+          refused is no longer polled;
+        - refused for now, such as device busy: left empty for this poll;
+        - timed out or lost the link: fails this poll, and is no longer polled
+          after OPTIONAL_STALLS_TO_DROP in a row. Optional blocks are read last, so
+          with the required reads before it fine, the fault is the block's.
+
+        Registers no longer polled are tried again after a firmware change.
+        """
+        try:
+            raw = await self._modbus_client.async_read(
+                register_block.start, register_block.count
+            )
+        except ModbusReadRejected as err:
+            if not register_block.optional:
+                raise
+            if not err.permanent:
+                data.update(dict.fromkeys(r.key for r in register_block.registers))
+                return
+            await self._async_probe_optional_block(register_block, data)
+            return
+        # Cancelled is the poll budget running out on it, and is always re-raised.
+        except (
+            TimeoutError,
+            ConnectionError,
+            ModbusException,
+            asyncio.CancelledError,
+        ):
+            if register_block.optional:
+                self._note_optional_stall(register_block)
+            raise
+        self._optional_stalls.pop(register_block.start, None)
+
+        self._raw_blocks[register_block.start] = list(raw)
+        for register in register_block.registers:
+            data[register.key] = self._decode(
+                register_block.registers_for(raw, register), register
+            )
+
+    def _note_optional_stall(self, register_block: RegisterBlock) -> None:
+        stalls = self._optional_stalls.get(register_block.start, 0) + 1
+        self._optional_stalls[register_block.start] = stalls
+        if stalls < OPTIONAL_STALLS_TO_DROP:
+            return
+        del self._optional_stalls[register_block.start]
+        dropped = {register.key for register in register_block.registers}
+        _LOGGER.warning(
+            "Reading %s failed %s polls in a row while the rest succeeded; they are "
+            "no longer read",
+            ", ".join(sorted(dropped)),
+            stalls,
+        )
+        self._unsupported_keys = self._unsupported_keys | dropped
+        self._plan_reads()
+
+    async def _async_probe_optional_block(
+        self, register_block: RegisterBlock, data: dict[str, Any]
+    ) -> None:
+        refused: set[str] = set()
+        for register in register_block.registers:
+            try:
+                raw = await self._modbus_client.async_read(
+                    register.address, register.size
+                )
+            except ModbusReadRejected as err:
+                if err.permanent:
+                    refused.add(register.key)
+                data[register.key] = None
+                continue
+            self._raw_blocks[register.address] = list(raw)
+            data[register.key] = self._decode(list(raw), register)
+
+        if refused:
+            _LOGGER.info(
+                "The device does not implement %s; they are no longer read.",
+                ", ".join(sorted(refused)),
+            )
+            self._unsupported_keys = self._unsupported_keys | refused
+            self._plan_reads()
+
+    def _decode(self, words: list[int], register: RegisterDef) -> float | None:
+        traits = self.inverter_model.traits
+        value = decode_register(words, register.data_type, traits.high_word_first)
+        if (
+            value is not None
+            and traits.energy_in_watt_hours
+            and register.key in DEVICE_ENERGY_KEYS
+        ):
+            value = round(value / 1000, 3)
+        return value
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        try:
+            raw_data = await self.async_get_raw_data()
+        except IdentityMismatch:
+            self._status = CoordinatorStatus.IDENTITY_MISMATCH
+            raise
+        except UpdateFailed as err:
+            self._status = CoordinatorStatus.RECONNECT_FAILED
+            raise UpdateFailed(
+                "Could not reconnect to the inverter; retrying in 30 s",
+                retry_after=30,
+            ) from err
+
+        if raw_data is None:
+            self._status = CoordinatorStatus.READ_FAILED
+            raise UpdateFailed(
+                "Read failed; entities stay unavailable until the next successful read."
+            )
+
+        try:
+            if "battery_capacity" in raw_data:
+                raw_data["battery_capacity"] = self._hold_battery_capacity(
+                    raw_data["battery_capacity"]
+                )
+            self._size_battery_limits(raw_data.get("battery_capacity"))
+            result = self._energy_processor.validate_totals(
+                self._energy_processor.apply_offsets(raw_data),
+                self._last_checked_data,
+                self._last_checked_time,
+            )
+            result.update(self._energy_processor.raw_daily_values(raw_data))
+            result.update(self._energy_processor.raw_total_values(raw_data))
+            result.update(self._device_info_values())
+            result, is_daily_reset = self._energy_processor.derive_daily(result)
+            calculated_results = calculate_derived_values(
+                TelemetryData.from_mapping(result),
+                calculate_solar_power=self._ena_calc_solar_power,
+                startup_voltage=self.inverter_model.traits.startup_voltage,
+                reports_effective_feed_cap=(
+                    self.inverter_model.traits.reports_effective_feed_cap
+                ),
+            )
+            result.update(calculated_results)
+            result = self._energy_processor.clamp_calculated(
+                result, self._last_checked_data, is_daily_reset=is_daily_reset
+            )
+
+            # The poll needs to happen after the derived values are calculated so that
+            # the control sees the correct solar power, in case the user has configured
+            # them to be calculated.
+            await self.control.async_poll(result)
+            self._async_track_reading_checks_safely()
+            try:
+                self._record_check_snapshots(result)
+            except Exception:
+                _LOGGER.exception("Could not keep the readings of a failed check")
+
+            self._last_checked_data = dict(result)
+            self._last_checked_time = dt.now()
+            self._take_long_held_inverter_only_totals()
+            self._status = CoordinatorStatus.SUCCESS
+            if self._store is not None:
+                self._store.async_delay_save(self._persisted_state, STATE_SAVE_DELAY_S)
+            self._async_update_held_totals_issue_safely()
+
+            return dict(result)
+        except Exception:
+            # Re-raised so the coordinator logs the traceback and marks the
+            # entities unavailable, rather than publishing an empty frame.
+            self._status = CoordinatorStatus.PROCESSING_FAILED
+            raise
+
+    def _hold_battery_capacity(self, capacity_wh: float | None) -> float | None:
+        """Return a plausible capacity, else the last one read.
+
+        Until one has been read, an implausible reading is unknown, not zero.
+        """
+        if capacity_wh and capacity_wh <= MAX_BATTERY_CAPACITY_WH:
+            self._battery_capacity_wh = capacity_wh
+        return self._battery_capacity_wh
+
+    def _size_battery_limits(self, capacity_wh: float | None) -> None:
+        """Scale the battery power limits to the capacity the inverter reports.
+
+        Module sizes can be mixed, so the module count alone does not tell how much
+        power the battery takes. Until a plausible capacity is read, the limits stay
+        as worked out from the module count.
+        """
+        if not capacity_wh or capacity_wh > MAX_BATTERY_CAPACITY_WH:
+            return
+        (
+            self.limits[CONF_MAX_BATTERY_CHARGED_POWER],
+            self.limits[CONF_MAX_BATTERY_DISCHARGED_POWER],
+        ) = battery_power_limits(capacity_wh)
+
+    # ── Parameter and setpoint writes ─────────────────────────────────────────
+
+    async def async_write_modbus_register(
+        self, entity_def: NumberWritableDef, value: int
+    ) -> None:
+        """Write a device setting from a number entity."""
+        await self._async_write_register(
+            RegisterDef(entity_def.read_key, entity_def.register, entity_def.data_type),
+            value,
+        )
+
+    async def _async_write_register(
+        self, register: RegisterDef, value: int, *, publish_as: Any = None
+    ) -> None:
+        """Write a device setting and verify it by reading it back.
+
+        Settings apply without Modbus control authority, unlike the control word and
+        its setpoints, so this never takes control away from the EcoFlow app.
+        """
+        if not self.connected:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="not_connected"
+            )
+
+        target_value = int(value)
+        register_address = register.write_address or register.address
+        key = register.key
+
+        try:
+            words = encode_register(target_value, register.data_type)
+        except ValueError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="value_out_of_range",
+                translation_placeholders={"value": str(target_value), "what": key},
+            ) from err
+
+        await self._modbus_client.async_write(
+            register_address, words, what=f"{key} {value}"
+        )
+
+        try:
+            readback_words = await self._modbus_client.async_read(
+                register_address, len(words)
+            )
+        except ModbusException as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="write_not_verified",
+                translation_placeholders={
+                    "register": str(register_address),
+                    "error": str(err),
+                },
+            ) from err
+
+        readback_value = decode_register(
+            readback_words,
+            register.data_type,
+            self.inverter_model.traits.high_word_first,
+        )
+        # A 32-bit register echoes the words just written and only swaps them into
+        # read order a few seconds later, so either form means the write landed.
+        if readback_words != words and (
+            readback_value is None or int(readback_value) != target_value
+        ):
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="write_read_back_differs",
+                translation_placeholders={
+                    "register": str(register_address),
+                    "value": str(target_value),
+                    "read_back": str(readback_value),
+                },
+            )
+
+        _LOGGER.debug(
+            "Register %s [%s] acknowledged value: %s (the device may still ignore "
+            "it; confirm the effect, not the readback)",
+            register_address,
+            key,
+            target_value,
+        )
+
+        published = target_value if publish_as is None else publish_as
+        updated_data = {**(self.data or {}), key: published}
+        self.async_set_updated_data(updated_data)
+
+
+def _with_int_addresses(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Return a snapshot loaded from JSON with its register addresses as numbers."""
+    return {
+        **snapshot,
+        **{
+            key: {int(address): words for address, words in raw.items()}
+            for key in ("raw_registers", "raw_registers_before")
+            if isinstance(raw := snapshot.get(key), dict)
+        },
+    }

@@ -1,0 +1,280 @@
+"""The feature table is all that stands between the user and a wrong register."""
+
+from __future__ import annotations
+
+import pytest
+
+from custom_components.ef_powerocean_hybrid import const
+from custom_components.ef_powerocean_hybrid.models import (
+    BATTERY_FULL_SOC,
+    ControlFeature,
+    ControlMode,
+    ControlStatus,
+    deviation_state,
+)
+from custom_components.ef_powerocean_hybrid.telemetry import (
+    TelemetryData,
+    calculate_derived_values,
+)
+
+
+def derived_keys() -> set[str]:
+    """Return every key the coordinator adds on top of the raw registers."""
+    return set(
+        calculate_derived_values(
+            TelemetryData.from_mapping({"house_power": 1000.0, "grid_power": -200.0}),
+            calculate_solar_power=True,
+            startup_voltage=250,
+        )
+    )
+
+
+def test_every_feature_is_defined() -> None:
+    assert set(const.CONTROL_FEATURES) == set(ControlFeature)
+
+
+def test_only_automatic_leaves_the_device_to_itself() -> None:
+    automatic = const.CONTROL_FEATURES[ControlFeature.AUTOMATIC]
+    assert automatic.method is ControlMode.DEFAULT
+    assert not automatic.commands_power
+
+    for feature, definition in const.CONTROL_FEATURES.items():
+        if feature is ControlFeature.AUTOMATIC:
+            continue
+        assert definition.commands_power
+        assert definition.method is not ControlMode.DEFAULT
+        assert definition.sign in (1, -1)
+
+
+@pytest.mark.parametrize("feature", tuple(ControlFeature))
+def test_feature_keys_all_resolve(feature: ControlFeature) -> None:
+    """A typo here would silently write to nothing or bound against nothing."""
+    definition = const.CONTROL_FEATURES[feature]
+    known = set(const.REGISTERS_BY_KEY) | derived_keys()
+
+    for key in (definition.setpoint_key, definition.limit_key, definition.measure_key):
+        if key is not None:
+            assert key in known, key
+
+    if definition.setpoint_key is not None:
+        assert definition.setpoint_key in const.REGISTERS_BY_KEY
+
+    if definition.config_limit_key is not None:
+        assert definition.config_limit_key in {
+            const.CONF_MAX_BATTERY_CHARGED_POWER,
+            const.CONF_MAX_BATTERY_DISCHARGED_POWER,
+            const.CONF_MAX_GRID_POWER,
+        }
+
+
+def test_the_battery_modes_do_not_bound_themselves_by_the_apps_limit() -> None:
+    """Modbus control overrides the app's charge limit, so that register is not a cap.
+
+    Measured on a PowerOcean Plus: with the app limited to 500 W, a charge command
+    still drew the full 5 kW the modules accept.
+    """
+    for feature in (ControlFeature.CHARGE_BATTERY, ControlFeature.DISCHARGE_BATTERY):
+        definition = const.CONTROL_FEATURES[feature]
+        assert definition.limit_key is None
+        assert definition.config_limit_key is not None
+
+    # The export limit is a real firmware cap and stays in force.
+    assert const.CONTROL_FEATURES[ControlFeature.EXPORT_TO_GRID].limit_key == (
+        "feed_in_power_max"
+    )
+
+
+def test_the_signs_follow_the_devices_own_measurements() -> None:
+    """Confirmed on hardware: grid export reads negative, battery charging positive.
+
+    Nothing else in the code pins this down, and flipping either sign on the
+    assumption that export should be positive inverts the status of every mode.
+    """
+    export = const.CONTROL_FEATURES[ControlFeature.EXPORT_TO_GRID]
+    charge = const.CONTROL_FEATURES[ControlFeature.CHARGE_BATTERY]
+    import_ = const.CONTROL_FEATURES[ControlFeature.IMPORT_FROM_GRID]
+
+    assert (export.measure_key, export.sign) == ("grid_power", -1)
+    assert (charge.measure_key, charge.sign) == ("battery_power", 1)
+    # A draw reads positive on the meter, as the protocol defines the setpoint.
+    assert (import_.measure_key, import_.sign) == ("grid_power", 1)
+
+    # Exporting 2 kW against a 2 kW command is the mode working, not a deviation.
+    assert (
+        deviation_state(
+            signed_target=2000.0 * export.sign,
+            measured=-2000.0,
+            soc=59.0,
+            min_soc=0.0,
+        )
+        is ControlStatus.ACTIVE
+    )
+    assert (
+        deviation_state(
+            signed_target=1700.0 * charge.sign,
+            measured=1700.0,
+            soc=59.0,
+            min_soc=0.0,
+        )
+        is ControlStatus.ACTIVE
+    )
+
+
+def test_opposing_features_share_a_register_but_not_a_sign() -> None:
+    """Charge and discharge are one register; the sign is what tells them apart."""
+    charge = const.CONTROL_FEATURES[ControlFeature.CHARGE_BATTERY]
+    discharge = const.CONTROL_FEATURES[ControlFeature.DISCHARGE_BATTERY]
+
+    assert charge.setpoint_key == discharge.setpoint_key
+    assert charge.method is discharge.method
+    assert charge.sign == 1
+    assert discharge.sign == -1
+
+
+def test_import_and_export_share_the_meter_setpoint_but_not_a_sign() -> None:
+    export = const.CONTROL_FEATURES[ControlFeature.EXPORT_TO_GRID]
+    import_ = const.CONTROL_FEATURES[ControlFeature.IMPORT_FROM_GRID]
+
+    assert import_.setpoint_key == export.setpoint_key == "system_power_setpoint"
+    assert import_.method is export.method is ControlMode.SYSTEM_FEED
+    assert import_.sign == -export.sign
+    # The house draws past the inverter, so no converter capacity bounds a draw.
+    assert import_.capacity_key is None
+    assert import_.limit_key is None
+
+
+def test_export_solar_first_defaults_to_all_the_inverter_may_export() -> None:
+    """Its power is the Solar Export Limit, which means something untouched, so it is
+    the one mode the action lets leave its power out."""
+    definition = const.CONTROL_FEATURES[ControlFeature.EXPORT_SOLAR_FIRST]
+
+    assert definition.method is ControlMode.BATTERY_LIMITS
+    assert definition.setpoint_key == "battery_power_setpoint"
+    assert definition.default_power == const.DEFAULT_MAX_POWER
+    assert [
+        feature
+        for feature, feature_def in const.CONTROL_FEATURES.items()
+        if feature_def.power_optional
+    ] == [ControlFeature.EXPORT_SOLAR_FIRST]
+
+
+def test_holding_the_battery_commands_a_method_but_no_power() -> None:
+    """Hold is the same method at zero watts, so it needs no parameters."""
+    definition = const.CONTROL_FEATURES[ControlFeature.HOLD_BATTERY]
+
+    assert definition.commands_power
+    assert not definition.has_power
+
+
+def test_the_select_offers_every_mode() -> None:
+    assert const.BATTERY_MODE_SELECT.key == "battery_mode"
+    assert const.CONTROL_STATUS_SENSOR.options == tuple(
+        str(status) for status in ControlStatus
+    )
+
+
+def test_a_setpoint_that_is_being_met_reads_as_active() -> None:
+    state = deviation_state(
+        signed_target=3000.0, measured=2900.0, soc=50.0, min_soc=10.0
+    )
+
+    assert state is ControlStatus.ACTIVE
+
+
+def test_a_full_battery_explains_a_target_that_needs_absorbing() -> None:
+    """Reducing an export means charging, and a full battery cannot."""
+    state = deviation_state(
+        signed_target=-1000.0, measured=-6400.0, soc=100.0, min_soc=10.0
+    )
+
+    assert state is ControlStatus.UNREACHABLE_BATTERY_FULL
+
+
+def test_an_empty_battery_explains_a_target_that_needs_supplying() -> None:
+    state = deviation_state(
+        signed_target=-7000.0, measured=-2000.0, soc=10.0, min_soc=10.0
+    )
+
+    assert state is ControlStatus.UNREACHABLE_BATTERY_EMPTY
+
+
+def test_a_wide_miss_with_headroom_left_is_only_ramping() -> None:
+    """A gap alone proves nothing while the battery can still close it."""
+    state = deviation_state(
+        signed_target=5000.0, measured=1000.0, soc=50.0, min_soc=10.0
+    )
+
+    assert state is ControlStatus.RAMPING
+
+
+def test_full_is_judged_below_a_hundred_percent() -> None:
+    """SOC is whole percent, so a battery reporting 99 is full enough to explain it."""
+    state = deviation_state(
+        signed_target=3000.0, measured=0.0, soc=BATTERY_FULL_SOC, min_soc=10.0
+    )
+
+    assert state is ControlStatus.UNREACHABLE_BATTERY_FULL
+
+
+@pytest.mark.parametrize(
+    ("target", "measured"),
+    (
+        # Issue #144, Ocean 2 Plus under a ~3.3 kW import ceiling: asked to charge,
+        # the battery discharged; asked to discharge 1.5 kW, it gave 2.9 kW; asked
+        # to hold, it discharged.
+        (1500.0, -2847.0),
+        (-1500.0, -2930.0),
+        (const.HOLD_SETPOINT_W, -2000.0),
+    ),
+)
+def test_going_the_other_way_or_past_the_target_is_limited_by_the_inverter(
+    target: float, measured: float
+) -> None:
+    """Ramping lies between zero and the target; anything else is the inverter."""
+    state = deviation_state(
+        signed_target=target, measured=measured, soc=45.0, min_soc=4.0
+    )
+
+    assert state is ControlStatus.LIMITED_BY_INVERTER
+
+
+def test_an_empty_battery_still_explains_a_discharge_it_cannot_give() -> None:
+    """The battery limits come first, as the clearer reason."""
+    state = deviation_state(
+        signed_target=-3000.0, measured=500.0, soc=10.0, min_soc=10.0
+    )
+
+    assert state is ControlStatus.UNREACHABLE_BATTERY_EMPTY
+
+
+@pytest.mark.parametrize(
+    ("target", "measured", "soc"),
+    (
+        # A hold met by a charge still winding down, under a raised reserve.
+        (const.HOLD_SETPOINT_W, 2500.0, 40.0),
+        # A hold met by a discharge on a full battery.
+        (const.HOLD_SETPOINT_W, -2500.0, 100.0),
+    ),
+)
+def test_a_full_or_empty_battery_only_explains_its_own_direction(
+    target: float, measured: float, soc: float
+) -> None:
+    state = deviation_state(
+        signed_target=target, measured=measured, soc=soc, min_soc=50.0, battery=measured
+    )
+
+    assert state not in (
+        ControlStatus.UNREACHABLE_BATTERY_EMPTY,
+        ControlStatus.UNREACHABLE_BATTERY_FULL,
+    )
+
+
+def test_the_app_backup_reserve_is_not_a_battery_level() -> None:
+    """Home Assistant would otherwise show it as the battery's charge."""
+    sensor = next(
+        sensor
+        for sensor in const.SENSOR_MAP
+        if sensor.key == const.BATTERY_RESERVE_REGISTER_KEY
+    )
+
+    assert sensor.device_class != "battery"

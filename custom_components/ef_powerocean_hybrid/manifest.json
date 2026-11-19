@@ -1,0 +1,21 @@
+{
+  "domain": "ef_powerocean_hybrid",
+  "name": "EF PowerOcean Hybrid",
+  "after_dependencies": [
+    "modbus"
+  ],
+  "codeowners": [
+    "@abz2much"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/abz2much/ef_powerocean_hybrid",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/abz2much/ef_powerocean_hybrid/issues",
+  "loggers": [
+    "custom_components.ef_powerocean_hybrid"
+  ],
+  "requirements": [
+    "pymodbus>=3.11"
+  ],
+  "version": "0.1.0"
+}

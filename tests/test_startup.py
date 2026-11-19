@@ -1,0 +1,775 @@
+"""The integration starts in a real Home Assistant, talking to a real Modbus server.
+
+Every other test mocks something. This one only fakes the inverter: Home Assistant
+loads the integration and its dependencies through its own loader, the connection
+goes over TCP through whichever Modbus stack that Home Assistant version ships,
+and every platform sets up. It is the test that fails when a new Home Assistant or
+library version would stop the integration from starting at all.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import socket
+import struct
+from collections.abc import Iterator
+from datetime import timedelta
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import MAJOR_VERSION, MINOR_VERSION, STATE_UNAVAILABLE
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_platform
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.update_coordinator import UpdateFailed
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.ef_powerocean_hybrid import PLATFORMS, const
+from custom_components.ef_powerocean_hybrid import modbus as modbus_module
+from custom_components.ef_powerocean_hybrid.control import ControlInputs
+from custom_components.ef_powerocean_hybrid.coordinator import EcoflowCoordinator
+from custom_components.ef_powerocean_hybrid.models import (
+    EnergySensorDef,
+    InverterModel,
+    RegisterType,
+    SensorDef,
+)
+from tests.fake_inverter import HOST, FakeInverter
+
+
+async def test_uses_the_shared_connection_where_home_assistant_has_one(
+    hass: HomeAssistant,
+) -> None:
+    """The fallback to an own connection must not hide a broken shared one."""
+    expected = (MAJOR_VERSION, MINOR_VERSION) >= (2026, 9)
+    assert await modbus_module.async_prepare(hass) is expected
+    assert modbus_module.is_shared() is expected
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_starts_and_unloads(hass: HomeAssistant, inverter: FakeInverter) -> None:
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    entities = er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
+    assert {entity.domain for entity in entities} == {str(p) for p in PLATFORMS}
+    assert inverter.requests  # Read over the wire, not from a stub.
+    states = [hass.states.get(entity.entity_id) for entity in entities]
+    assert any(state and state.state != "unavailable" for state in states)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.NOT_LOADED
+
+
+SERIAL = "HJ31ZAS2TEST0001"
+
+
+def _serve_serial(inverter: FakeInverter, serial: str) -> None:
+    inverter.serve_serial(serial, const.SERIAL_NUMBER.address)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_an_entry_keyed_by_address_takes_the_serial_number(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    """Entries made before the serial was read are keyed by host and port."""
+    _serve_serial(inverter, SERIAL)
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        unique_id=f"{HOST}:{inverter.port}",
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.unique_id == SERIAL
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_a_serial_number_another_entry_has_is_left_to_it(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    _serve_serial(inverter, SERIAL)
+    MockConfigEntry(domain=const.DOMAIN, unique_id=SERIAL).add_to_hass(hass)
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        unique_id=f"{HOST}:{inverter.port}",
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.unique_id == f"{HOST}:{inverter.port}"
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_raises_a_repairs_issue_while_modbus_is_disabled(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    """The inverter answers, with a serial number, but every value reads zero."""
+    _serve_serial(inverter, SERIAL)
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    registry = ir.async_get(hass)
+    issue_id = f"modbus_disabled_{entry.entry_id}"
+    assert registry.async_get_issue(const.DOMAIN, issue_id) is None
+
+    coordinator = entry.runtime_data
+    for _ in range(const.MODBUS_DISABLED_READ_THRESHOLD):
+        await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    issue = registry.async_get_issue(const.DOMAIN, issue_id)
+    assert issue is not None
+    assert issue.translation_placeholders == {"host": HOST}
+
+    inverter.registers[const.REGISTERS_BY_KEY["inverter_rated_power"].address] = 1
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert registry.async_get_issue(const.DOMAIN, issue_id) is None
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_a_device_registered_as_a_service_becomes_a_device(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+    registry = dr.async_get(hass)
+    device = registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(const.DOMAIN, entry.entry_id)},
+        entry_type=dr.DeviceEntryType.SERVICE,
+    )
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    updated = registry.async_get(device.id)
+    assert isinstance(updated, dr.DeviceEntry)
+    assert updated.entry_type is None
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_a_disabled_sensor_is_not_read(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    """Only what an enabled entity, the control loop or the coordinator needs."""
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+    er.async_get(hass).async_get_or_create(
+        "sensor",
+        const.DOMAIN,
+        f"{entry.entry_id}_inverter_temperature",
+        config_entry=entry,
+        disabled_by=er.RegistryEntryDisabler.USER,
+    )
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    polled = entry.runtime_data.polled_registers
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert "inverter_temperature" not in polled
+    assert {
+        "voltage_l1",
+        "frequency",
+        "battery_soc",
+        "solar_total",
+        "grid_feed_mode",
+    } <= polled
+
+
+# ── Every entity gets what it shows from the demand-driven poll ───────────────
+
+
+def _fill_registers(inverter: FakeInverter, start: int = 1) -> None:
+    """Give every polled register a distinct, non-zero value.
+
+    Zero everywhere would hide a missing read behind a value that looks right, and
+    leave the branches that only run for a non-zero value untried.
+    """
+    formats = {
+        RegisterType.FLOAT32: "<f",
+        RegisterType.UINT32: "<I",
+        RegisterType.INT32: "<i",
+    }
+    for index, register in enumerate(const.MODBUS_REGISTERS):
+        register = register.for_model(InverterModel.POWEROCEAN_PLUS)
+        value = index + start
+        if register.data_type is RegisterType.UINT16:
+            words = [value]
+        else:
+            # Published low word first.
+            raw = struct.pack(formats[register.data_type], value)
+            words = list(struct.unpack("<HH", raw))
+        for offset, word in enumerate(words):
+            inverter.registers[register.address + offset] = word
+
+
+class _RecordingData(dict):
+    """The coordinator's data, noting each key read from it."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        super().__init__(data)
+        self.read: set[str] = set()
+
+    def __getitem__(self, key: str) -> Any:
+        self.read.add(key)
+        return super().__getitem__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        self.read.add(key)
+        return super().get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        if isinstance(key, str):
+            self.read.add(key)
+        return super().__contains__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        self.read.add("*")
+        return super().__iter__()
+
+    def items(self):
+        self.read.add("*")
+        return super().items()
+
+    def values(self):
+        self.read.add("*")
+        return super().values()
+
+
+def _enable_every_entity(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    """Register the entities that start disabled as enabled, so they load too."""
+    registry = er.async_get(hass)
+    for number in const.WRITABLE_NUMBERS_MAP:
+        registry.async_get_or_create(
+            "number",
+            const.DOMAIN,
+            f"{entry.entry_id}_{number.key}",
+            config_entry=entry,
+            disabled_by=None,
+        )
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_every_entity_reads_only_what_it_asks_for(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    """An entity that reads a register it did not ask for would show nothing once
+    that register is left out of the poll. Every entity is enabled here, so the
+    poll still has it; what each one reads is checked against what it asked for.
+    """
+    _fill_registers(inverter)
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+    _enable_every_entity(hass, entry)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator: EcoflowCoordinator = entry.runtime_data
+    registers = frozenset(const.REGISTERS_BY_KEY)
+    always = coordinator._own_keys | ControlInputs.keys()
+    data = coordinator.data
+    checked = 0
+    undeclared: dict[str, set[str]] = {}
+    for platform in entity_platform.async_get_platforms(hass, const.DOMAIN):
+        for entity in platform.entities.values():
+            recording = _RecordingData(data)
+            coordinator.data = recording
+            entity.async_write_ha_state()
+            asked = getattr(entity, "coordinator_context", None) or frozenset()
+            extra = (recording.read & (registers | {"*"})) - asked - always
+            if extra:
+                undeclared[entity.entity_id] = extra
+            checked += 1
+    coordinator.data = data
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert checked > 100
+    assert undeclared == {}
+
+
+def _states(hass: HomeAssistant, entry: MockConfigEntry) -> dict[str, Any]:
+    """Return each entity's state and attributes."""
+    states = {}
+    for registry_entry in er.async_entries_for_config_entry(
+        er.async_get(hass), entry.entry_id
+    ):
+        if state := hass.states.get(registry_entry.entity_id):
+            states[registry_entry.entity_id] = (state.state, dict(state.attributes))
+    return states
+
+
+async def _poll(
+    hass: HomeAssistant, coordinator: EcoflowCoordinator, *, everything: bool = False
+) -> None:
+    """Run a poll, reading every register or only what has been asked for."""
+    if everything:
+        coordinator._wanted_keys = None
+        coordinator._plan_reads()
+    # A poll within a second of the last is answered from it. Moving the last
+    # back rather than freezing the clock, which stalls the Modbus stack of some
+    # Home Assistant versions.
+    if coordinator._last_checked_time is not None:
+        coordinator._last_checked_time -= timedelta(seconds=6)
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    if everything:
+        coordinator._async_track_wanted_keys()
+
+
+def _differences(shown: dict[str, Any], reference: dict[str, Any]) -> list[str]:
+    assert len(reference) > 100
+    assert shown.keys() == reference.keys()
+    return [
+        f"{entity_id}: {shown[entity_id]} instead of {reference[entity_id]}"
+        for entity_id in reference
+        if shown[entity_id] != reference[entity_id]
+    ]
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_entities_show_what_reading_everything_shows(
+    hass: HomeAssistant,
+    inverter: FakeInverter,
+) -> None:
+    """Each entity, after a poll of only what was asked for, shows what it would
+    after a poll of every register: at setup, with a poll landing while the
+    entities are being added, and after a poll in which every value changed.
+    """
+    _fill_registers(inverter)
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+    _enable_every_entity(hass, entry)
+    forward = hass.config_entries.async_forward_entry_setups
+
+    async def poll_then_forward(config_entry, platforms):
+        await _poll(hass, config_entry.runtime_data)
+        return await forward(config_entry, platforms)
+
+    with patch.object(
+        hass.config_entries, "async_forward_entry_setups", poll_then_forward
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    coordinator: EcoflowCoordinator = entry.runtime_data
+
+    at_setup = _states(hass, entry)
+    await _poll(hass, coordinator, everything=True)
+    at_setup_differences = _differences(at_setup, _states(hass, entry))
+
+    # Every value changes, so one not read would keep showing the old.
+    _fill_registers(inverter, start=101)
+    await _poll(hass, coordinator)
+    on_demand = _states(hass, entry)
+    await _poll(hass, coordinator, everything=True)
+    on_demand_differences = _differences(on_demand, _states(hass, entry))
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert at_setup_differences == []
+    assert on_demand_differences == []
+
+
+# ── A failed read shows, and a good one clears, steady entities (#219) ────────
+
+
+def _reading_entities(hass: HomeAssistant, entry: MockConfigEntry) -> list[str]:
+    """The entities that show a reading, and so are unavailable while reads fail."""
+    sensor_definitions: tuple[SensorDef | EnergySensorDef, ...] = (
+        *const.SENSOR_MAP,
+        *const.ENERGY_SENSOR_MAP,
+        *const.DAILY_ENERGY_SENSORS_DEVICE_RAW,
+        *const.TOTAL_ENERGY_SENSORS_DEVICE_RAW,
+    )
+    readings = {
+        *(
+            ("sensor", definition.key)
+            for definition in sensor_definitions
+            if definition.key != "coordinator_status"
+        ),
+        *(("binary_sensor", definition.key) for definition in const.BINARY_SENSOR_MAP),
+        *(("number", definition.key) for definition in const.WRITABLE_NUMBERS_MAP),
+    }
+    prefix = f"{entry.entry_id}_"
+    return sorted(
+        registry_entry.entity_id
+        for registry_entry in er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )
+        if (registry_entry.domain, registry_entry.unique_id.removeprefix(prefix))
+        in readings
+    )
+
+
+async def _fail_a_poll(hass: HomeAssistant, coordinator: EcoflowCoordinator) -> None:
+    """Run a poll whose read fails, as when the inverter briefly does not answer."""
+    with patch.object(coordinator, "async_get_raw_data", AsyncMock(return_value=None)):
+        await _poll(hass, coordinator)
+    assert not coordinator.last_update_success
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_a_failed_read_shows_steady_entities_unavailable_until_the_next(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    """The fake inverter's values never change, so each entity's only change is
+    whether it is available. Both ways must reach the state machine.
+    """
+    _fill_registers(inverter)
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+    _enable_every_entity(hass, entry)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator: EcoflowCoordinator = entry.runtime_data
+    await _poll(hass, coordinator)
+
+    before = _states(hass, entry)
+    shown = [
+        entity_id
+        for entity_id in _reading_entities(hass, entry)
+        if entity_id in before and before[entity_id][0] != STATE_UNAVAILABLE
+    ]
+    await _fail_a_poll(hass, coordinator)
+    during = _states(hass, entry)
+    await _poll(hass, coordinator)
+    after = _states(hass, entry)
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert len(shown) > 50
+    assert [e for e in shown if during[e][0] != STATE_UNAVAILABLE] == []
+    assert [e for e in shown if after[e] != before[e]] == []
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_steady_entities_recover_after_a_start_whose_first_poll_fails(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    """The report of #219: after a restart whose first poll failed, entities whose
+    value had not changed stayed unavailable once reads succeeded again.
+
+    Unloading keeps the states the entities restore when set up again, as at a
+    restart. The poll that fails lands while the entities are being added.
+    """
+    _fill_registers(inverter)
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+    _enable_every_entity(hass, entry)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    await _poll(hass, entry.runtime_data)
+    before = _states(hass, entry)
+    shown = [
+        entity_id
+        for entity_id in _reading_entities(hass, entry)
+        if entity_id in before and before[entity_id][0] != STATE_UNAVAILABLE
+    ]
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    forward = hass.config_entries.async_forward_entry_setups
+
+    async def fail_then_forward(config_entry, platforms):
+        await _fail_a_poll(hass, config_entry.runtime_data)
+        return await forward(config_entry, platforms)
+
+    with patch.object(
+        hass.config_entries, "async_forward_entry_setups", fail_then_forward
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    coordinator: EcoflowCoordinator = entry.runtime_data
+    added = _states(hass, entry)
+    restored = [
+        entity.entity_id
+        for platform in entity_platform.async_get_platforms(hass, const.DOMAIN)
+        for entity in platform.entities.values()
+        if entity.entity_id in shown
+        and getattr(entity, "_last_written_value", None) is not None
+    ]
+    await _poll(hass, coordinator)
+    after = _states(hass, entry)
+
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    # The entities were added while the read had failed, holding their old values.
+    assert [e for e in shown if added[e][0] != STATE_UNAVAILABLE] == []
+    assert len(restored) > 50
+    # One good read later, none is left unavailable.
+    assert [e for e in shown if after[e][0] == STATE_UNAVAILABLE] == []
+
+
+# ── Refused registers are retried after a firmware update ─────────────────────
+
+
+def _serve_firmware(inverter: FakeInverter, version: int) -> None:
+    """Publish a firmware version, 0x01020304 for 1.2.3.4, low word first."""
+    inverter.registers[const.FIRMWARE_VERSION.address] = version & 0xFFFF
+    inverter.registers[const.FIRMWARE_VERSION.address + 1] = version >> 16
+
+
+async def _set_up_refusing(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> tuple[MockConfigEntry, EcoflowCoordinator]:
+    """Set up with firmware 1.2.3.4 and one register the device has refused."""
+    _serve_firmware(inverter, 0x01020304)
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator: EcoflowCoordinator = entry.runtime_data
+    coordinator._unsupported_keys = frozenset({"breaker_capacity"})
+    coordinator._plan_reads()
+    return entry, coordinator
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_a_firmware_update_retries_refused_registers(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    entry, coordinator = await _set_up_refusing(hass, inverter)
+    registry = dr.async_get(hass)
+    try:
+        (device,) = dr.async_entries_for_config_entry(registry, entry.entry_id)
+        sw_version_before = device.sw_version
+
+        # The update reboots the inverter, and the reconnect reads the device again.
+        _serve_firmware(inverter, 0x01020400)
+        await coordinator.async_read_device_info()
+
+        unsupported = coordinator.unsupported_registers
+        polled = coordinator.polled_registers
+        updated = registry.async_get(device.id)
+        assert isinstance(updated, dr.DeviceEntry)
+        sw_version = updated.sw_version
+    finally:
+        await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert sw_version_before == "1.2.3.4"
+    assert unsupported == frozenset()
+    assert "breaker_capacity" in polled
+    assert sw_version == "1.2.4.0"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_a_reconnect_on_the_same_firmware_keeps_refused_registers_out(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    entry, coordinator = await _set_up_refusing(hass, inverter)
+
+    await coordinator.async_read_device_info()
+
+    unsupported = coordinator.unsupported_registers
+    polled = coordinator.polled_registers
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert unsupported == {"breaker_capacity"}
+    assert "breaker_capacity" not in polled
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_an_unreadable_firmware_version_is_not_a_change(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    """A version of zero reads as none, and keeps the one known before."""
+    entry, coordinator = await _set_up_refusing(hass, inverter)
+
+    _serve_firmware(inverter, 0)
+    await coordinator.async_read_device_info()
+
+    unsupported = coordinator.unsupported_registers
+    firmware = coordinator.identity.firmware_version
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert unsupported == {"breaker_capacity"}
+    assert firmware == "1.2.3.4"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_removing_the_entry_deletes_its_saved_state(
+    hass: HomeAssistant, inverter: FakeInverter, hass_storage: dict[str, Any]
+) -> None:
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    key = f"{const.DOMAIN}.{entry.entry_id}.state"
+    assert key in hass_storage
+
+    await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert key not in hass_storage
+
+
+# ── A setup that fails leaves nothing behind ──────────────────────────────────
+
+
+def _heartbeats() -> list[asyncio.Task[Any]]:
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == "powerocean-heartbeat" and not task.done()
+    ]
+
+
+def _closed_port() -> int:
+    """Return a port nothing listens on."""
+    with socket.socket() as sock:
+        sock.bind((HOST, 0))
+        return int(sock.getsockname()[1])
+
+
+def _controlled_entry(port: int) -> MockConfigEntry:
+    return MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: HOST, const.CONF_PORT: port},
+        options={const.CONF_MODBUS_CONTROL: True},
+    )
+
+
+@pytest.mark.usefixtures("enable_custom_integrations", "socket_enabled")
+async def test_an_unreachable_inverter_is_retried_without_leaking(
+    hass: HomeAssistant,
+) -> None:
+    """With control on, a failed setup must not leave a heartbeat or a client
+    behind: every retry would add another writer to the inverter."""
+    entry = _controlled_entry(_closed_port())
+    entry.add_to_hass(hass)
+
+    with patch.object(
+        modbus_module.ModbusClient,
+        "async_close",
+        autospec=True,
+        side_effect=modbus_module.ModbusClient.async_close,
+    ) as close:
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    port = entry.data[const.CONF_PORT]
+    assert entry.reason == f"Could not connect to the inverter at {HOST}:{port}"
+    assert _heartbeats() == []
+    assert close.call_count == 1
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_a_failed_first_poll_is_retried_without_leaking(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    """The inverter answers, so the heartbeat starts, but the first poll fails."""
+    _serve_serial(inverter, SERIAL)
+    entry = _controlled_entry(inverter.port)
+    entry.add_to_hass(hass)
+
+    with (
+        patch.object(
+            EcoflowCoordinator,
+            "async_get_raw_data",
+            side_effect=UpdateFailed("first poll failed"),
+        ),
+        patch.object(
+            modbus_module.ModbusClient,
+            "async_close",
+            autospec=True,
+            side_effect=modbus_module.ModbusClient.async_close,
+        ) as close,
+    ):
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    assert _heartbeats() == []
+    assert close.call_count == 1
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_unloading_stops_the_heartbeat_and_closes_the_client(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    _serve_serial(inverter, SERIAL)
+    entry = _controlled_entry(inverter.port)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert len(_heartbeats()) == 1
+    coordinator: EcoflowCoordinator = entry.runtime_data
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert _heartbeats() == []
+    assert not coordinator.connected
