@@ -25,10 +25,12 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 
+from .cloud_sensor import cloud_sensors
 from .const import (
     BATTERY_RESERVE_REGISTER_KEY,
     BATTERY_SOC_KEYS,
     CONF_BATTERY_COUNT,
+    CONF_INVERTER_MODEL,
     CONTROL_STATUS_SENSOR,
     CONTROL_TEST_SENSOR,
     DAILY_ENERGY_SENSORS_DEVICE_RAW,
@@ -43,7 +45,7 @@ from .const import (
 from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
 from .entity import EcoFlowBaseEntity
 from .fault_names import async_get_fault_names
-from .models import EnergySensorDef, SensorDef
+from .models import EnergySensorDef, InverterModel, SensorDef
 from .telemetry import active_fault_codes
 
 # The coordinator polls for every entity, so updates need no limit.
@@ -68,11 +70,31 @@ VALUE_PRECISION: Final = {
 
 
 async def async_setup_entry(
-    hass: HomeAssistant,  # noqa: ARG001 - required by the platform API
+    hass: HomeAssistant,
     entry: EcoflowConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
+    model: str | None
+    if coordinator is not None:
+        _add_modbus_sensors(coordinator, entry, async_add_entities)
+        model = coordinator.inverter_model
+    else:
+        model = entry.options.get(CONF_INVERTER_MODEL)
+
+    # The cloud's values, for the one model the cloud is read for.
+    cloud = entry.runtime_data.cloud
+    if cloud is not None and model == InverterModel.POWEROCEAN_SINGLE_PHASE:
+        entry.async_on_unload(cloud_sensors(hass, entry, cloud, async_add_entities))
+
+
+@callback
+def _add_modbus_sensors(
+    coordinator: EcoflowCoordinator,
+    entry: EcoflowConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Add the sensors of the inverter's Modbus registers."""
     entities: list[EcoflowSensor] = []
 
     empty_battery_slots = set(

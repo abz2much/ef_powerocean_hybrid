@@ -20,6 +20,7 @@ from custom_components.ef_powerocean_hybrid.repairs import (
     HeldTotalsRepairFlow,
     async_create_fix_flow,
 )
+from custom_components.ef_powerocean_hybrid.runtime import HybridData
 
 BUG_FORM = Path(__file__).parents[1] / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml"
 HELD = (
@@ -48,7 +49,9 @@ def _flow(coordinator: Any) -> HeldTotalsRepairFlow:
         async_create_fix_flow(None, "issue", {"entry_id": "entry"})  # type: ignore[arg-type]
     )
     assert isinstance(flow, HeldTotalsRepairFlow)
-    entry = SimpleNamespace(domain=const.DOMAIN, runtime_data=coordinator)
+    entry = SimpleNamespace(
+        domain=const.DOMAIN, runtime_data=HybridData(modbus=coordinator)
+    )
     flow.hass = SimpleNamespace(  # type: ignore[assignment]
         config_entries=SimpleNamespace(async_get_entry=lambda _: entry)
     )

@@ -9,4 +9,10 @@ Copyright (c) 2026 MaxGrmm.
   the shared connection, dropping a shared connection after a timed-out
   request, and the shorter reconnect delays.
 
-The upstream copyright and permission notice is kept in LICENSE.
+The cloud code in custom_components/ef_powerocean_hybrid/cloud/ and its tests
+come from powerocean_single_phase by abz2much
+(https://github.com/abz2much/powerocean_single_phase), MIT licence,
+Copyright (c) 2026 niltrip, abz2much, at commit 45287c9 (v1.0.1). That project
+is itself based on niltrip's powerocean (https://github.com/niltrip/powerocean).
+
+The upstream copyright and permission notices are kept in LICENSE.

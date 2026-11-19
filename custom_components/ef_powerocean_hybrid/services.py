@@ -162,7 +162,12 @@ def _coordinator_for(hass: HomeAssistant, device_id: str) -> EcoflowCoordinator:
                 and entry.domain == DOMAIN
                 and entry.state is ConfigEntryState.LOADED
             ):
-                return entry.runtime_data
+                if entry.runtime_data.modbus is None:
+                    raise ServiceValidationError(
+                        translation_domain=DOMAIN,
+                        translation_key="no_modbus_connection",
+                    )
+                return entry.runtime_data.modbus
     raise ServiceValidationError(
         translation_domain=DOMAIN,
         translation_key="unknown_device",

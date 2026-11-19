@@ -13,6 +13,7 @@ from homeassistant.loader import async_get_integration
 
 from .const import BUG_REPORT_URL, DOMAIN
 from .coordinator import EcoflowCoordinator
+from .runtime import HybridData
 
 if TYPE_CHECKING:
     # Only for annotations: Home Assistant 2025.12, the oldest supported, does not
@@ -30,8 +31,8 @@ class HeldTotalsRepairFlow(RepairsFlow):
         entry = self.hass.config_entries.async_get_entry(self._entry_id)
         if entry is None or entry.domain != DOMAIN:
             return None
-        coordinator: EcoflowCoordinator | None = getattr(entry, "runtime_data", None)
-        return coordinator
+        runtime: HybridData | None = getattr(entry, "runtime_data", None)
+        return runtime.modbus if runtime is not None else None
 
     def _held_coordinator(self) -> EcoflowCoordinator | None:
         coordinator = self._coordinator()

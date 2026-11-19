@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -14,6 +14,7 @@ from custom_components.ef_powerocean_hybrid.models import (
     InverterModel,
     ReserveSource,
 )
+from custom_components.ef_powerocean_hybrid.runtime import HybridData
 
 
 async def effective_reserve(hass, reserve_in_force):
@@ -31,7 +32,7 @@ async def effective_reserve(hass, reserve_in_force):
     )
     entry = MockConfigEntry(domain=const.DOMAIN, entry_id="entry")
     entry.add_to_hass(hass)
-    entry.runtime_data = coordinator
+    entry.runtime_data = HybridData(modbus=cast(Any, coordinator))
     added: list = []
     await sensor.async_setup_entry(hass, entry, cast(AddEntitiesCallback, added.extend))
     return next(

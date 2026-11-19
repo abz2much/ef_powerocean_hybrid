@@ -22,7 +22,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up EcoFlow binary sensors from a config entry."""
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
+    if coordinator is None:
+        # Only Modbus has these.
+        return
     async_add_entities(
         [
             EcoFlowModbusControlBinarySensor(

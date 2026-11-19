@@ -14,6 +14,7 @@ from .const import DOMAIN
 from .control import ControlManager
 from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
 from .entity import EcoFlowBaseEntity
+from .ids import system_id
 from .models import SwitchDef, requires_modbus_control
 
 # One write to the inverter at a time.
@@ -87,7 +88,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up EcoFlow switches from a config entry."""
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
+    if coordinator is None:
+        # Only Modbus has these.
+        return
     native = coordinator.control.reserve_native
 
     async_add_entities(
@@ -100,7 +104,7 @@ async def async_setup_entry(
     registry = er.async_get(hass)
     if native and (
         stale := registry.async_get_entity_id(
-            "switch", DOMAIN, f"{entry.entry_id}_{RESERVE_CHARGE_SWITCH.key}"
+            "switch", DOMAIN, f"{system_id(entry)}_{RESERVE_CHARGE_SWITCH.key}"
         )
     ):
         registry.async_remove(stale)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -18,6 +19,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.ef_powerocean_hybrid import services
 from custom_components.ef_powerocean_hybrid.const import DOMAIN
 from custom_components.ef_powerocean_hybrid.models import ControlFeature
+from custom_components.ef_powerocean_hybrid.runtime import HybridData
 
 
 @pytest.fixture
@@ -34,7 +36,9 @@ def inverter(hass: HomeAssistant) -> SimpleNamespace:
         async_start=Mock(),
         async_cancel=AsyncMock(),
     )
-    entry.runtime_data = SimpleNamespace(control=control, control_test=control_test)
+    entry.runtime_data = HybridData(
+        modbus=cast(Any, SimpleNamespace(control=control, control_test=control_test))
+    )
     services.async_setup_services(hass)
     return SimpleNamespace(
         device_id=device.id, control=control, control_test=control_test

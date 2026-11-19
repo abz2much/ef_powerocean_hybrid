@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -11,6 +11,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ef_powerocean_hybrid import const, number
 from custom_components.ef_powerocean_hybrid.models import InverterModel
+from custom_components.ef_powerocean_hybrid.runtime import HybridData
 
 
 def fake_coordinator(*, native: bool) -> SimpleNamespace:
@@ -28,10 +29,10 @@ def fake_coordinator(*, native: bool) -> SimpleNamespace:
     )
 
 
-async def set_up(hass, *, native: bool) -> list:
-    entry = MockConfigEntry(domain=const.DOMAIN, entry_id="entry")
+async def set_up(hass, *, native: bool, unique_id: str | None = None) -> list:
+    entry = MockConfigEntry(domain=const.DOMAIN, entry_id="entry", unique_id=unique_id)
     entry.add_to_hass(hass)
-    entry.runtime_data = fake_coordinator(native=native)
+    entry.runtime_data = HybridData(modbus=cast(Any, fake_coordinator(native=native)))
     added: list = []
     await number.async_setup_entry(hass, entry, cast(AddEntitiesCallback, added.extend))
     return added
@@ -62,6 +63,16 @@ async def test_the_retired_minimum_soc_number_is_removed(hass) -> None:
         entity._definition.key == const.RETIRED_MIN_SOC_NUMBER_KEY
         for entity in entities
     )
+
+
+async def test_the_retired_number_of_a_serial_keyed_entry_is_removed(hass) -> None:
+    registry = er.async_get(hass)
+    unique_id = f"HJ31ZAS2TEST0001_{const.RETIRED_MIN_SOC_NUMBER_KEY}"
+    registry.async_get_or_create("number", const.DOMAIN, unique_id)
+
+    await set_up(hass, native=False, unique_id="HJ31ZAS2TEST0001")
+
+    assert not registry.async_get_entity_id("number", const.DOMAIN, unique_id)
 
 
 async def test_the_battery_reserve_says_whether_it_is_native(hass) -> None:

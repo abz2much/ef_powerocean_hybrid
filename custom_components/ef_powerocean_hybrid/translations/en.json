@@ -3,14 +3,10 @@
     "step": {
       "user": {
         "title": "EcoFlow PowerOcean",
-        "description": "Enter the connection details for your inverter.",
-        "data": {
-          "host": "IP Address",
-          "port": "Modbus TCP Port"
-        },
-        "data_description": {
-          "host": "Local IP address of the inverter.",
-          "port": "Default is 502"
+        "description": "How does Home Assistant reach your system?",
+        "menu_options": {
+          "modbus": "Modbus TCP on the local network (the cloud can be added for a PowerOcean Single Phase)",
+          "cloud": "EcoFlow cloud only (PowerOcean Single Phase)"
         }
       },
       "parameters": {
@@ -43,16 +39,106 @@
         "data_description": {
           "host": "Local IP address of the inverter.",
           "port": "Default is 502"
+        },
+        "menu_options": {
+          "reconfigure_address": "Change the inverter's address",
+          "reconfigure_cloud": "Add the EcoFlow cloud"
+        }
+      },
+      "modbus": {
+        "title": "EcoFlow PowerOcean",
+        "description": "Enter the connection details for your inverter.",
+        "data": {
+          "host": "IP Address",
+          "port": "Modbus TCP Port"
+        },
+        "data_description": {
+          "host": "Local IP address of the inverter.",
+          "port": "Default is 502"
+        }
+      },
+      "cloud_option": {
+        "title": "EcoFlow cloud",
+        "description": "A PowerOcean Single Phase can also be read through the EcoFlow cloud. The cloud adds the battery packs and other values Modbus does not have, and stands in for Modbus when the inverter cannot be reached.",
+        "menu_options": {
+          "cloud_login": "Add the EcoFlow cloud",
+          "finish": "Modbus only"
+        }
+      },
+      "cloud_login": {
+        "title": "EcoFlow account",
+        "description": "Sign in with the EcoFlow account that has this inverter.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        },
+        "data_description": {
+          "email": "The email address of your EcoFlow account.",
+          "password": "The password of your EcoFlow account."
+        }
+      },
+      "cloud": {
+        "title": "EcoFlow cloud",
+        "description": "Sign in with the EcoFlow account that has the inverter.",
+        "data": {
+          "email": "Email",
+          "password": "Password",
+          "cloud_serial": "Inverter serial number",
+          "inverter_model": "Inverter model"
+        },
+        "data_description": {
+          "email": "The email address of your EcoFlow account.",
+          "password": "The password of your EcoFlow account.",
+          "cloud_serial": "As shown in the EcoFlow app under the device's settings.",
+          "inverter_model": "The cloud is read for the PowerOcean Single Phase only."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Sign in to EcoFlow again",
+        "description": "The EcoFlow cloud rejected the login for {email}. Enter the account's current password.",
+        "data": {
+          "password": "Password"
+        }
+      },
+      "reconfigure_address": {
+        "title": "EcoFlow PowerOcean - Connection",
+        "description": "Change the address of {title}. The inverter must answer on it, and it must be the same inverter.",
+        "data": {
+          "host": "IP Address",
+          "port": "Modbus TCP Port"
+        },
+        "data_description": {
+          "host": "Local IP address of the inverter.",
+          "port": "Default is 502"
+        }
+      },
+      "reconfigure_cloud": {
+        "title": "Add the EcoFlow cloud",
+        "description": "Sign in with the EcoFlow account that has this inverter. The entities you have keep their IDs, names, labels and areas.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        },
+        "data_description": {
+          "email": "The email address of your EcoFlow account.",
+          "password": "The password of your EcoFlow account."
         }
       }
     },
     "error": {
-      "cannot_connect": "Connection failed - please check IP address and port"
+      "cannot_connect": "Connection failed - please check IP address and port",
+      "model_mismatch": "The inverter reports a different model than PowerOcean Single Phase. Choose the model the inverter reports.",
+      "invalid_auth": "The EcoFlow cloud rejected the email address or password.",
+      "cloud_cannot_connect": "The EcoFlow cloud cannot be reached. Try again later.",
+      "cloud_unknown_device": "The EcoFlow account has no inverter with this serial number.",
+      "serial_unreadable": "The inverter's serial number could not be read over Modbus, so the EcoFlow cloud cannot be matched to it. Check that Modbus TCP is on and try again."
     },
     "abort": {
       "already_configured": "This device is already configured",
       "reconfigure_successful": "The connection details have been updated.",
-      "wrong_device": "Another inverter answers on this address. To add it, set it up as a new device instead."
+      "wrong_device": "Another inverter answers on this address. To add it, set it up as a new device instead.",
+      "reauth_successful": "Signed in again. The cloud values come back with the next update.",
+      "use_reconfigure": "This inverter is already set up through the EcoFlow cloud. To add Modbus to it, open that entry's menu and choose Reconfigure."
     }
   },
   "options": {
@@ -105,6 +191,9 @@
     "error": {
       "invalid_energy_total": "Enter each energy total as a number, with a comma or a point for decimals and without thousands separators.",
       "energy_total_lowered": "This would lower a total. Home Assistant records a drop as negative energy, or, if it is more than 10%, as a new meter that adds the whole value to the Energy dashboard. Check the values, then submit again to save them anyway. You can correct the history afterwards under Developer tools \u2192 Statistics \u2192 Adjust sum."
+    },
+    "abort": {
+      "no_settings": "A system reached through the EcoFlow cloud alone has no settings yet."
     }
   },
   "issues": {
@@ -566,6 +655,270 @@
       },
       "grid_connection_code": {
         "name": "Grid Connection Code"
+      },
+      "pcs_meter_power": {
+        "name": "Grid power (heartbeat)"
+      },
+      "ems_battery_power": {
+        "name": "Battery power (heartbeat)"
+      },
+      "cloud_solar_power": {
+        "name": "Solar power (cloud)"
+      },
+      "cloud_pv1_voltage": {
+        "name": "PV string 1 voltage (cloud)"
+      },
+      "cloud_pv1_current": {
+        "name": "PV string 1 current (cloud)"
+      },
+      "cloud_pv1_power": {
+        "name": "PV string 1 power (cloud)"
+      },
+      "pv1_light": {
+        "name": "PV string 1 light"
+      },
+      "cloud_pv2_voltage": {
+        "name": "PV string 2 voltage (cloud)"
+      },
+      "cloud_pv2_current": {
+        "name": "PV string 2 current (cloud)"
+      },
+      "cloud_pv2_power": {
+        "name": "PV string 2 power (cloud)"
+      },
+      "pv2_light": {
+        "name": "PV string 2 light"
+      },
+      "cloud_current_l1": {
+        "name": "Inverter current L1 (cloud)"
+      },
+      "cloud_inverter_ac_power": {
+        "name": "Inverter AC power (cloud)"
+      },
+      "cloud_active_power_l1": {
+        "name": "Inverter active power L1 (cloud)"
+      },
+      "cloud_reactive_power_l1": {
+        "name": "Inverter reactive power L1"
+      },
+      "cloud_apparent_power_l1": {
+        "name": "Inverter apparent power L1"
+      },
+      "active_power_limit_up": {
+        "name": "Active power limit up"
+      },
+      "active_power_limit_down": {
+        "name": "Active power limit down"
+      },
+      "cloud_battery_count": {
+        "name": "Battery module count (cloud)"
+      },
+      "cloud_battery_remaining": {
+        "name": "Battery remaining energy (cloud)"
+      },
+      "battery_to_grid": {
+        "name": "Battery to grid"
+      },
+      "battery_to_house": {
+        "name": "Battery to house"
+      },
+      "grid_to_battery": {
+        "name": "Grid to battery"
+      },
+      "grid_to_house": {
+        "name": "Grid to house"
+      },
+      "solar_to_battery": {
+        "name": "Solar to battery"
+      },
+      "solar_to_grid": {
+        "name": "Solar to grid"
+      },
+      "solar_to_house": {
+        "name": "Solar to house"
+      },
+      "insulation_resistance": {
+        "name": "PV insulation resistance"
+      },
+      "ems_battery_selfcheck_state": {
+        "name": "Battery self-check state"
+      },
+      "ems_mppt_run_state": {
+        "name": "MPPT run state"
+      },
+      "ems_mppt_selfcheck_state": {
+        "name": "MPPT self-check state"
+      },
+      "heartbeat_update_time": {
+        "name": "Heartbeat update time"
+      },
+      "energy_stream_update_time": {
+        "name": "Energy stream update time"
+      },
+      "ems_change_update_time": {
+        "name": "EMS change update time"
+      },
+      "cloud_operating_mode": {
+        "name": "Operating mode (cloud)"
+      },
+      "pcs_run_state": {
+        "name": "Inverter run state"
+      },
+      "cloud_feed_in_power": {
+        "name": "Feed-in power limit (cloud)"
+      },
+      "cloud_feed_mode": {
+        "name": "Feed-in mode (cloud)"
+      },
+      "cloud_feed_ratio": {
+        "name": "Feed-in ratio (cloud)"
+      },
+      "keep_soc": {
+        "name": "Keep SOC"
+      },
+      "backup_ratio": {
+        "name": "Backup ratio"
+      },
+      "battery_limit_reason": {
+        "name": "Battery limit reason"
+      },
+      "pcs_ac_error_code": {
+        "name": "Inverter AC error code"
+      },
+      "pcs_dc_error_code": {
+        "name": "Inverter DC error code"
+      },
+      "pcs_power_derating_flag": {
+        "name": "Inverter power derating flag"
+      },
+      "pcs_power_derating_set": {
+        "name": "Inverter power derating setting"
+      },
+      "pcs_avg_ovp_protect_cnt": {
+        "name": "Average overvoltage protection count"
+      },
+      "pcs_ofp_protect_cnt": {
+        "name": "Overfrequency protection count"
+      },
+      "pcs_ovp_protect_cnt": {
+        "name": "Overvoltage protection count"
+      },
+      "pcs_ufp_protect_cnt": {
+        "name": "Underfrequency protection count"
+      },
+      "pcs_uvp1_protect_cnt": {
+        "name": "Undervoltage protection count 1"
+      },
+      "pcs_uvp2_protect_cnt": {
+        "name": "Undervoltage protection count 2"
+      },
+      "cloud_error_count": {
+        "name": "Error count (cloud)"
+      },
+      "cloud_breaker_capacity": {
+        "name": "Circuit breaker capacity (cloud)"
+      },
+      "online": {
+        "name": "Online"
+      },
+      "grid_state": {
+        "name": "Grid state"
+      },
+      "charge_limit": {
+        "name": "Charge limit"
+      },
+      "other_pv_power": {
+        "name": "Other PV power"
+      },
+      "pv_inverter_power": {
+        "name": "PV inverter power"
+      },
+      "solar_today_cloud": {
+        "name": "Solar yield today (cloud)"
+      },
+      "solar_month_cloud": {
+        "name": "Solar yield this month (cloud)"
+      },
+      "solar_year_cloud": {
+        "name": "Solar yield this year (cloud)"
+      },
+      "solar_total_cloud": {
+        "name": "Solar yield total (cloud)"
+      },
+      "pack_soc": {
+        "name": "State of charge"
+      },
+      "pack_real_soc": {
+        "name": "Real state of charge"
+      },
+      "pack_soh": {
+        "name": "State of health"
+      },
+      "pack_real_soh": {
+        "name": "Real state of health"
+      },
+      "pack_power": {
+        "name": "Power"
+      },
+      "pack_voltage": {
+        "name": "Voltage"
+      },
+      "pack_current": {
+        "name": "Current"
+      },
+      "pack_cell_max_voltage": {
+        "name": "Highest cell voltage"
+      },
+      "pack_cell_min_voltage": {
+        "name": "Lowest cell voltage"
+      },
+      "pack_env_temp": {
+        "name": "Ambient temperature"
+      },
+      "pack_max_cell_temp": {
+        "name": "Highest cell temperature"
+      },
+      "pack_min_cell_temp": {
+        "name": "Lowest cell temperature"
+      },
+      "pack_max_mos_temp": {
+        "name": "Highest MOSFET temperature"
+      },
+      "pack_min_mos_temp": {
+        "name": "Lowest MOSFET temperature"
+      },
+      "pack_cycles": {
+        "name": "Charge cycles"
+      },
+      "pack_remaining": {
+        "name": "Remaining energy"
+      },
+      "pack_charged_total": {
+        "name": "Charged total"
+      },
+      "pack_discharged_total": {
+        "name": "Discharged total"
+      },
+      "pack_state": {
+        "name": "State"
+      },
+      "pack_bms_run_state": {
+        "name": "BMS run state"
+      },
+      "pack_charge_state": {
+        "name": "Charge state"
+      },
+      "pack_module_state": {
+        "name": "Module state"
+      },
+      "pack_balance_state": {
+        "name": "Balance state"
+      },
+      "pack_error_code": {
+        "name": "Error code"
+      },
+      "pack_update_time": {
+        "name": "Update time"
       }
     },
     "binary_sensor": {
@@ -777,6 +1130,9 @@
     },
     "cannot_connect": {
       "message": "Could not connect to the inverter at {host}:{port}."
+    },
+    "no_modbus_connection": {
+      "message": "This system has no Modbus connection, so the battery cannot be controlled from Home Assistant."
     }
   }
 }

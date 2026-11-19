@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from typing import Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
 
-from .const import CONF_HOST, CONF_PORT, DOMAIN
+from .cloud import coordinator as cloud_module
+from .cloud.coordinator import CloudCoordinator
+from .const import CONF_CLOUD_SERIAL, CONF_HOST, CONF_PORT, DOMAIN
 from .control import ControlInputs
 from .coordinator import (
     EcoflowConfigEntry,
@@ -24,9 +30,13 @@ from .coordinator import (
 )
 from .modbus import async_prepare
 from .reading_checks import KEYS as READING_CHECK_KEYS
+from .runtime import HybridData
 from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
+
+# How often an entry running on the cloud checks whether Modbus answers again.
+MODBUS_RETRY_INTERVAL: Final = timedelta(seconds=30)
 
 CONFIG_SCHEMA: Final = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -83,8 +93,9 @@ def _async_claim_serial_number(
     """Make the serial number the entry's unique id once the device has reported it.
 
     Entries made before the serial was read are keyed by host and port, which
-    changes with the network while the inverter does not. Entities and the device
-    are keyed by the entry id, so the entry's unique id can change under them.
+    changes with the network while the inverter does not. Until then their
+    entities and device are keyed by the entry id; they move to the serial here,
+    keeping their entity IDs, names, labels and areas.
     """
     serial = coordinator.identity.serial_number
     if not serial or serial == "unknown" or entry.unique_id == serial:
@@ -103,7 +114,27 @@ def _async_claim_serial_number(
     _LOGGER.info(
         "Unique id of %s changes from %s to %s", entry.title, entry.unique_id, serial
     )
+    _async_move_to_serial(hass, entry, serial)
     hass.config_entries.async_update_entry(entry, unique_id=serial)
+
+
+@callback
+def _async_move_to_serial(
+    hass: HomeAssistant, entry: EcoflowConfigEntry, serial: str
+) -> None:
+    """Re-key the entities and the device made under the entry id by the serial."""
+    old = f"{entry.entry_id}_"
+    entities = er.async_get(hass)
+    for registered in er.async_entries_for_config_entry(entities, entry.entry_id):
+        if registered.unique_id.startswith(old):
+            entities.async_update_entity(
+                registered.entity_id,
+                new_unique_id=f"{serial}_{registered.unique_id[len(old) :]}",
+            )
+    devices = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(devices, entry.entry_id):
+        if (DOMAIN, entry.entry_id) in device.identifiers:
+            devices.async_update_device(device.id, new_identifiers={(DOMAIN, serial)})
 
 
 @callback
@@ -141,15 +172,60 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> bool:
     """Set up EF PowerOcean Hybrid from a config entry."""
 
-    await async_prepare(hass)
-    coordinator = EcoflowCoordinator(
-        hass,
-        config_entry=entry,
-    )
+    coordinator = None
+    # An entry made with only a cloud connection has no inverter address.
+    if CONF_HOST in entry.data:
+        await async_prepare(hass)
+        modbus = EcoflowCoordinator(hass, config_entry=entry)
+        try:
+            await _async_start_modbus(hass, entry, modbus)
+        except ConfigEntryNotReady:
+            if CONF_CLOUD_SERIAL not in entry.data:
+                raise
+            # The entry stays loaded, so Home Assistant does not shut it down.
+            await modbus.async_shutdown()
+            # The cloud carries the system until the inverter answers again.
+            _LOGGER.warning(
+                "The inverter does not answer over Modbus; running on the EcoFlow "
+                "cloud until it does"
+            )
+            _async_watch_for_modbus(hass, entry)
+        else:
+            coordinator = modbus
+
+    cloud = None
+    if CONF_CLOUD_SERIAL in entry.data:
+        cloud = CloudCoordinator(hass, entry, cloud_module.create_api(hass, entry))
+        # Not a first refresh: a cloud that is down or rejects the login must
+        # not stop the entry, or its Modbus side, from loading.
+        await cloud.async_refresh()
+    entry.runtime_data = HybridData(modbus=coordinator, cloud=cloud)
+    _async_make_device_physical(hass, entry)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    if coordinator is not None:
+        # The control loop reads its inputs, and what its reading checks compare,
+        # whatever entities are enabled. With it and the entities all asking, the
+        # poll reads only what they ask for from here on.
+        entry.async_on_unload(
+            coordinator.async_require(ControlInputs.keys() | READING_CHECK_KEYS)
+        )
+        coordinator.async_poll_on_demand()
+
+    # Reload integration when config entry data changes
+    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+
+    return True
+
+
+async def _async_start_modbus(
+    hass: HomeAssistant, entry: EcoflowConfigEntry, coordinator: EcoflowCoordinator
+) -> None:
+    """Connect to the inverter over Modbus through *coordinator*."""
     # Connects and reads the device, through the coordinator's _async_setup. If
     # it fails, Home Assistant retries the setup and shuts the coordinator down.
     await coordinator.async_config_entry_first_refresh()
-    # Before the update listener below, which would reload the entry over it.
+    # Before the update listener, which would reload the entry over it.
     _async_claim_serial_number(hass, entry, coordinator)
 
     _async_update_modbus_disabled_issue(hass, entry, coordinator)
@@ -159,22 +235,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> b
         )
     )
 
-    entry.runtime_data = coordinator
-    _async_make_device_physical(hass, entry)
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # The control loop reads its inputs, and what its reading checks compare,
-    # whatever entities are enabled. With it and
-    # the entities all asking, the poll reads only what they ask for from here on.
+@callback
+def _async_watch_for_modbus(hass: HomeAssistant, entry: EcoflowConfigEntry) -> None:
+    """Reload the entry once the inverter answers over Modbus again."""
+
+    async def async_probe(_now: datetime) -> None:
+        # Imported here: the config flow imports this package.
+        from .config_flow import (
+            DEVICE_SERIAL_NUMBER,
+            async_read_device_settings,
+        )
+
+        settings = await async_read_device_settings(
+            hass, entry.data[CONF_HOST], entry.data[CONF_PORT]
+        )
+        # Only this inverter: a connection alone, or another device at the
+        # address, would fail the setup again and reload every 30 seconds.
+        if settings and settings.get(DEVICE_SERIAL_NUMBER) == entry.unique_id:
+            hass.config_entries.async_schedule_reload(entry.entry_id)
+
     entry.async_on_unload(
-        coordinator.async_require(ControlInputs.keys() | READING_CHECK_KEYS)
+        async_track_time_interval(hass, async_probe, MODBUS_RETRY_INTERVAL)
     )
-    coordinator.async_poll_on_demand()
-
-    # Reload integration when config entry data changes
-    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
-
-    return True
 
 
 async def _async_reload_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> None:

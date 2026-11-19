@@ -6,13 +6,27 @@ from dataclasses import asdict
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
+from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_HOST, CONTROL_FEATURES, DOMAIN, SERIAL_NUMBER
+from .const import (
+    CONF_CLOUD_SERIAL,
+    CONF_HOST,
+    CONTROL_FEATURES,
+    DOMAIN,
+    SERIAL_NUMBER,
+)
 from .coordinator import EcoflowConfigEntry
 from .modbus import is_shared
 
-TO_REDACT = (CONF_HOST, "title", "unique_id")
+TO_REDACT = (
+    CONF_HOST,
+    "title",
+    "unique_id",
+    CONF_EMAIL,
+    CONF_PASSWORD,
+    CONF_CLOUD_SERIAL,
+)
 
 # Raw readings worth having in a model report, to compare how each model fills them.
 PROTOCOL_REPORT_KEYS = (
@@ -54,7 +68,11 @@ async def async_get_config_entry_diagnostics(
     entry: EcoflowConfigEntry,
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
+    if coordinator is None:
+        return async_redact_data(
+            {"entry": entry.as_dict(), "domain": DOMAIN, "modbus": None}, TO_REDACT
+        )
 
     identity = asdict(coordinator.identity)
     if identity["serial_number"] not in (None, "unknown"):

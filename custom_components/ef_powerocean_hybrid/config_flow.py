@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Final
 
 import voluptuous as vol
@@ -12,6 +13,7 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
     OptionsFlow,
 )
+from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import section
 from homeassistant.helpers.selector import (
@@ -24,10 +26,13 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
+from .cloud import coordinator as cloud_module
+from .cloud.coordinator import async_check_cloud
 from .const import (
     CONF_BATTERY_COUNT,
     CONF_BATTERY_RESERVE,
     CONF_CALC_SOLAR_POWER,
+    CONF_CLOUD_SERIAL,
     CONF_ENERGY_OFFSETS,
     CONF_HOST,
     CONF_INVERTER_MODEL,
@@ -57,6 +62,7 @@ from .util import parse_kwh, portal_history_url
 
 if TYPE_CHECKING:
     from .coordinator import EcoflowCoordinator
+    from .runtime import HybridData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -148,8 +154,18 @@ def _connection_schema() -> vol.Schema:
     )
 
 
+CLOUD_TITLE: Final = "EcoFlow PowerOcean (cloud)"
+
+
 def _default_title(host: str) -> str:
     return f"EcoFlow PowerOcean ({host})"
+
+
+def _default_titles(entry: ConfigEntry) -> tuple[str, ...]:
+    """Return the titles setup gives an entry like *entry*: a user's own is kept."""
+    if CONF_HOST in entry.data:
+        return (_default_title(entry.data[CONF_HOST]),)
+    return (CLOUD_TITLE,)
 
 
 def _is_keyed_by_address(entry: ConfigEntry) -> bool:
@@ -159,6 +175,39 @@ def _is_keyed_by_address(entry: ConfigEntry) -> bool:
     until the coordinator claims the serial. A serial number has no colon.
     """
     return ":" in (entry.unique_id or "")
+
+
+_PASSWORD = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
+_LOGIN_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_EMAIL): TextSelector(
+            TextSelectorConfig(type=TextSelectorType.EMAIL)
+        ),
+        vol.Required(CONF_PASSWORD): _PASSWORD,
+    }
+)
+# Models whose product registers the PowerOcean Single Phase can report: the
+# registers cannot tell it from the Ocean 2 single phase.
+_SINGLE_PHASE_READINGS: Final = (
+    InverterModel.POWEROCEAN_SINGLE_PHASE.value,
+    InverterModel.OCEAN_2_SINGLE_PHASE.value,
+)
+
+
+def _reads_as_single_phase(device_settings: dict[str, Any]) -> bool:
+    """Return False if the inverter's product registers name another model."""
+    reported = device_settings.get(CONF_INVERTER_MODEL)
+    return reported is None or reported in _SINGLE_PHASE_READINGS
+
+
+async def _async_check_login(
+    hass: HomeAssistant, login: Mapping[str, Any], serial: str
+) -> str | None:
+    """Log in to the cloud and read the inverter; return the form's error key."""
+    api = cloud_module.create_api_for(
+        hass, login[CONF_EMAIL], login[CONF_PASSWORD], serial
+    )
+    return await async_check_cloud(api)
 
 
 class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -173,6 +222,7 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
         """Initialize the config flow."""
         self._user_input: dict[str, Any] = {}
         self._device_settings: dict[str, Any] = {}
+        self._options: dict[str, Any] = {}
 
     @staticmethod
     @callback
@@ -182,6 +232,16 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
         return EcoflowOptionsFlow()
 
     async def async_step_user(
+        self,
+        user_input: dict[str, Any] | None = None,  # noqa: ARG002 - flow API
+    ) -> ConfigFlowResult:
+        """Ask how to reach the system.
+
+        Modbus (with the cloud as an option), or the cloud alone.
+        """
+        return self.async_show_menu(step_id="user", menu_options=["modbus", "cloud"])
+
+    async def async_step_modbus(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
@@ -199,6 +259,13 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
                     device_settings.get(DEVICE_SERIAL_NUMBER)
                     or f"{user_input[CONF_HOST]}:{user_input[CONF_PORT]}"
                 )
+                existing = self.hass.config_entries.async_entry_for_domain_unique_id(
+                    DOMAIN, str(self.unique_id)
+                )
+                if existing is not None and CONF_HOST not in existing.data:
+                    # Set up through the cloud alone: Reconfigure adds Modbus
+                    # to it after checking the inverter's serial and model.
+                    return self.async_abort(reason="use_reconfigure")
                 # An inverter already set up that has moved on the network gets
                 # its new address rather than a second entry.
                 self._abort_if_unique_id_configured(
@@ -211,7 +278,7 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
             errors["base"] = "cannot_connect"
 
         return self.async_show_form(
-            step_id="user",
+            step_id="modbus",
             data_schema=self.add_suggested_values_to_schema(
                 _connection_schema(), user_input
             ),
@@ -224,11 +291,18 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            return self.async_create_entry(
-                title=_default_title(self._user_input[CONF_HOST]),
-                data=self._user_input,
-                options=user_input,
+            self._options = user_input
+            single = (
+                user_input.get(CONF_INVERTER_MODEL)
+                == InverterModel.POWEROCEAN_SINGLE_PHASE
             )
+            if single and not _reads_as_single_phase(self._device_settings):
+                errors["base"] = "model_mismatch"
+            elif single:
+                # The cloud is read for the PowerOcean Single Phase only.
+                return await self.async_step_cloud_option()
+            else:
+                return await self.async_step_finish()
 
         return self.async_show_form(
             step_id="parameters",
@@ -280,14 +354,189 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    async def async_step_cloud_option(
+        self,
+        user_input: dict[str, Any] | None = None,  # noqa: ARG002 - flow API
+    ) -> ConfigFlowResult:
+        """Offer the cloud beside Modbus."""
+        return self.async_show_menu(
+            step_id="cloud_option", menu_options=["cloud_login", "finish"]
+        )
+
+    async def async_step_finish(
+        self,
+        user_input: dict[str, Any] | None = None,  # noqa: ARG002 - flow API
+    ) -> ConfigFlowResult:
+        """Create the entry with Modbus only."""
+        return self.async_create_entry(
+            title=_default_title(self._user_input[CONF_HOST]),
+            data=self._user_input,
+            options=self._options,
+        )
+
+    async def async_step_cloud_login(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Add the cloud to a Modbus system: the account that has this inverter."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            serial = str(self.unique_id)
+            if ":" in serial:
+                # Only host:port is known: the cloud could not be matched to it.
+                errors["base"] = "serial_unreadable"
+            elif error := await _async_check_login(self.hass, user_input, serial):
+                errors["base"] = error
+            else:
+                return self.async_create_entry(
+                    title=_default_title(self._user_input[CONF_HOST]),
+                    data={**self._user_input, **user_input, CONF_CLOUD_SERIAL: serial},
+                    options=self._options,
+                )
+        return self.async_show_form(
+            step_id="cloud_login",
+            data_schema=self.add_suggested_values_to_schema(_LOGIN_SCHEMA, user_input),
+            errors=errors,
+        )
+
+    async def async_step_cloud(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Set up a PowerOcean Single Phase through the cloud alone."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            serial = user_input[CONF_CLOUD_SERIAL]
+            await self.async_set_unique_id(serial)
+            self._abort_if_unique_id_configured()
+            if error := await _async_check_login(self.hass, user_input, serial):
+                errors["base"] = error
+            else:
+                return self.async_create_entry(
+                    title=CLOUD_TITLE,
+                    data={
+                        CONF_EMAIL: user_input[CONF_EMAIL],
+                        CONF_PASSWORD: user_input[CONF_PASSWORD],
+                        CONF_CLOUD_SERIAL: serial,
+                    },
+                    # Trusted as chosen: the cloud does not report the model.
+                    options={CONF_INVERTER_MODEL: user_input[CONF_INVERTER_MODEL]},
+                )
+        schema = _LOGIN_SCHEMA.extend(
+            {
+                vol.Required(CONF_CLOUD_SERIAL): str,
+                vol.Required(
+                    CONF_INVERTER_MODEL,
+                    default=InverterModel.POWEROCEAN_SINGLE_PHASE.value,
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=[InverterModel.POWEROCEAN_SINGLE_PHASE.value],
+                        translation_key=CONF_INVERTER_MODEL,
+                        mode=SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+            }
+        )
+        return self.async_show_form(
+            step_id="cloud",
+            data_schema=self.add_suggested_values_to_schema(schema, user_input),
+            errors=errors,
+        )
+
+    async def async_step_reauth(
+        self,
+        entry_data: Mapping[str, Any],  # noqa: ARG002 - flow API
+    ) -> ConfigFlowResult:
+        """The cloud rejected the login: ask for the password again."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            login = {CONF_EMAIL: entry.data[CONF_EMAIL], **user_input}
+            if error := await _async_check_login(
+                self.hass, login, entry.data[CONF_CLOUD_SERIAL]
+            ):
+                errors["base"] = error
+            else:
+                return self.async_update_reload_and_abort(
+                    entry, data_updates={CONF_PASSWORD: user_input[CONF_PASSWORD]}
+                )
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required(CONF_PASSWORD): _PASSWORD}),
+            description_placeholders={"email": entry.data[CONF_EMAIL]},
+            errors=errors,
+        )
+
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Move an existing entry to a new address of the same inverter.
+        """Change how the system is reached.
 
-        Only the connection lives here. Everything else about the inverter is in
-        the options flow, which works without the inverter answering.
+        Only the connections live here. Everything else about the inverter is in
+        the options flow, which works without the inverter answering. A Modbus-only
+        PowerOcean Single Phase is also offered the cloud, so its entities keep
+        their IDs, names, labels and areas rather than being set up again.
         """
+        entry = self._get_reconfigure_entry()
+        if (
+            user_input is None
+            and CONF_HOST in entry.data
+            and CONF_CLOUD_SERIAL not in entry.data
+            and entry.options.get(CONF_INVERTER_MODEL)
+            == InverterModel.POWEROCEAN_SINGLE_PHASE
+        ):
+            return self.async_show_menu(
+                step_id="reconfigure",
+                menu_options=["reconfigure_address", "reconfigure_cloud"],
+            )
+        return await self._async_reconfigure_address(user_input, "reconfigure")
+
+    async def async_step_reconfigure_address(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Move the entry to a new address of the same inverter."""
+        return await self._async_reconfigure_address(user_input, "reconfigure_address")
+
+    async def async_step_reconfigure_cloud(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Add the cloud to a Modbus-only PowerOcean Single Phase."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            # The same checks as at setup: this inverter, read as single phase.
+            settings = await async_read_device_settings(
+                self.hass, entry.data[CONF_HOST], entry.data[CONF_PORT]
+            )
+            serial = (settings or {}).get(DEVICE_SERIAL_NUMBER)
+            if settings is None:
+                errors["base"] = "cannot_connect"
+            elif not serial:
+                errors["base"] = "serial_unreadable"
+            elif serial != entry.unique_id:
+                return self.async_abort(reason="wrong_device")
+            elif not _reads_as_single_phase(settings):
+                errors["base"] = "model_mismatch"
+            elif error := await _async_check_login(self.hass, user_input, serial):
+                errors["base"] = error
+            else:
+                # The entry's update listener reloads it with the cloud.
+                return self.async_update_and_abort(
+                    entry, data_updates={**user_input, CONF_CLOUD_SERIAL: serial}
+                )
+        return self.async_show_form(
+            step_id="reconfigure_cloud",
+            data_schema=self.add_suggested_values_to_schema(_LOGIN_SCHEMA, user_input),
+            errors=errors,
+        )
+
+    async def _async_reconfigure_address(
+        self, user_input: dict[str, Any] | None, step_id: str
+    ) -> ConfigFlowResult:
+        """Move an existing entry to a new address of the same inverter."""
         entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
 
@@ -299,6 +548,15 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
             device_settings = await async_read_device_settings(self.hass, host, port)
             if device_settings is None:
                 errors["base"] = "cannot_connect"
+            elif CONF_CLOUD_SERIAL in entry.data and not device_settings.get(
+                DEVICE_SERIAL_NUMBER
+            ):
+                # The cloud is matched to the inverter by its serial.
+                errors["base"] = "serial_unreadable"
+            elif CONF_CLOUD_SERIAL in entry.data and not _reads_as_single_phase(
+                device_settings
+            ):
+                errors["base"] = "model_mismatch"
             else:
                 serial = device_settings.get(DEVICE_SERIAL_NUMBER)
                 if serial and not _is_keyed_by_address(entry):
@@ -315,18 +573,18 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
                     # A title the user chose is kept; the default names the host.
                     title=(
                         _default_title(host)
-                        if entry.title == _default_title(entry.data[CONF_HOST])
+                        if entry.title in _default_titles(entry)
                         else entry.title
                     ),
                 )
 
         return self.async_show_form(
-            step_id="reconfigure",
+            step_id=step_id,
             data_schema=self.add_suggested_values_to_schema(
                 _connection_schema(),
                 user_input
                 or {
-                    CONF_HOST: entry.data[CONF_HOST],
+                    CONF_HOST: entry.data.get(CONF_HOST),
                     CONF_PORT: entry.data.get(CONF_PORT, DEFAULT_PORT),
                 },
             ),
@@ -362,6 +620,9 @@ class EcoflowOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
+        if CONF_HOST not in self.config_entry.data:
+            # The settings below are all Modbus ones.
+            return self.async_abort(reason="no_settings")
 
         if user_input is not None:
             entered = user_input.pop(ENERGY_TOTALS, {})
@@ -386,7 +647,12 @@ class EcoflowOptionsFlow(OptionsFlow):
                 ),
             ): SelectSelector(
                 SelectSelectorConfig(
-                    options=[model.value for model in InverterModel],
+                    options=(
+                        # The cloud is read for this model only.
+                        [InverterModel.POWEROCEAN_SINGLE_PHASE.value]
+                        if CONF_CLOUD_SERIAL in self.config_entry.data
+                        else [model.value for model in InverterModel]
+                    ),
                     translation_key=CONF_INVERTER_MODEL,
                     mode=SelectSelectorMode.DROPDOWN,
                 )
@@ -455,10 +721,8 @@ class EcoflowOptionsFlow(OptionsFlow):
         )
 
     def _coordinator(self) -> EcoflowCoordinator | None:
-        coordinator: EcoflowCoordinator | None = getattr(
-            self.config_entry, "runtime_data", None
-        )
-        return coordinator
+        runtime: HybridData | None = getattr(self.config_entry, "runtime_data", None)
+        return runtime.modbus if runtime is not None else None
 
     def _energy_totals_section(self, *, collapsed: bool) -> section | None:
         """Return the section to correct the lifetime totals.

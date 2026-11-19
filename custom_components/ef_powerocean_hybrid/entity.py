@@ -9,6 +9,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import EcoflowCoordinator
+from .ids import system_id
 from .models import ControlEntityDef, EntityDef, shown_keys
 
 
@@ -28,9 +29,9 @@ class EcoFlowBaseEntity[DefinitionT: EntityDef](CoordinatorEntity[EcoflowCoordin
     ) -> None:
         # The keys this entity shows, which the coordinator reads on demand.
         super().__init__(coordinator, context=shown_keys(definition))
-        self._entry_id = entry.entry_id
+        self._system_id = system_id(entry)
         self._definition = definition
-        self._attr_unique_id = f"{self._entry_id}_{definition.key}"
+        self._attr_unique_id = f"{self._system_id}_{definition.key}"
         self._attr_translation_key = definition.key
 
     @property
@@ -38,7 +39,7 @@ class EcoFlowBaseEntity[DefinitionT: EntityDef](CoordinatorEntity[EcoflowCoordin
         """Return Home Assistant device info."""
         identity = self.coordinator.identity
         info = DeviceInfo(
-            identifiers={(DOMAIN, self._entry_id)},
+            identifiers={(DOMAIN, self._system_id)},
             name="EcoFlow PowerOcean",
             manufacturer="EcoFlow",
             model=self.coordinator.inverter_model.traits.display_name,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -14,6 +14,7 @@ from custom_components.ef_powerocean_hybrid.models import (
     DeviceIdentity,
     InverterModel,
 )
+from custom_components.ef_powerocean_hybrid.runtime import HybridData
 
 SINGLE_PHASE = (
     InverterModel.POWEROCEAN_SINGLE_PHASE,
@@ -42,7 +43,7 @@ async def sensors_of(hass, model: InverterModel) -> dict:
     )
     entry = MockConfigEntry(domain=const.DOMAIN, entry_id=f"entry_{model}")
     entry.add_to_hass(hass)
-    entry.runtime_data = coordinator
+    entry.runtime_data = HybridData(modbus=cast(Any, coordinator))
     added: list = []
     await sensor.async_setup_entry(hass, entry, cast(AddEntitiesCallback, added.extend))
     return {entity._definition.key: entity for entity in added}

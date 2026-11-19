@@ -104,6 +104,53 @@ async def test_an_entry_keyed_by_address_takes_the_serial_number(
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
+async def test_taking_the_serial_number_keeps_the_entities_and_the_device(
+    hass: HomeAssistant, inverter: FakeInverter
+) -> None:
+    """Entities and the device made under the entry ID move to the serial."""
+    _serve_serial(inverter, SERIAL)
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        unique_id=f"{HOST}:{inverter.port}",
+        data={const.CONF_HOST: HOST, const.CONF_PORT: inverter.port},
+    )
+    entry.add_to_hass(hass)
+    devices, entities = dr.async_get(hass), er.async_get(hass)
+    device = devices.async_get_or_create(
+        config_entry_id=entry.entry_id, identifiers={(const.DOMAIN, entry.entry_id)}
+    )
+    devices.async_update_device(device.id, area_id="network_room")
+    old = entities.async_get_or_create(
+        "sensor",
+        const.DOMAIN,
+        f"{entry.entry_id}_house_power",
+        config_entry=entry,
+        device_id=device.id,
+        suggested_object_id="my_house_power",
+    )
+    entities.async_update_entity(old.entity_id, labels={"energy"})
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    # Unloaded before asserting: the fake inverter waits for an open connection.
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    moved = entities.async_get(old.entity_id)
+    assert moved is not None
+    assert moved.unique_id == f"{SERIAL}_house_power"
+    assert moved.labels == {"energy"}
+    assert (
+        entities.async_get_entity_id("sensor", const.DOMAIN, f"{SERIAL}_house_power")
+        == old.entity_id
+    )
+    kept = devices.async_get(device.id)
+    assert kept is not None
+    assert kept.identifiers == {(const.DOMAIN, SERIAL)}
+    assert kept.area_id == "network_room"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
 async def test_a_serial_number_another_entry_has_is_left_to_it(
     hass: HomeAssistant, inverter: FakeInverter
 ) -> None:
@@ -142,7 +189,7 @@ async def test_raises_a_repairs_issue_while_modbus_is_disabled(
     issue_id = f"modbus_disabled_{entry.entry_id}"
     assert registry.async_get_issue(const.DOMAIN, issue_id) is None
 
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
     for _ in range(const.MODBUS_DISABLED_READ_THRESHOLD):
         await coordinator.async_refresh()
     await hass.async_block_till_done()
@@ -208,7 +255,7 @@ async def test_a_disabled_sensor_is_not_read(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    polled = entry.runtime_data.polled_registers
+    polled = entry.runtime_data.modbus.polled_registers
     await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
 
@@ -313,7 +360,7 @@ async def test_every_entity_reads_only_what_it_asks_for(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    coordinator: EcoflowCoordinator = entry.runtime_data
+    coordinator: EcoflowCoordinator = entry.runtime_data.modbus
     registers = frozenset(const.REGISTERS_BY_KEY)
     always = coordinator._own_keys | ControlInputs.keys()
     data = coordinator.data
@@ -395,7 +442,7 @@ async def test_entities_show_what_reading_everything_shows(
     forward = hass.config_entries.async_forward_entry_setups
 
     async def poll_then_forward(config_entry, platforms):
-        await _poll(hass, config_entry.runtime_data)
+        await _poll(hass, config_entry.runtime_data.modbus)
         return await forward(config_entry, platforms)
 
     with patch.object(
@@ -403,7 +450,7 @@ async def test_entities_show_what_reading_everything_shows(
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-    coordinator: EcoflowCoordinator = entry.runtime_data
+    coordinator: EcoflowCoordinator = entry.runtime_data.modbus
 
     at_setup = _states(hass, entry)
     await _poll(hass, coordinator, everything=True)
@@ -477,7 +524,7 @@ async def test_a_failed_read_shows_steady_entities_unavailable_until_the_next(
     _enable_every_entity(hass, entry)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    coordinator: EcoflowCoordinator = entry.runtime_data
+    coordinator: EcoflowCoordinator = entry.runtime_data.modbus
     await _poll(hass, coordinator)
 
     before = _states(hass, entry)
@@ -518,7 +565,7 @@ async def test_steady_entities_recover_after_a_start_whose_first_poll_fails(
     _enable_every_entity(hass, entry)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    await _poll(hass, entry.runtime_data)
+    await _poll(hass, entry.runtime_data.modbus)
     before = _states(hass, entry)
     shown = [
         entity_id
@@ -531,7 +578,7 @@ async def test_steady_entities_recover_after_a_start_whose_first_poll_fails(
     forward = hass.config_entries.async_forward_entry_setups
 
     async def fail_then_forward(config_entry, platforms):
-        await _fail_a_poll(hass, config_entry.runtime_data)
+        await _fail_a_poll(hass, config_entry.runtime_data.modbus)
         return await forward(config_entry, platforms)
 
     with patch.object(
@@ -539,7 +586,7 @@ async def test_steady_entities_recover_after_a_start_whose_first_poll_fails(
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
-    coordinator: EcoflowCoordinator = entry.runtime_data
+    coordinator: EcoflowCoordinator = entry.runtime_data.modbus
     added = _states(hass, entry)
     restored = [
         entity.entity_id
@@ -582,7 +629,7 @@ async def _set_up_refusing(
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    coordinator: EcoflowCoordinator = entry.runtime_data
+    coordinator: EcoflowCoordinator = entry.runtime_data.modbus
     coordinator._unsupported_keys = frozenset({"breaker_capacity"})
     coordinator._plan_reads()
     return entry, coordinator
@@ -766,7 +813,7 @@ async def test_unloading_stops_the_heartbeat_and_closes_the_client(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     assert len(_heartbeats()) == 1
-    coordinator: EcoflowCoordinator = entry.runtime_data
+    coordinator: EcoflowCoordinator = entry.runtime_data.modbus
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

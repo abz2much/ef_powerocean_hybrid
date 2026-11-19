@@ -29,6 +29,7 @@ from .const import (
 )
 from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
 from .entity import EcoFlowBaseEntity
+from .ids import system_id
 from .models import (
     ControlEntityDef,
     ControlFeature,
@@ -51,7 +52,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the control numbers and the writable registers."""
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
+    if coordinator is None:
+        # Only Modbus has these.
+        return
 
     entities: list[NumberEntity] = [
         EcoFlowFeaturePowerNumber(coordinator, entry, feature)
@@ -84,7 +88,7 @@ async def async_setup_entry(
     # The Battery Reserve took over the number that wrote the reserve register.
     registry = er.async_get(hass)
     if retired := registry.async_get_entity_id(
-        "number", DOMAIN, f"{entry.entry_id}_{RETIRED_MIN_SOC_NUMBER_KEY}"
+        "number", DOMAIN, f"{system_id(entry)}_{RETIRED_MIN_SOC_NUMBER_KEY}"
     ):
         registry.async_remove(retired)
     entities.extend(

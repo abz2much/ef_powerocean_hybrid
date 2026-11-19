@@ -68,7 +68,7 @@ async def _poll(hass: HomeAssistant, entry: MockConfigEntry) -> None:
     poll back, rather than moving the clock, leaves alone the timeouts of a request
     in flight, which pymodbus 3.11 trips over when the clock jumps.
     """
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
     if coordinator._last_checked_time is not None:
         coordinator._last_checked_time -= timedelta(
             seconds=const.DEFAULT_SCAN_INTERVAL_S
@@ -136,7 +136,7 @@ async def test_the_snapshots_survive_a_restart(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    snapshots = entry.runtime_data.reading_check_snapshots
+    snapshots = entry.runtime_data.modbus.reading_check_snapshots
     (snapshot,) = [s for s in snapshots if s["check"] == "battery_soc"]
     # Addresses come back as numbers, as diagnostics expects them.
     assert _word(snapshot["raw_registers"], SYSTEM_SOC) == 0

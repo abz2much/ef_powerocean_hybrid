@@ -71,11 +71,39 @@ async def set_up(hass: HomeAssistant, inverter: FakeInverter) -> AsyncIterator[S
     await hass.async_block_till_done()
 
 
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_runtime_holds_the_modbus_coordinator(set_up: SetUp) -> None:
+    from custom_components.ef_powerocean_hybrid.coordinator import (
+        EcoflowCoordinator,
+    )
+
+    entry = await set_up()
+
+    assert isinstance(entry.runtime_data.modbus, EcoflowCoordinator)
+    assert entry.runtime_data.cloud is None
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_entities_and_the_device_are_keyed_by_the_serial(
+    hass: HomeAssistant, set_up: SetUp
+) -> None:
+    entry = await set_up()
+
+    unique_ids = {
+        e.unique_id
+        for e in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
+    }
+    assert f"{SERIAL}_house_power" in unique_ids
+    assert all(uid.startswith(f"{SERIAL}_") for uid in unique_ids)
+    devices = dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id)
+    assert [d.identifiers for d in devices] == [{(const.DOMAIN, SERIAL)}]
+
+
 def _entity_id(
     hass: HomeAssistant, entry: MockConfigEntry, platform: str, key: str
 ) -> str:
     entity_id = er.async_get(hass).async_get_entity_id(
-        platform, const.DOMAIN, f"{entry.entry_id}_{key}"
+        platform, const.DOMAIN, f"{entry.unique_id}_{key}"
     )
     assert entity_id is not None
     return entity_id
@@ -110,7 +138,7 @@ async def test_raw_registers_in_the_diagnostics_never_hold_the_serial_number(
     entry = await set_up()
     serial = const.SERIAL_NUMBER
     words = list(range(1, serial.end - 40001 + 3))
-    entry.runtime_data._raw_blocks = {40001: words}
+    entry.runtime_data.modbus._raw_blocks = {40001: words}
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
 
@@ -129,7 +157,7 @@ async def test_diagnostics_replay_on_the_fake_inverter(
 ) -> None:
     """A user's diagnostics download makes the same poll in a test."""
     entry = await set_up()
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
     _serve_float(inverter, const.REGISTERS_BY_KEY["grid_power"].address, -1234.5)
     await coordinator.async_refresh()
     recorded = coordinator.raw_registers
@@ -158,7 +186,7 @@ async def test_active_faults_are_named_where_the_code_is_known(
     inverter.registers[const.REGISTERS_BY_KEY["fault_count"].address] = 2
     inverter.registers[const.REGISTERS_BY_KEY["fault_1"].address] = 521
     inverter.registers[const.REGISTERS_BY_KEY["fault_2"].address] = 9999
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
     # A poll within a second of the last one returns the last frame.
     coordinator._last_checked_time = dt_util.now() - timedelta(seconds=5)
     await coordinator.async_refresh()
@@ -191,7 +219,7 @@ async def test_battery_controls_are_unavailable_while_modbus_control_is_off(
     # The heartbeat lands in the background; the next poll shows the inverter
     # following us.
     await hass.async_block_till_done()
-    await entry.runtime_data.async_refresh()
+    await entry.runtime_data.modbus.async_refresh()
     await hass.async_block_till_done()
 
     assert _state(hass, select_id) == "automatic"
@@ -216,7 +244,7 @@ async def test_a_command_that_runs_out_returns_to_automatic_and_says_why(
     # the timers an own Modbus connection waits on.
     later = dt_util.now() + timedelta(seconds=61)
     monkeypatch.setattr(dt_util, "now", lambda: later)
-    await entry.runtime_data.async_refresh()
+    await entry.runtime_data.modbus.async_refresh()
     await hass.async_block_till_done()
 
     assert _state(hass, select_id) == "automatic"
@@ -258,8 +286,8 @@ async def test_a_setting_the_register_cannot_hold_is_never_sent(
     )
 
     with pytest.raises(HomeAssistantError, match="does not fit"):
-        await entry.runtime_data.async_write_modbus_register(setting, 0x10000)
-    await entry.runtime_data.async_write_modbus_register(setting, 50)
+        await entry.runtime_data.modbus.async_write_modbus_register(setting, 0x10000)
+    await entry.runtime_data.modbus.async_write_modbus_register(setting, 50)
 
     assert [
         words for address, words in inverter.writes if address == setting.register
@@ -323,7 +351,7 @@ async def _held_export_issue(
     assert await async_setup_component(hass, "repairs", {})
     _serve_float(inverter, const.REGISTERS_BY_KEY["grid_export_total"].address, 507.5)
     entry = await set_up()
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
     coordinator._last_checked_data["grid_export_total"] = 1548.73
     coordinator._energy_processor.accepted_at["grid_export_total"] = (
         dt_util.now() - timedelta(days=30)
@@ -340,7 +368,7 @@ async def _held_export_issue(
 
 
 async def _poll_a_minute_later(entry: MockConfigEntry) -> None:
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
     coordinator._last_checked_time = dt_util.now() - timedelta(minutes=1)
     await coordinator.async_refresh()
 
@@ -370,7 +398,7 @@ async def test_the_held_totals_repair_runs_end_to_end_in_home_assistant(
     menu = await manager.async_init(const.DOMAIN, data={"issue_id": issue_id})
 
     assert menu["type"] == "menu"
-    assert entry.runtime_data.data["grid_export_total"] == 1548.73
+    assert entry.runtime_data.modbus.data["grid_export_total"] == 1548.73
     translations = await async_get_translations(hass, "en", "issues", [const.DOMAIN])
     prefix = f"component.{const.DOMAIN}.issues.energy_totals_held"
     description = translations[f"{prefix}.fix_flow.step.init.description"]
@@ -386,7 +414,7 @@ async def test_the_held_totals_repair_runs_end_to_end_in_home_assistant(
 
     await _choose(hass, issue_id, "take_device")
 
-    assert entry.runtime_data.data["grid_export_total"] == pytest.approx(507.5)
+    assert entry.runtime_data.modbus.data["grid_export_total"] == pytest.approx(507.5)
     assert ir.async_get(hass).async_get_issue(const.DOMAIN, issue_id) is None
 
 
@@ -401,7 +429,7 @@ async def test_a_held_total_keeps_its_value_in_home_assistant_after_the_repair(
     await _poll_a_minute_later(entry)
     await hass.async_block_till_done()
 
-    data = entry.runtime_data.data
+    data = entry.runtime_data.modbus.data
     assert entry.options[const.CONF_ENERGY_OFFSETS] == {
         "grid_export_total": pytest.approx(1041.23)
     }
@@ -425,7 +453,7 @@ async def test_a_total_set_in_the_settings_continues_from_the_value_entered(
 ) -> None:
     _serve_float(inverter, const.REGISTERS_BY_KEY["solar_total"].address, 4296.8)
     entry = await set_up()
-    today = entry.runtime_data.data["solar_today"]
+    today = entry.runtime_data.modbus.data["solar_today"]
 
     form = await _parameters_form(hass, entry)
     fields = {str(key): value for key, value in form["data_schema"].schema.items()}
@@ -438,7 +466,7 @@ async def test_a_total_set_in_the_settings_continues_from_the_value_entered(
     )
     await hass.async_block_till_done()
 
-    data = entry.runtime_data.data
+    data = entry.runtime_data.modbus.data
     assert done["type"] == "create_entry"
     assert data["solar_total"] == pytest.approx(4400.5)
     assert data["solar_total_raw"] == pytest.approx(4296.8)
@@ -470,7 +498,9 @@ async def test_a_total_not_in_the_portal_is_never_corrected(
 
     entry = await set_up(**{const.CONF_ENERGY_OFFSETS: {"inverter_ac_in_total": 50.0}})
 
-    assert entry.runtime_data.data["inverter_ac_in_total"] == pytest.approx(1234.5)
+    assert entry.runtime_data.modbus.data["inverter_ac_in_total"] == pytest.approx(
+        1234.5
+    )
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
@@ -483,7 +513,7 @@ async def test_a_total_not_in_the_portal_takes_the_inverters_value_after_a_day(
         inverter, const.REGISTERS_BY_KEY["inverter_ac_in_total"].address, 1234.5
     )
     entry = await set_up()
-    coordinator = entry.runtime_data
+    coordinator = entry.runtime_data.modbus
     coordinator._last_checked_data["inverter_ac_in_total"] = 2000.0
     coordinator._energy_processor.accepted_at["inverter_ac_in_total"] = (
         dt_util.now() - timedelta(days=30)
@@ -543,7 +573,7 @@ async def test_a_lower_total_is_saved_only_once_confirmed(
 
     assert (await submit("4100"))["type"] == "create_entry"
     await hass.async_block_till_done()
-    assert entry.runtime_data.data["solar_total"] == pytest.approx(4100.0)
+    assert entry.runtime_data.modbus.data["solar_total"] == pytest.approx(4100.0)
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
@@ -552,8 +582,8 @@ async def test_removing_the_corrections_returns_every_total_to_the_inverter(
 ) -> None:
     _serve_float(inverter, const.REGISTERS_BY_KEY["solar_total"].address, 4296.8)
     entry = await set_up(**{const.CONF_ENERGY_OFFSETS: {"solar_total": 103.2}})
-    assert entry.runtime_data.data["solar_total"] == pytest.approx(4400.0)
-    today = entry.runtime_data.data["solar_today"]
+    assert entry.runtime_data.modbus.data["solar_total"] == pytest.approx(4400.0)
+    today = entry.runtime_data.modbus.data["solar_today"]
 
     form = await _parameters_form(hass, entry)
     assert "remove_corrections" in _section_fields(form)
@@ -564,7 +594,7 @@ async def test_removing_the_corrections_returns_every_total_to_the_inverter(
     await hass.config_entries.options.async_configure(form["flow_id"], remove)
     await hass.async_block_till_done()
 
-    data = entry.runtime_data.data
+    data = entry.runtime_data.modbus.data
     assert entry.options[const.CONF_ENERGY_OFFSETS] == {}
     assert data["solar_total"] == pytest.approx(4296.8)
     assert data["solar_today"] == pytest.approx(today)
@@ -587,7 +617,9 @@ async def test_a_total_left_as_shown_is_not_corrected(
     await hass.async_block_till_done()
 
     assert const.CONF_ENERGY_OFFSETS not in entry.options
-    assert entry.runtime_data.data["solar_total"] == pytest.approx(4296.81, abs=0.001)
+    assert entry.runtime_data.modbus.data["solar_total"] == pytest.approx(
+        4296.81, abs=0.001
+    )
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
@@ -615,6 +647,6 @@ async def test_an_older_entry_copies_its_settings_to_the_options(
     assert (entry.version, entry.minor_version) == (1, 2)
     assert entry.data == data
     assert entry.options == settings
-    assert entry.runtime_data.inverter_model == "powerocean_plus"
-    assert entry.runtime_data.scan_interval == 10
+    assert entry.runtime_data.modbus.inverter_model == "powerocean_plus"
+    assert entry.runtime_data.modbus.scan_interval == 10
     await hass.config_entries.async_unload(entry.entry_id)

@@ -192,7 +192,7 @@ async def test_a_refused_register_stays_out_whatever_is_asked(coordinator) -> No
 def test_an_entity_asks_for_the_keys_it_shows(definition, keys) -> None:
     entity = EcoFlowBaseEntity(
         cast(EcoflowCoordinator, SimpleNamespace()),
-        cast(ConfigEntry, SimpleNamespace(entry_id="entry")),
+        cast(ConfigEntry, SimpleNamespace(entry_id="entry", unique_id=None)),
         definition,
     )
     assert entity.coordinator_context == frozenset(keys)

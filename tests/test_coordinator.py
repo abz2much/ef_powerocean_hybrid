@@ -1817,6 +1817,24 @@ def test_the_issue_names_each_held_total_with_both_values(
     )
 
 
+@pytest.mark.usefixtures("issues")
+def test_the_issue_finds_the_entity_by_the_serial_keyed_unique_id(
+    coordinator, held_for_a_month: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _hold_export(coordinator, monkeypatch, held_for_a_month)
+    coordinator.config_entry.unique_id = "HJ31ZAS2TEST0001"
+    wanted = "HJ31ZAS2TEST0001_grid_export_total"
+    registry = SimpleNamespace(
+        async_get_entity_id=lambda _platform, _domain, uid: (
+            "sensor.grid_export" if uid == wanted else None
+        )
+    )
+    monkeypatch.setattr(er, "async_get", lambda _: registry)
+    monkeypatch.setattr(dt_util, "as_local", lambda value: value)
+
+    assert coordinator.describe_held_totals().startswith("- sensor.grid_export:")
+
+
 def test_an_error_in_the_held_totals_issue_never_fails_the_poll(
     coordinator, issues, held_for_a_month: datetime, monkeypatch: pytest.MonkeyPatch
 ) -> None:

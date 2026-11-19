@@ -72,6 +72,8 @@ CONF_SCAN_INTERVAL: Final = "scan_interval"
 CONF_CALC_SOLAR_POWER: Final = "calc_solar_power"
 CONF_MODBUS_CONTROL: Final = "modbus_control"
 CONF_INVERTER_MODEL: Final = "inverter_model"
+# The inverter serial the EcoFlow cloud knows it by; set with a cloud connection.
+CONF_CLOUD_SERIAL: Final = "cloud_serial"
 # kWh added to what the device reports for a lifetime total, by its key. Set by the
 # user for a counter the inverter reset, so the total continues as in EcoFlow's portal.
 CONF_ENERGY_OFFSETS: Final = "energy_offsets"

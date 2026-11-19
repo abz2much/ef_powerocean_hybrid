@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_DEVICE_ID, ATTR_ENTITY_ID, Platform
@@ -82,6 +82,7 @@ from .energy_processor import (
     HeldTotal,
     offsets_from,
 )
+from .ids import system_id
 from .modbus import ModbusClient, ModbusReadRejected, create_client
 from .models import (
     ControlFeature,
@@ -124,7 +125,10 @@ def battery_power_limits(capacity_wh: float) -> tuple[int, int]:
     )
 
 
-type EcoflowConfigEntry = ConfigEntry[EcoflowCoordinator]
+if TYPE_CHECKING:
+    from .runtime import HybridData
+
+type EcoflowConfigEntry = ConfigEntry[HybridData]
 
 
 class IdentityMismatch(UpdateFailed):
@@ -307,7 +311,9 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             device_registry.async_get(self.hass), entry_id
         )
         select_id = entity_registry.async_get(self.hass).async_get_entity_id(
-            Platform.SELECT, DOMAIN, f"{entry_id}_{BATTERY_MODE_SELECT.key}"
+            Platform.SELECT,
+            DOMAIN,
+            f"{system_id(self.config_entry)}_{BATTERY_MODE_SELECT.key}",
         )
         context = Context()
         self.hass.bus.async_fire(
@@ -711,7 +717,7 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         lines = []
         for key, held in sorted(self.long_held_totals.items()):
             entity_id = registry.async_get_entity_id(
-                Platform.SENSOR, DOMAIN, f"{self.config_entry.entry_id}_{key}"
+                Platform.SENSOR, DOMAIN, f"{system_id(self.config_entry)}_{key}"
             )
             since = (
                 dt.as_local(held.since).strftime("%Y-%m-%d %H:%M")

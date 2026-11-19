@@ -7,7 +7,7 @@ import socket
 import struct
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -19,6 +19,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ef_powerocean_hybrid import config_flow, const
 from custom_components.ef_powerocean_hybrid.models import RegisterType
+from custom_components.ef_powerocean_hybrid.runtime import HybridData
 from tests.fake_inverter import HOST, FakeInverter
 
 SERIAL = "HJ31ZAS2TEST0001"
@@ -38,6 +39,9 @@ def device_settings():
 async def _start(hass: HomeAssistant, host: str, port: int = 502):
     result = await hass.config_entries.flow.async_init(
         const.DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "modbus"}
     )
     return await hass.config_entries.flow.async_configure(
         result["flow_id"], {const.CONF_HOST: host, const.CONF_PORT: port}
@@ -420,7 +424,9 @@ async def test_energy_totals_are_left_out_while_the_inverter_reports_none(
     hass: HomeAssistant,
 ) -> None:
     entry = _configured_entry(hass)
-    entry.runtime_data = SimpleNamespace(correctable_totals={})
+    entry.runtime_data = HybridData(
+        modbus=cast(Any, SimpleNamespace(correctable_totals={}))
+    )
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
