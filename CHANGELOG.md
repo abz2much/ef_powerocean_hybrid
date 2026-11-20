@@ -108,6 +108,9 @@
   there too, switched off: Wi-Fi, Ethernet and 4G state, system name, and four
   values of an energy management report (feed power cap, PCL power base,
   current SOC, start state), whose meaning is unclear.
+- Wi-Fi, Ethernet and 4G state show "Connected" for code 0 and "Not
+  connected" for code 2, as seen on a real system; other codes show as the
+  number. powerocean_single_phase shows only the number.
 - The cloud's sensors are on or off by default as in powerocean_single_phase:
   active power L1, PV insulation resistance, online, and each pack's BMS run
   state, module state, balance state and update time are now on; each pack's

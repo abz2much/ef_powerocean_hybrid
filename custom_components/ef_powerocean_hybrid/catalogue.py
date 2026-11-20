@@ -82,11 +82,17 @@ class CatalogueEntry:
         return (
             self.kind == "cloud"
             and self.cloud is not None
-            and parser_key(self.cloud) in TRANSLATED_STATES
+            and parser_key(self.cloud) in TRANSLATED_STATES | CONNECTION_CODES
         )
 
 
 _MODEL_PREFIX = re.compile(r"(?:[A-Z0-9]+_)?")
+
+
+# Connection codes the hybrid names, which the cloud integration shows as
+# numbers (owner, 20 Nov 2026). Seen on the owner's system: 0 with Wi-Fi and
+# Ethernet both connected, 2 for 4G without a SIM card.
+CONNECTION_CODES: Final = {"wifiStaStat", "ethWanStat", "iot4gSta"}
 
 
 def parser_key(source: CloudSource) -> str:

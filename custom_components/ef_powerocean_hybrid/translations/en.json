@@ -1003,13 +1003,25 @@
         "name": "Active schedule"
       },
       "wifi_state": {
-        "name": "Wi-Fi state"
+        "name": "Wi-Fi state",
+        "state": {
+          "0": "Connected",
+          "2": "Not connected"
+        }
       },
       "ethernet_state": {
-        "name": "Ethernet state"
+        "name": "Ethernet state",
+        "state": {
+          "0": "Connected",
+          "2": "Not connected"
+        }
       },
       "cellular_state": {
-        "name": "4G state"
+        "name": "4G state",
+        "state": {
+          "0": "Connected",
+          "2": "Not connected"
+        }
       },
       "system_name": {
         "name": "System name"

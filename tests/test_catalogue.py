@@ -191,7 +191,8 @@ def test_the_cloud_integrations_translated_states_are_translated() -> None:
         e for e in _cloud_only() if e.cloud and parser_key(e.cloud) in TRANSLATED_STATES
     ]
 
-    assert {e.key for e in translated} == {
+    own = {"wifi_state", "ethernet_state", "cellular_state"}
+    assert {e.key for e in translated} | own == {
         e.key for e in CATALOGUE_86 if e.translated_states
     }
     for entry in translated:
@@ -216,3 +217,14 @@ def test_the_connection_and_system_values_are_there_switched_off() -> None:
 
     assert wanted <= entries.keys()
     assert not any(entries[key].enabled for key in wanted)
+
+
+def test_the_connection_codes_are_named() -> None:
+    """The hybrid's own names (owner, 20 Nov 2026), not in the cloud integration.
+
+    Seen on the owner's system: 0 while Wi-Fi and Ethernet are both connected,
+    2 for 4G without a SIM card. Other codes show as the number.
+    """
+    for key in ("wifi_state", "ethernet_state", "cellular_state"):
+        assert next(e for e in CATALOGUE_86 if e.key == key).translated_states
+        assert TRANSLATIONS[key]["state"] == {"0": "Connected", "2": "Not connected"}
