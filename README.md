@@ -10,8 +10,9 @@ Early development. Do not install it yet.
 
 - **Modbus:** the local Modbus integration it is based on, under a new name, for
   every model that integration supports. It still contains that integration's
-  battery control; the safeguards this integration needs before control can be
-  used are not built yet.
+  battery control, now with safeguards (see below). Control has not been tested
+  on a PowerOcean Single Phase yet: do not switch Modbus Control on until the
+  supervised checks on the inverter are done.
 - **EcoFlow cloud (PowerOcean Single Phase only):** set up beside Modbus or on its
   own. The cloud adds the values Modbus does not have, such as each battery
   pack's state of health, cycles and temperatures. If the inverter does not
@@ -130,6 +131,24 @@ Not ready yet; the integration is still in development. When it is:
 4. Change automations and scripts that call `powerocean_single_phase.add_schedule`,
    `update_schedule` or `delete_schedule` to the `ef_powerocean_hybrid` actions.
 5. Turn on the same options (MQTT, live power, max schedule power).
+
+## Modbus Control safeguards
+
+- Modbus Control always starts off when Home Assistant starts.
+- It cannot be switched on while EF-PowerOcean-TcpModbus, or a second entry of
+  this integration, is loaded for the same inverter address, and it is switched
+  off if one is loaded later.
+- The heartbeat that keeps the inverter following commands beats only while the
+  control logic runs on recent polls; otherwise the inverter returns to its app
+  settings within 60 seconds.
+- Switching off, unloading or stopping Home Assistant first releases the
+  command (setpoint 0, default method); switching on first clears what the
+  inverter held.
+- Every control word is checked for the off-grid and shutdown bits, and the
+  setpoint is read back each poll: if the inverter holds something else on two
+  polls in a row, control is switched off and the log says why.
+- Commands go out one at a time, and a clock that steps back does not stall
+  the control timers.
 
 ## Troubleshooting
 
