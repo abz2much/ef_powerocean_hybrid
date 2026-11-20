@@ -206,6 +206,8 @@ class ActiveSchedule(CoordinatorEntity[CloudCoordinator], SensorEntity):
 
     _attr_has_entity_name = True
     _attr_translation_key = "active_schedule"
+    # For the schedule card; a setting, not worth a row in the recorder.
+    _unrecorded_attributes = frozenset({"max_schedule_power"})
 
     def __init__(self, coordinator: CloudCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
@@ -235,6 +237,12 @@ class ActiveSchedule(CoordinatorEntity[CloudCoordinator], SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return id, type, start, end, power, days and in_use of the schedule."""
+        """Return id, type, start, end, power, days and in_use of the schedule.
+
+        Also the option "Max schedule power (W)", for the schedule card.
+        """
         schedule = self.coordinator.active_schedule
-        return schedule_attributes(schedule) if schedule else {}
+        return {
+            **(schedule_attributes(schedule) if schedule else {}),
+            "max_schedule_power": self.coordinator.max_schedule_power,
+        }

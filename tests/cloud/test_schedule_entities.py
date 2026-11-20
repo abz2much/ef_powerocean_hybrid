@@ -28,9 +28,11 @@ from custom_components.ef_powerocean_hybrid.cloud.mqtt import (
 from custom_components.ef_powerocean_hybrid.cloud.schedules import (
     schedule_attributes,
 )
+from custom_components.ef_powerocean_hybrid.cloud_schedules import ActiveSchedule
 from tests.cloud.conftest import SetUp
 from tests.cloud.fakes import CLOUD_SN, SERIAL
 from tests.cloud.schedule_fakes import (
+    MAX_POWER,
     ScheduleMqtt,
     hm,
     listed,
@@ -308,6 +310,29 @@ async def test_active_schedule_sensor_without_a_schedule_in_use(
     state = _active(hass)
     assert state.state == "none"
     assert "id" not in state.attributes
+
+
+async def test_active_schedule_tells_the_max_schedule_power(
+    hass: HomeAssistant, set_up: Start
+) -> None:
+    """For the schedule card: the most a schedule may use."""
+    await set_up()
+
+    assert _active(hass).attributes["max_schedule_power"] == MAX_POWER
+
+
+async def test_active_schedule_max_power_is_none_without_the_option(
+    hass: HomeAssistant, set_up: Start
+) -> None:
+    ScheduleMqtt.system = [replace(s, in_use=False) for s in system_schedules()]
+
+    await set_up(max_power=None)
+
+    assert _active(hass).attributes["max_schedule_power"] is None
+
+
+def test_active_schedule_max_power_is_not_recorded() -> None:
+    assert "max_schedule_power" in ActiveSchedule._unrecorded_attributes
 
 
 # -----------------------------
