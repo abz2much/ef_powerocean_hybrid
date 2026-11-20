@@ -150,6 +150,20 @@ async def test_live_power_off_by_default(
     assert client.energy_stream_requests == 0
 
 
+async def test_live_power_requests_the_stream_once_mqtt_connects(
+    hass: HomeAssistant, cloud_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    await _setup(hass, cloud_entry, set_up_hybrid, mqtt=True, live_power=True)
+    client = _client()
+    requests = client.energy_stream_requests
+
+    # A reconnect: the system may have restarted
+    await hass.async_add_executor_job(client.callbacks.on_connected)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert client.energy_stream_requests == requests + 1
+
+
 async def test_live_power_needs_mqtt(
     hass: HomeAssistant, cloud_entry: MockConfigEntry, set_up_hybrid: SetUp
 ) -> None:

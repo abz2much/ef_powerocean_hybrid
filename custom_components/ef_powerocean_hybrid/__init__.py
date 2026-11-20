@@ -12,8 +12,8 @@ from homeassistant.config_entries import (
     ConfigEntry,
     ConfigEntryChange,
 )
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
@@ -250,6 +250,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> b
         # the setup; MQTT then stays off until a reload.
         if entry.options.get(CONF_MQTT, False):
             entry.async_on_unload(cloud.async_stop_mqtt)
+
+            async def _async_stop_mqtt(_event: Event) -> None:
+                await cloud.async_stop_mqtt()
+
+            # Entries are not unloaded when Home Assistant stops, and paho's
+            # thread must not hand over to a closed event loop.
+            entry.async_on_unload(
+                hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_mqtt)
+            )
             if cloud.last_update_success:
                 await cloud.async_start_mqtt()
             else:

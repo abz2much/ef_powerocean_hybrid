@@ -1,5 +1,6 @@
 """test_mqtt: protobuf messages and module info of the MQTT connection."""
 
+import dataclasses
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -340,6 +341,31 @@ def test_on_connect_subscribes_and_requests_full_state(
     topic, payload = cast(Any, mqtt.client.publish).call_args.args
     assert topic == f"/app/{USER_ID}/{SN}/thing/property/get"
     assert _header(payload) == _header(get_all_request())
+
+
+def test_on_connect_reports_the_connection(
+    connection: tuple[PowerOceanMqtt, MqttCallbacks],
+) -> None:
+    """Requests sent before the connection is up are lost, so they wait for it."""
+    mqtt, callbacks = connection
+    connected = MagicMock()
+    mqtt.callbacks = dataclasses.replace(callbacks, on_connected=connected)
+
+    mqtt._on_connect(mqtt.client, None, None, MagicMock(is_failure=False), None)
+
+    connected.assert_called_once_with()
+
+
+def test_a_refused_connection_is_not_reported(
+    connection: tuple[PowerOceanMqtt, MqttCallbacks],
+) -> None:
+    mqtt, callbacks = connection
+    connected = MagicMock()
+    mqtt.callbacks = dataclasses.replace(callbacks, on_connected=connected)
+
+    mqtt._on_connect(mqtt.client, None, None, MagicMock(is_failure=True), None)
+
+    connected.assert_not_called()
 
 
 def test_on_connect_refused_sends_nothing(

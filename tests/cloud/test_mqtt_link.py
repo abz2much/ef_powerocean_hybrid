@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pytest
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from pytest_homeassistant_custom_component.common import (
@@ -70,6 +71,8 @@ class FakeMqtt:
         self.user_id = user_id
         self.callbacks = callbacks
         self.started = self.stopped = False
+        # paho's is_connected(); connected by the time the start returns
+        self.connected = True
         self.requests = 0
         self.schedule_list_requests = 0
         FakeMqtt.instances.append(self)
@@ -229,6 +232,79 @@ async def test_full_state_requested_again(
     await hass.async_block_till_done(wait_background_tasks=True)
 
     assert client.requests == 1
+
+
+class UnconnectedMqtt(FakeMqtt):
+    """Not connected yet when its start returns, as paho mostly is."""
+
+    def start(self) -> None:
+        super().start()
+        self.connected = False
+
+
+async def test_nothing_is_requested_before_mqtt_connects(
+    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    with patch(
+        "custom_components.ef_powerocean_hybrid.cloud.coordinator.PowerOceanMqtt",
+        UnconnectedMqtt,
+    ):
+        await _setup(hass, hybrid_entry, set_up_hybrid, mqtt=True)
+    (client,) = FakeMqtt.instances
+
+    assert client.schedule_list_requests == 0
+
+
+async def test_the_schedules_are_requested_once_mqtt_connects(
+    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    with patch(
+        "custom_components.ef_powerocean_hybrid.cloud.coordinator.PowerOceanMqtt",
+        UnconnectedMqtt,
+    ):
+        await _setup(hass, hybrid_entry, set_up_hybrid, mqtt=True)
+    (client,) = FakeMqtt.instances
+    assert client.schedule_list_requests == 0
+
+    client.connected = True
+    # paho calls back from its own thread
+    await hass.async_add_executor_job(client.callbacks.on_connected)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert client.schedule_list_requests == 1
+
+
+async def test_no_timed_request_while_mqtt_is_disconnected(
+    hass: HomeAssistant,
+    hybrid_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """paho reconnects by itself; the disconnect is logged once, not per request."""
+    await _setup(hass, hybrid_entry, set_up_hybrid, mqtt=True)
+    (client,) = FakeMqtt.instances
+    schedules = client.schedule_list_requests
+    client.connected = False
+
+    freezer.tick(timedelta(hours=6))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert (client.requests, client.schedule_list_requests) == (0, schedules)
+
+
+async def test_mqtt_stops_when_home_assistant_stops(
+    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    """Entries are not unloaded at a stop; paho's thread must not outlive the loop."""
+    await _setup(hass, hybrid_entry, set_up_hybrid, mqtt=True)
+    (client,) = FakeMqtt.instances
+
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+    await hass.async_block_till_done()
+
+    assert client.stopped
+    assert hybrid_entry.runtime_data.cloud.mqtt is None
 
 
 async def test_late_message_after_unload_is_ignored(

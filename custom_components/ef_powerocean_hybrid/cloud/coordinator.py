@@ -299,6 +299,7 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 on_energy_stream=self._from_mqtt_thread(self._apply_energy_stream),
                 on_schedules=self._from_mqtt_thread(self._apply_schedules),
                 on_schedule=self._from_mqtt_thread(self._apply_schedule),
+                on_connected=self._connected_from_mqtt_thread,
             )
             client = PowerOceanMqtt(
                 credentials, self.api.sn, self.api.user_id, callbacks
@@ -324,11 +325,11 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._energy_stream_unsub = async_track_time_interval(
                 self.hass, self._async_request_energy_stream, ENERGY_STREAM_INTERVAL
             )
-            await self._async_request_energy_stream(dt_util.utcnow())
         self._schedule_poll_unsub = async_track_time_interval(
             self.hass, self._async_request_schedules, SCHEDULE_POLL_INTERVAL
         )
-        await self._async_request_schedules(dt_util.utcnow())
+        # Mostly not connected yet: then the connection asks once it is up.
+        await self._async_request_on_connect()
         # The settings become available
         self.async_update_listeners()
 
@@ -350,15 +351,42 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             client, self.mqtt = self.mqtt, None
             await self.hass.async_add_executor_job(client.stop)
 
+    def _connected_from_mqtt_thread(self) -> None:
+        """Hand the connection being up over from paho's thread."""
+        self.hass.loop.call_soon_threadsafe(self._mqtt_connected)
+
+    @callback
+    def _mqtt_connected(self) -> None:
+        """Ask for what a request sent before the connection was up missed."""
+        if self.mqtt:
+            cast(ConfigEntry, self.config_entry).async_create_background_task(
+                self.hass, self._async_request_on_connect(), f"{DOMAIN} MQTT connected"
+            )
+
+    async def _async_request_on_connect(self) -> None:
+        """Ask for the schedules, and the energy stream with live power."""
+        now = dt_util.utcnow()
+        if cast(ConfigEntry, self.config_entry).options.get(CONF_LIVE_POWER, False):
+            await self._async_request_energy_stream(now)
+        await self._async_request_schedules(now)
+
+    def _mqtt_up(self) -> PowerOceanMqtt | None:
+        """Return the connection if a request can go out on it now.
+
+        While paho reconnects, a request would be lost; the disconnect is
+        logged once, and the connection asks again once it is back.
+        """
+        return self.mqtt if self.mqtt is not None and self.mqtt.connected else None
+
     async def _async_request_full_state(self, _now: datetime) -> None:
         """Ask the system for its full state again (module firmware)."""
-        if self.mqtt:
-            await self.hass.async_add_executor_job(self.mqtt.request_full_state)
+        if client := self._mqtt_up():
+            await self.hass.async_add_executor_job(client.request_full_state)
 
     async def _async_request_energy_stream(self, _now: datetime) -> None:
         """Ask the system for the energy stream again (option live power)."""
-        if self.mqtt:
-            await self.hass.async_add_executor_job(self.mqtt.request_energy_stream)
+        if client := self._mqtt_up():
+            await self.hass.async_add_executor_job(client.request_energy_stream)
 
     @callback
     def _apply_energy_stream(self, values: dict[str, float | int]) -> None:
@@ -645,8 +673,8 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_request_schedules(self, _now: datetime) -> None:
         """Ask the system for its schedules again (it reports no changes)."""
-        if self.mqtt:
-            await self.hass.async_add_executor_job(self.mqtt.request_schedules)
+        if client := self._mqtt_up():
+            await self.hass.async_add_executor_job(client.request_schedules)
 
     @callback
     def _apply_schedules(self, schedules: list[Schedule]) -> None:

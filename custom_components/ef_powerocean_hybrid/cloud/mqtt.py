@@ -635,7 +635,7 @@ def schedule_single(part: Part) -> Schedule | None:
 # -----------------------------
 
 
-def _ignore(_value: Any) -> None:
+def _ignore(*_args: Any) -> None:
     """Do nothing: the callback is not wanted."""
 
 
@@ -655,6 +655,8 @@ class MqttCallbacks:
     on_schedules: Callable[[list[Schedule]], None] = _ignore
     # One schedule (96/126)
     on_schedule: Callable[[Schedule], None] = _ignore
+    # The connection is up, also after a reconnect
+    on_connected: Callable[[], None] = _ignore
 
 
 class PowerOceanMqtt:
@@ -802,6 +804,7 @@ class PowerOceanMqtt:
             client.subscribe(topic, qos=1)
         # Also after a reconnect: the system may have restarted (update)
         self.request_full_state()
+        self.callbacks.on_connected()
 
     def _on_disconnect(
         self,

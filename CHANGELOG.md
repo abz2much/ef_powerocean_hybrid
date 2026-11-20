@@ -173,6 +173,13 @@
   control command to the inverter. An inverter that left the write unanswered
   dropped the connection each time. From upstream EF-PowerOcean-TcpModbus
   `e399e89` (v2.10.0).
+- MQTT asks for the schedules, and with live power the energy stream, once its
+  connection is up, and again after a reconnect. Before, the first requests
+  went out before the connection was up and were lost, with a warning, so the
+  schedules showed only a minute later. While MQTT reconnects, the timed
+  requests wait instead of warning each time.
+- MQTT now stops when Home Assistant stops. Before, a message arriving during
+  the shutdown logged "Event loop is closed".
 
 ## [0.2.0] - Unreleased
 
