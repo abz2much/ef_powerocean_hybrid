@@ -14,6 +14,7 @@ import {
   runsOn,
   toHm,
   toMinutes,
+  viewKey,
   weekdayIn,
 } from "../../custom_components/ef_powerocean_hybrid/frontend/schedule-logic.js";
 
@@ -115,15 +116,6 @@ test("finds the schedules by their attributes, sorted by start", () => {
     { start: byId(15).start, end: byId(15).end, inUse: byId(14).inUse },
     { start: 1380, end: 120, inUse: true },
   );
-});
-
-test("is not available while the switches have no schedule attributes", () => {
-  const hass = fakeHass();
-  for (const state of Object.values(hass.states)) {
-    if (state.entity_id?.startsWith("switch.")) state.attributes = {};
-  }
-
-  assert.equal(findSchedules(hass, SENSOR).available, false);
 });
 
 test("is not available while the sensor is unavailable", () => {
@@ -330,4 +322,43 @@ test("a new schedule starts in the first free hour", () => {
 
 test("a new schedule starts at 00:00 when no hour is free", () => {
   assert.deepEqual(firstFreeWindow(schedules()), { start: 0, end: 60 });
+});
+
+test("an empty list with the sensor available is available", () => {
+  // MQTT connected and the list read, but no schedules: the card must offer Add.
+  const hass = fakeHass({ sensorState: "none" });
+  for (const id of Object.keys(hass.states)) {
+    if (id.startsWith("switch.x_schedule_") || id === "switch.my_day_battery") {
+      delete hass.states[id];
+      delete hass.entities[id];
+    }
+  }
+
+  const found = findSchedules(hass, SENSOR);
+  assert.equal(found.available, true);
+  assert.deepEqual(found.schedules, []);
+});
+
+test("the view does not change with unrelated states", () => {
+  const hass = fakeHass();
+  const before = viewKey(hass, SENSOR, "fri");
+
+  hass.states["sensor.house_power"] = { state: "512", attributes: {} };
+
+  assert.equal(viewKey(hass, SENSOR, "fri"), before);
+});
+
+test("the view changes with a schedule, the day or the max power", () => {
+  const hass = fakeHass();
+  const before = viewKey(hass, SENSOR, "fri");
+
+  assert.notEqual(viewKey(hass, SENSOR, "sat"), before);
+  hass.states["switch.x_schedule_13"] = {
+    ...hass.states["switch.x_schedule_13"],
+    state: "off",
+  };
+  const switched = viewKey(hass, SENSOR, "fri");
+  assert.notEqual(switched, before);
+  hass.states[SENSOR].attributes = { max_schedule_power: 5000 };
+  assert.notEqual(viewKey(hass, SENSOR, "fri"), switched);
 });

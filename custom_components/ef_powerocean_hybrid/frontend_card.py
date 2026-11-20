@@ -23,9 +23,9 @@ FOLDER: Final = Path(__file__).parent / "frontend"
 async def async_register_card(hass: HomeAssistant) -> None:
     """Serve the card's folder and load the card, where Home Assistant can."""
     if hass.http is not None:
-        # Not cached for long: the card imports its logic without a version.
+        # Cached: the card and its logic are fetched with the version.
         await hass.http.async_register_static_paths(
-            [StaticPathConfig(CARD_URL, str(FOLDER), cache_headers=False)]
+            [StaticPathConfig(CARD_URL, str(FOLDER), cache_headers=True)]
         )
     if "frontend" in hass.config.components:
         # The version makes browsers fetch the card again after an update.

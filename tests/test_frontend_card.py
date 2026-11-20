@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -28,9 +29,8 @@ async def test_the_card_folder_is_served_and_loaded(hass: HomeAssistant) -> None
     assert folder.name == "frontend"
     assert (folder / "schedule-card.js").is_file()
     assert (folder / "schedule-logic.js").is_file()
-    # Not cached for long: the card imports the logic without a version, so
-    # a long cache could keep an old logic file after an update.
-    assert config.cache_headers is False
+    # Cached: both files are fetched with the version in their address.
+    assert config.cache_headers is True
     add_url.assert_called_once_with(
         hass, "/ef_powerocean_hybrid/frontend/schedule-card.js?v=0.3.0"
     )
@@ -56,3 +56,11 @@ async def test_integration_setup_registers_the_card(hass: HomeAssistant) -> None
         assert await async_setup_component(hass, const.DOMAIN, {})
 
     register.assert_awaited_once_with(hass)
+
+
+def test_the_card_imports_its_logic_with_the_version() -> None:
+    """A new version fetches the logic again, not an old cached copy."""
+    manifest = json.loads((frontend_card.FOLDER.parent / "manifest.json").read_text())
+    card = (frontend_card.FOLDER / "schedule-card.js").read_text()
+
+    assert f'from "./schedule-logic.js?v={manifest["version"]}"' in card

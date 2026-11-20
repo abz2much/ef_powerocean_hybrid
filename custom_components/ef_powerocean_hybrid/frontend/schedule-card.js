@@ -11,8 +11,9 @@ import {
   firstFreeWindow,
   runsOn,
   toHm,
+  viewKey,
   weekdayIn,
-} from "./schedule-logic.js";
+} from "./schedule-logic.js?v=0.3.0"; // the manifest version (tested)
 
 const DOMAIN = "ef_powerocean_hybrid";
 const CARD = "ef-powerocean-schedule-card";
@@ -143,6 +144,7 @@ class ScheduleCard extends HTMLElement {
     if (!config?.entity)
       throw new Error("Choose the system's Active schedule sensor.");
     this._config = config;
+    this._shownKey = undefined;
     this._render();
   }
 
@@ -171,7 +173,16 @@ class ScheduleCard extends HTMLElement {
         .querySelector("dialog")
         .addEventListener("close", () => this._closed());
     }
+    // Only when what the card shows changed: a redraw between pointer-down
+    // and click would drop the tap.
+    const key = viewKey(this._hass, this._config.entity, this._today());
+    if (key === this._shownKey) return;
+    this._shownKey = key;
     root.querySelector(".card").innerHTML = this._cardHtml(this._data);
+  }
+
+  _today() {
+    return weekdayIn(this._hass.config.time_zone, new Date());
   }
 
   _cardHtml({ available, schedules, maxPower }) {
@@ -179,7 +190,7 @@ class ScheduleCard extends HTMLElement {
       return `<div class="head"><h2>Schedules</h2></div>
         <div class="hint">Schedules not available. They need the Extended connection (MQTT).</div>`;
     }
-    const today = weekdayIn(this._hass.config.time_zone, new Date());
+    const today = this._today();
     const full = schedules.length >= 6;
     const noMax = maxPower === null;
     const addHint = noMax
@@ -272,9 +283,9 @@ class ScheduleCard extends HTMLElement {
     const value = event.target.value;
     this._draft[field] =
       field === "power" ? (value === "" ? NaN : Number(value)) : Number(value);
-    // Typing in the power box: keep focus, only refresh the messages.
-    if (event.type === "input") this._renderMessages();
-    else this._renderDialog();
+    // Never rebuild the form here: leaving the power box fires "change" on the
+    // way to a tap on Save, and a rebuilt Save button would lose that tap.
+    this._renderMessages();
   }
 
   _open(original) {
@@ -363,11 +374,7 @@ class ScheduleCard extends HTMLElement {
           "end",
         )}<div class="error" data-msg="end"></div></div>
       </div>
-      <div class="hint">${
-        d.end < d.start
-          ? "Runs over midnight."
-          : "Times in 30-minute steps; an end before the start runs over midnight."
-      }</div>
+      <div class="hint" data-hint="time"></div>
       <div class="field"><label>Days</label><div class="chips">
         <button data-daily class="${
           d.days === "daily" ? "sel" : ""
@@ -389,6 +396,11 @@ class ScheduleCard extends HTMLElement {
   _renderMessages() {
     const dialog = this.shadowRoot.querySelector("dialog");
     const errors = this._errors();
+    const d = this._draft;
+    dialog.querySelector("[data-hint=time]").textContent =
+      d.end < d.start
+        ? "Runs over midnight."
+        : "Times in 30-minute steps; an end before the start runs over midnight.";
     for (const box of dialog.querySelectorAll("[data-msg]")) {
       box.textContent =
         box.dataset.msg === "server"

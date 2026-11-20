@@ -72,12 +72,26 @@ export function findSchedules(hass, sensorId) {
       };
     })
     .sort((a, b) => a.start - b.start);
+  // The sensor is available only with MQTT and once the list was read; an
+  // empty list is still a list, to which the card can add.
   const available =
     sensor !== undefined &&
     !["unavailable", "unknown"].includes(sensor.state) &&
-    deviceId !== null &&
-    schedules.length > 0;
+    deviceId !== null;
   return { deviceId, maxPower, available, schedules };
+}
+
+// What the card shows, as one value: the card redraws only when it changes,
+// not on every update of Home Assistant (which would drop taps).
+export function viewKey(hass, sensorId, weekday) {
+  const { available, maxPower, schedules } = findSchedules(hass, sensorId);
+  return JSON.stringify([
+    available,
+    maxPower,
+    weekday,
+    hass.states[sensorId]?.state,
+    schedules,
+  ]);
 }
 
 export function weekdayIn(timeZone, now) {
