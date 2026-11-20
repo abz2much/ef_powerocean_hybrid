@@ -205,7 +205,7 @@ async def test_energy_stream_updates_the_joined_values(
     # No new entities; the state of charge is not taken from the stream
     assert len(er.async_get(hass).entities) == entities
     assert _state(hass, "battery_soc").state == soc_before
-    assert _state(hass, "battery_soc").attributes["source"] != "mqtt"
+    assert _state(hass, "battery_soc").attributes.get("source") != "mqtt"
 
 
 async def test_energy_stream_kept_while_the_cloud_is_behind(

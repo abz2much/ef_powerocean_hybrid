@@ -364,6 +364,19 @@ async def _cloud_down_at_start(
     return api
 
 
+async def test_the_wait_for_the_cloud_ends_with_an_unload(
+    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    """Nothing of the entry is left listening to the cloud after an unload."""
+    await _cloud_down_at_start(hass, hybrid_entry, set_up_hybrid)
+    cloud = hybrid_entry.runtime_data.cloud
+
+    assert await hass.config_entries.async_unload(hybrid_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert not cloud._listeners
+
+
 async def test_cloud_down_at_start_starts_mqtt_with_its_first_answer(
     hass: HomeAssistant,
     hybrid_entry: MockConfigEntry,

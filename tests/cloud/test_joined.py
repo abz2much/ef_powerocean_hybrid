@@ -140,6 +140,29 @@ async def test_a_stale_cloud_and_no_modbus_is_unavailable(
     assert _state(hass, "house_power").state == "unavailable"
 
 
+async def test_the_cloud_soc_is_stale_once_the_system_stops_checking_in(
+    hass: HomeAssistant,
+    hybrid_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """The cloud keeps answering with the last SOC of a system that went quiet."""
+    api = FakeApi(fetch=[_stream_at("2026-11-19 20:00:00")])
+    await set_up_hybrid(hybrid_entry, api)
+    await _cloud_fresh(hass, hybrid_entry, api)
+    await _fail_modbus(hass, hybrid_entry)
+    assert _state(hass, "battery_soc").attributes["source"] == "cloud"
+
+    # The cloud's polls still succeed, but its heartbeat time stands still.
+    freezer.tick(timedelta(seconds=121))
+    api.respond(_stream_at("2026-11-19 20:00:30"))
+    await hybrid_entry.runtime_data.cloud.async_refresh()
+    await hass.async_block_till_done()
+
+    assert hybrid_entry.runtime_data.cloud.last_update_success
+    assert _state(hass, "battery_soc").state == "unavailable"
+
+
 async def test_a_distrusted_soc_falls_back_to_the_cloud(
     hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
 ) -> None:

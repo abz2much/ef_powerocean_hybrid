@@ -312,8 +312,15 @@ def _async_start_mqtt_with_cloud(
             cloud.hass, cloud.async_start_mqtt(), f"{DOMAIN} MQTT start"
         )
 
-    # Unloading shuts the cloud coordinator down, so no update arrives later.
     unsubscribe.append(cloud.async_add_listener(_cloud_updated))
+
+    @callback
+    def _stop_waiting() -> None:
+        # Unloaded before the cloud answered
+        if unsubscribe:
+            unsubscribe.pop()()
+
+    entry.async_on_unload(_stop_waiting)
 
 
 async def _async_start_modbus(

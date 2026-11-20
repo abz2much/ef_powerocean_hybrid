@@ -69,8 +69,8 @@ def test_joined_values_name_the_report_time_that_shows_freshness() -> None:
         "house_power": "energyStreamUpdateTime",
         "battery_power": "energyStreamUpdateTime",
         "grid_power": "energyStreamUpdateTime",
-        # Sent only when a value changes: its time says nothing of freshness.
-        "battery_soc": None,
+        # Sent only when a value changes: fresh while the system checks in.
+        "battery_soc": "heartbeatUpdateTime",
         "voltage_l1": "heartbeatUpdateTime",
         "frequency": "heartbeatUpdateTime",
     }

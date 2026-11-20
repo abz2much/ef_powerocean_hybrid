@@ -198,6 +198,13 @@
   whether it was started.
 - The text of the option "Live power values (MQTT)" says that house, grid and
   battery power come from it only while Modbus has no current reading.
+- The battery SOC from the cloud counts only while the system still checks in
+  (its heartbeat time changes), as voltage and frequency already do. Before,
+  it counted while the cloud answered, which keeps the last SOC of a system
+  that went quiet. After a restart, a system without Modbus shows its SOC once
+  the heartbeat has changed once, within about two minutes.
+- An unload before the cloud's first answer no longer leaves the wait for it
+  behind.
 
 ## [0.2.0] - Unreleased
 

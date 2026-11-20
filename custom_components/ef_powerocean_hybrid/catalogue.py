@@ -199,9 +199,11 @@ _JOINED: Final = (
     ("house_power", CloudSource("sysLoadPwr", time_key=STREAM_TIME)),
     ("battery_power", CloudSource("bpPwr", time_key=STREAM_TIME)),
     ("grid_power", CloudSource("sysGridPwr", time_key=STREAM_TIME)),
-    # As the cloud integration reads it. The report is sent only when a value
-    # changes, so it counts while the cloud's polls succeed, not by its time.
-    ("battery_soc", CloudSource("bpSoc", CHANGE)),
+    # The report is sent only when a value changes, so it has no time of its
+    # own. It counts while the system still checks in (its heartbeat), not
+    # merely while the cloud answers: a cloud keeps the last SOC of a system
+    # that went quiet.
+    ("battery_soc", CloudSource("bpSoc", CHANGE, time_key=HEARTBEAT_TIME)),
     ("voltage_l1", CloudSource("pcsAPhase_vol", HEARTBEAT, time_key=HEARTBEAT_TIME)),
     ("frequency", CloudSource("pcsAcFreq", HEARTBEAT, time_key=HEARTBEAT_TIME)),
 )
