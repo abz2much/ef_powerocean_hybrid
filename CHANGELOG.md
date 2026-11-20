@@ -206,6 +206,9 @@
   such as 2500 W read as 2500 x 65536: the words in the other order, which would
   run something far from what was sent. The two setpoint registers are now read
   on every poll for this, whatever entities are enabled.
+- Commands go out one at a time. Before, a poll and a user action could
+  interleave their writes, and the poll could then commit its older command
+  over the user's newer one until the next poll.
 
 ### Fixed
 

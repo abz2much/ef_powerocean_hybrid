@@ -294,6 +294,9 @@ class ControlManager:
         self._modbus_client = modbus_client
         # Raises while another integration could write to the same inverter.
         self._check_sole_controller = check_sole_controller
+        # One command at a time: a poll and a user action must not interleave
+        # their writes, or the poll may commit its older command over the new one.
+        self._write_lock = asyncio.Lock()
         self._registers_by_key = registers_by_key
         self._limits = limits
         self._inverter_model = inverter_model
@@ -752,7 +755,7 @@ class ControlManager:
             if definition.setpoint_key in self._registers_by_key
         }
         try:
-            async with asyncio.timeout(RELEASE_TIMEOUT_S):
+            async with self._write_lock, asyncio.timeout(RELEASE_TIMEOUT_S):
                 for feature in features.values():
                     await self._async_write_setpoint(feature, 0.0)
                 await self._async_write_control_word(
@@ -776,7 +779,7 @@ class ControlManager:
         ):
             return
         try:
-            async with asyncio.timeout(RELEASE_TIMEOUT_S):
+            async with self._write_lock, asyncio.timeout(RELEASE_TIMEOUT_S):
                 await self._async_write_setpoint(self._commanded_feature, 0.0)
                 await self._async_write_control_word(
                     self._compose_control_command(ControlFeature.AUTOMATIC)
@@ -921,9 +924,10 @@ class ControlManager:
         if self._reserve_native:
             # The register holds whole percent, which is then the reserve.
             soc = round(max(0.0, min(100.0, soc)))
-            await self._write_setting(
-                self._registers_by_key[BATTERY_RESERVE_REGISTER_KEY], soc
-            )
+            async with self._write_lock:
+                await self._write_setting(
+                    self._registers_by_key[BATTERY_RESERVE_REGISTER_KEY], soc
+                )
             self._inputs = replace(self._inputs, min_soc_limit=soc)
         if self._update_limits(self._charge_limit_soc, soc):
             await self.async_apply(force=True)
@@ -1011,15 +1015,16 @@ class ControlManager:
         mode_value = restore["mode"] if allow else GridFeedMode.LIMITED.register_value
         # Readers expect the enum a poll derives, never the register's raw 0/1.
         mode_state = GridFeedMode.from_register(mode_value)
-        if allow:
-            await self._write_setting(power, restore["power"])
-            await self._write_setting(mode, mode_value, publish_as=mode_state)
-            self._grid_feed_stopped = False
-        else:
-            # Set before writing, so a half-done stop cannot be adopted either.
-            self._grid_feed_stopped = True
-            await self._write_setting(mode, mode_value, publish_as=mode_state)
-            await self._write_setting(power, 0)
+        async with self._write_lock:
+            if allow:
+                await self._write_setting(power, restore["power"])
+                await self._write_setting(mode, mode_value, publish_as=mode_state)
+                self._grid_feed_stopped = False
+            else:
+                # Set before writing, so a half-done stop cannot be adopted either.
+                self._grid_feed_stopped = True
+                await self._write_setting(mode, mode_value, publish_as=mode_state)
+                await self._write_setting(power, 0)
 
     def _track_grid_feed_restore(self, inputs: ControlInputs) -> None:
         """Remember the export settings to put back, while there are any to keep.
@@ -1810,6 +1815,16 @@ class ControlManager:
         force: bool = False,
     ) -> None:
         """Send what the mode and guards add up to, if it differs from the last send."""
+        async with self._write_lock:
+            await self._async_apply(data, notify=notify, force=force)
+
+    async def _async_apply(
+        self,
+        data: Mapping[str, Any] | None,
+        *,
+        notify: bool,
+        force: bool,
+    ) -> None:
         if self._test_running:
             if notify:
                 self._on_update()
@@ -1972,13 +1987,14 @@ class ControlManager:
                 translation_domain=DOMAIN, translation_key="not_connected"
             )
 
-        # Battery saver applies on its own, like the LED brightness does. Only a
-        # control method needs the app locked out, so only it takes control.
-        if CONTROL_FEATURES[self._commanded_feature].commands_power:
-            await self._async_require_control_authority()
+        async with self._write_lock:
+            # Battery saver applies on its own, like the LED brightness does. Only
+            # a control method needs the app locked out, so only it takes control.
+            if CONTROL_FEATURES[self._commanded_feature].commands_power:
+                await self._async_require_control_authority()
 
-        await self._async_write_control_word(value)
-        self._note_control_written()
+            await self._async_write_control_word(value)
+            self._note_control_written()
         self._on_update()
         await self._on_refresh()
 

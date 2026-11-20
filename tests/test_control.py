@@ -1314,6 +1314,42 @@ def test_switching_on_without_a_connection_still_switches_on(
     control._heartbeat.start.assert_called_once()
 
 
+def test_a_poll_and_a_user_action_do_not_interleave_their_writes(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise the poll can commit its older power over the user's newer one."""
+    write = _charging_at(control, monkeypatch, 2500)
+    control._control_stale = True
+    write.reset_mock()
+    setpoint = const.REGISTERS_BY_KEY["battery_power_setpoint"].address
+
+    async def run() -> None:
+        released = asyncio.Event()
+        first = True
+
+        async def slow_write(*_args, **_kwargs) -> None:
+            nonlocal first
+            if first:
+                first = False
+                await released.wait()
+
+        write.side_effect = slow_write
+        poll = asyncio.create_task(control.async_poll({"battery_soc": 50.0}))
+        await asyncio.sleep(0)  # the poll is now held in its first write
+        user = asyncio.create_task(
+            control.async_set_feature_power(Feature.CHARGE_BATTERY, 3000)
+        )
+        await asyncio.sleep(0)
+        released.set()
+        await asyncio.gather(poll, user)
+
+    asyncio.run(run())
+
+    setpoints = [words for address, words in commands(write) if address == setpoint]
+    assert setpoints[-1] == [0x0000, 0x0BB8]  # 3000 W, the user's
+    assert control.power == 3000.0
+
+
 def test_a_shutdown_releases_the_command_before_the_heartbeat_stops(
     control, monkeypatch: pytest.MonkeyPatch
 ) -> None:
