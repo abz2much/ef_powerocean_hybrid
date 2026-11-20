@@ -73,6 +73,7 @@ async def test_the_cloud_part_without_mqtt(
         "update_interval": 10.0,
         "variant": "86",
         "mqtt": False,
+        "mqtt_connected": False,
     }
     assert cloud["modules"] == {}
     # Serials as placeholders, so the response can become a test fixture.
@@ -95,6 +96,7 @@ async def test_the_cloud_part_shows_mqtt_and_the_module_firmware(
         cloud = (await async_get_config_entry_diagnostics(hass, cloud_entry))["cloud"]
 
     assert cloud["coordinator"]["mqtt"] is True
+    assert cloud["coordinator"]["mqtt_connected"] is True
     # The EMS firmware is shown here only, not on a device (owner, Task 2).
     assert cloud["modules"] == {
         address: {

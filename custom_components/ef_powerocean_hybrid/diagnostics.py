@@ -162,6 +162,8 @@ def _cloud_diagnostics(cloud: CloudCoordinator) -> dict[str, Any]:
             ),
             "variant": cloud.api.variant,
             "mqtt": cloud.mqtt is not None,
+            # Started is not connected: paho may be reconnecting.
+            "mqtt_connected": cloud.mqtt is not None and cloud.mqtt.connected,
         },
         # Firmware of the modules from MQTT, by address (without serials). The
         # EMS firmware is shown here only.

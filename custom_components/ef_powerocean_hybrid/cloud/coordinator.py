@@ -65,7 +65,7 @@ from .mqtt import (
 )
 from .parse import parse
 from .schedule_rules import MAX_SCHEDULES, refuse, validate_schedule
-from .schedules import schedule_title, windows_overlap
+from .schedules import schedule_title, windows_overlap, within_the_day
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -218,6 +218,10 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pending_acks: dict[int, asyncio.Future[None]] = {}
         # Scheduled tasks (option MQTT), by id; none known until the first list.
         self.schedules: dict[int, Schedule] = {}
+        # Schedules with a time past 23:59, by id: not shown, as that is no time
+        # of the day, but they hold their id and a place on the system.
+        self._past_the_day: dict[int, Schedule] = {}
+        self._warned_past_the_day: set[Schedule] = set()
         self._schedules_known = False
         # Highest id of a schedule we added: the list may not show it yet.
         self._last_added_id = 0
@@ -345,6 +349,7 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._schedule_poll_unsub()
             self._schedule_poll_unsub = None
         self.schedules = {}
+        self._past_the_day = {}
         self._schedules_known = False
         self._last_added_id = 0
         if self.mqtt:
@@ -585,11 +590,18 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._apply_settings({"batterySaveMode": int(enabled)})
 
     def _connected_mqtt(self) -> PowerOceanMqtt:
-        if not self.mqtt:
+        """Return the connection, if a command can go out on it now.
+
+        While paho reconnects it would hold a command and send it on reconnect,
+        long after Home Assistant reported it failed: then a late soc limits
+        command sets back what the app changed meanwhile, and a retried add is
+        sent twice.
+        """
+        if (client := self._mqtt_up()) is None:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="mqtt_not_connected"
             )
-        return self.mqtt
+        return client
 
     async def _async_command(self, send: Callable[..., None], *values: Any) -> None:
         """Send a command (blocking, with the seq last) and wait for the ack."""
@@ -682,7 +694,11 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self.mqtt:
             # Arrived while the connection was being closed
             return
-        new = {schedule.schedule_id: schedule for schedule in schedules}
+        new = {s.schedule_id: s for s in schedules if within_the_day(s)}
+        self._past_the_day = {
+            s.schedule_id: s for s in schedules if not within_the_day(s)
+        }
+        self._warn_past_the_day()
         changed = new != self.schedules or not self._schedules_known
         self.schedules = new
         self._schedules_known = True
@@ -697,12 +713,36 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Take over one schedule (the answer to a single read)."""
         if not self.mqtt or self.schedules.get(schedule.schedule_id) == schedule:
             return
-        self.schedules = {**self.schedules, schedule.schedule_id: schedule}
+        if not within_the_day(schedule):
+            self._past_the_day[schedule.schedule_id] = schedule
+            self._warn_past_the_day()
+            if schedule.schedule_id not in self.schedules:
+                return
+            self.schedules = {
+                i: s for i, s in self.schedules.items() if i != schedule.schedule_id
+            }
+        else:
+            self._past_the_day.pop(schedule.schedule_id, None)
+            self.schedules = {**self.schedules, schedule.schedule_id: schedule}
         self.async_update_listeners()
+
+    def _warn_past_the_day(self) -> None:
+        """Warn once for each schedule with a time past 23:59, as it is now."""
+        for schedule in self._past_the_day.values():
+            if schedule not in self._warned_past_the_day:
+                self._warned_past_the_day.add(schedule)
+                _LOGGER.warning(
+                    "Schedule %s has a time past 23:59 (%s-%s minutes); not shown, "
+                    "but its id stays taken and it counts toward the limit",
+                    schedule.schedule_id,
+                    schedule.start,
+                    schedule.end,
+                )
 
     def _check_overlap(self, schedule: Schedule) -> None:
         """Refuse a time that overlaps another schedule, whatever the days."""
-        for other in self.schedules.values():
+        # One past 23:59 counts from its start: overlapping it is refused.
+        for other in (*self.schedules.values(), *self._past_the_day.values()):
             if other.schedule_id != schedule.schedule_id and windows_overlap(
                 schedule.start, schedule.end, other.start, other.end
             ):
@@ -804,10 +844,14 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             mqtt = self._connected_mqtt()
             if not self._schedules_known:
                 refuse("schedules_unknown")
-            if len(self.schedules) >= MAX_SCHEDULES:
+            if len(self.schedules) + len(self._past_the_day) >= MAX_SCHEDULES:
                 refuse("schedule_limit_reached", max=MAX_SCHEDULES)
             schedule = Schedule(
-                schedule_id=max(max(self.schedules, default=0), self._last_added_id)
+                schedule_id=max(
+                    max(self.schedules, default=0),
+                    max(self._past_the_day, default=0),
+                    self._last_added_id,
+                )
                 + 1,
                 schedule_type=schedule_type,
                 enabled=enabled,

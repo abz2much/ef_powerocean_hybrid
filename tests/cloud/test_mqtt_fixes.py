@@ -45,9 +45,12 @@ def _record(start: int, end: int) -> bytes:
     )
 
 
-def test_a_schedule_with_a_time_past_midnight_is_dropped() -> None:
-    """Minutes past 23:59 cannot be a time of day; using them would mislead."""
-    assert mqtt.parse_schedule(_record(60 * 2, 60 * 25)) is None
+def test_a_schedule_with_a_time_past_midnight_is_read_as_sent() -> None:
+    """The coordinator keeps it aside: it still holds its id on the system."""
+    schedule = mqtt.parse_schedule(_record(60 * 2, 60 * 25))
+
+    assert schedule is not None
+    assert (schedule.start, schedule.end) == (60 * 2, 60 * 25)
 
 
 def test_a_schedule_with_valid_times_is_read() -> None:

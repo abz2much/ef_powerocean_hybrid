@@ -172,7 +172,7 @@
           "calc_solar_power": "In some inverters, the modbus register delivers 0W of solar power. This switch allows the solar power to be calculated from the individual powers of the string.",
           "battery_reserve": "Native: the inverter enforces the reserve itself, like the one set in the EcoFlow app, but not every model accepts a change to it over Modbus. Emulated: the integration imitates the app's reserve with its own logic, while Modbus Control is on. Set for your model; change it only to test a model.",
           "mqtt": "Additionally connects to the EcoFlow cloud like the EcoFlow app (MQTT) and reads the firmware of the modules. The values still come from the regular polling.",
-          "live_power": "Asks the system for its power values every 20 s, as the EcoFlow app does while it is open; solar, grid, battery, house and the energy flows then update every ~5 s. Only with the extended connection (MQTT).",
+          "live_power": "Asks the system for its power values every 20 s, as the EcoFlow app does while it is open. Solar and the energy flows then update every ~5 s; house, grid and battery power too, while Modbus has no current reading. Only with the extended connection (MQTT).",
           "max_schedule_power": "Highest power in W that a schedule may use. Without a value, schedules cannot be added or changed. Only with the extended connection (MQTT).",
           "calc_grid_energy": "In some inverters, the grid import and export registers stay at 0 while Grid Power reads right. This switch calculates grid import and export from Grid Power instead. An estimate: it can differ from your meter by a few percent.",
           "alert_verbosity": "How much the integration raises in Settings \u2192 Repairs. Essential: only what you must act on, such as an inverter that stopped updating. Readings: also readings that cannot be trusted. Detailed: also the connection's health, such as frequent reconnects or late polls. Debug: also every warning and error the integration logs. Each alert can be ignored. Setting it back to Essential forgets the ignored alerts."
@@ -1417,7 +1417,7 @@
       "message": "The days must be daily, or a choice of days from Monday to Sunday."
     },
     "mqtt_not_connected": {
-      "message": "No MQTT connection to the EcoFlow cloud. Switch on the option \"Extended connection (MQTT)\"."
+      "message": "No MQTT connection to the EcoFlow cloud, so nothing was sent. If the option \"Extended connection (MQTT)\" is on, it reconnects by itself: try again in a minute. Otherwise, switch the option on."
     },
     "not_acknowledged": {
       "message": "The system did not confirm the setting. Please try again."

@@ -41,7 +41,6 @@ if TYPE_CHECKING:
 LOGGER = getLogger(__package__)
 
 # Minutes in a day: a schedule's start and end are below it.
-DAY_MINUTES = 24 * 60
 
 # Protobuf wire types
 VARINT, FIXED64, LENGTH, FIXED32 = 0, 1, 2, 5
@@ -582,9 +581,6 @@ def parse_schedule(content: bytes) -> Schedule | None:
     if schedule_id is None or schedule_type is None or not isinstance(time, bytes):
         return None
     start, end = unpack_schedule_time(_read_varint(time, 0)[0])
-    if not (0 <= start < DAY_MINUTES and 0 <= end < DAY_MINUTES):
-        LOGGER.warning("Schedule %s with a time past 23:59 ignored", schedule_id)
-        return None
     return Schedule(
         schedule_id=schedule_id,
         schedule_type=schedule_type,

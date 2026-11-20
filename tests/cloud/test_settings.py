@@ -126,6 +126,22 @@ async def _setup(
     return api
 
 
+async def test_no_setting_is_sent_while_mqtt_is_disconnected(
+    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    """A late command would set back what the app changed meanwhile."""
+    await _setup(hass, hybrid_entry, set_up_hybrid)
+    cloud = hybrid_entry.runtime_data.cloud
+    client = _client()
+    client.connected = False
+
+    with pytest.raises(HomeAssistantError) as error:
+        await cloud.async_set_backup_reserve(30)
+
+    assert error.value.translation_key == "mqtt_not_connected"
+    assert client.soc_limit_commands == []
+
+
 def _client() -> SettingsMqtt:
     (client,) = FakeMqtt.instances
     assert isinstance(client, SettingsMqtt)

@@ -180,6 +180,22 @@
   requests wait instead of warning each time.
 - MQTT now stops when Home Assistant stops. Before, a message arriving during
   the shutdown logged "Event loop is closed".
+- A command is refused at once while MQTT is reconnecting, with a message to
+  try again in a minute. Before, paho held it and sent it on reconnect, long
+  after Home Assistant reported it failed: a backup reserve change could then
+  set back a charge limit changed in the app meanwhile, and a retried schedule
+  was added twice.
+- A schedule the system reports with a time past 23:59 is still not shown, but
+  its id stays taken, it counts toward the 6 schedules, and a new schedule from
+  its start on counts as overlapping it. It is warned about once, not with
+  every list read.
+- The schedule card says why Save waits while another change is being sent,
+  and a form opened meanwhile can save once that change is done. The card's
+  editor no longer closes its open list with every update.
+- Diagnostics show whether MQTT is connected now (`mqtt_connected`), beside
+  whether it was started.
+- The text of the option "Live power values (MQTT)" says that house, grid and
+  battery power come from it only while Modbus has no current reading.
 
 ## [0.2.0] - Unreleased
 

@@ -137,7 +137,6 @@ class ScheduleCard extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this._draft = null;
     this._original = null;
-    this._serverError = "";
     this._busy = false;
   }
 
@@ -339,7 +338,6 @@ class ScheduleCard extends HTMLElement {
           ...firstFreeWindow(this._data.schedules),
           days: "daily",
         };
-    this._serverError = "";
     this._renderDialog();
     this.shadowRoot.querySelector("dialog").showModal();
   }
@@ -347,7 +345,6 @@ class ScheduleCard extends HTMLElement {
   _closed() {
     this._draft = null;
     this._original = null;
-    this._serverError = "";
   }
 
   _errors() {
@@ -440,7 +437,9 @@ class ScheduleCard extends HTMLElement {
     for (const box of dialog.querySelectorAll("[data-msg]")) {
       box.textContent =
         box.dataset.msg === "server"
-          ? this._serverError
+          ? this._busy
+            ? "Waiting for the last change to finish."
+            : ""
           : errors[box.dataset.msg] ?? "";
     }
     dialog.querySelector(".save").disabled = !this._canSave(errors);
@@ -473,6 +472,10 @@ class ScheduleCard extends HTMLElement {
     } finally {
       this._busy = false;
       this._redraw();
+      // A form opened meanwhile can save now.
+      if (this._draft && this.shadowRoot.querySelector("dialog").open) {
+        this._renderMessages();
+      }
     }
   }
 
@@ -535,6 +538,16 @@ class ScheduleCardEditor extends HTMLElement {
 
   _render() {
     if (!this._hass || !this._config) return;
+    // Only when the list changes: rebuilding it closes an open dropdown.
+    const shown = JSON.stringify([
+      this._config.entity,
+      candidates(this._hass).map((id) => [
+        id,
+        this._hass.states[id]?.attributes?.friendly_name,
+      ]),
+    ]);
+    if (shown === this._shown) return;
+    this._shown = shown;
     const options = candidates(this._hass)
       .map(
         (id) =>

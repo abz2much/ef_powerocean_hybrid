@@ -52,6 +52,11 @@ class ScheduleInputError(ValueError):
         self.key = key
 
 
+def within_the_day(schedule: Schedule) -> bool:
+    """Return whether both times of a schedule are times of the day (to 23:59)."""
+    return 0 <= schedule.start < DAY_MINUTES and 0 <= schedule.end < DAY_MINUTES
+
+
 def format_minutes(minutes: int) -> str:
     """Return minutes since midnight as HH:MM."""
     return f"{minutes // 60:02d}:{minutes % 60:02d}"

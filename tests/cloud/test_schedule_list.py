@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import replace
+from datetime import timedelta
 from typing import Any, Protocol
 from unittest.mock import patch
 
@@ -16,7 +17,10 @@ import pytest
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from custom_components.ef_powerocean_hybrid.cloud.mqtt import (
     SCHEDULE_CHARGE,
@@ -301,6 +305,81 @@ async def test_a_command_the_list_does_not_confirm_is_reported(set_up: Start) ->
 
 
 # -----------------------------
+# A schedule with a time past 23:59 (not a time of day)
+# -----------------------------
+
+# 03:00 to 25:00, with the highest id
+PAST_MIDNIGHT = listed(14, SCHEDULE_CHARGE, 1000, hm(3), hm(25))
+
+
+async def test_a_schedule_past_23_59_is_not_shown(set_up: Start) -> None:
+    ScheduleMqtt.system = [*system_schedules(), PAST_MIDNIGHT]
+
+    coordinator = (await set_up()).runtime_data.cloud
+
+    assert 14 not in coordinator.schedules
+
+
+async def test_a_schedule_past_23_59_keeps_its_id(set_up: Start) -> None:
+    """Reusing its id would overwrite it on the system."""
+    ScheduleMqtt.system = [*system_schedules(), PAST_MIDNIGHT]
+    coordinator = (await set_up()).runtime_data.cloud
+
+    new_id = await coordinator.async_add_schedule(
+        schedule_type=SCHEDULE_CHARGE, power=1000, start=hm(2), end=hm(3)
+    )
+
+    assert new_id == 15
+
+
+async def test_a_schedule_past_23_59_counts_toward_the_limit(set_up: Start) -> None:
+    ScheduleMqtt.system = [
+        *system_schedules(),
+        listed(13, SCHEDULE_CHARGE, 1000, hm(9), hm(10)),
+        listed(15, SCHEDULE_CHARGE, 1000, hm(10), hm(11)),
+        PAST_MIDNIGHT,
+    ]
+    coordinator = (await set_up()).runtime_data.cloud
+
+    with pytest.raises(HomeAssistantError) as error:
+        await coordinator.async_add_schedule(
+            schedule_type=SCHEDULE_CHARGE, power=1000, start=hm(1), end=hm(2)
+        )
+
+    assert _key(error) == "schedule_limit_reached"
+
+
+async def test_a_schedule_past_23_59_is_checked_for_overlaps(set_up: Start) -> None:
+    """Its window is unclear, so it counts as up to midnight from its start."""
+    ScheduleMqtt.system = [*system_schedules(), PAST_MIDNIGHT]
+    coordinator = (await set_up()).runtime_data.cloud
+
+    with pytest.raises(HomeAssistantError) as error:
+        await coordinator.async_add_schedule(
+            schedule_type=SCHEDULE_CHARGE, power=1000, start=hm(4), end=hm(5)
+        )
+
+    assert _key(error) == "schedule_overlap"
+
+
+async def test_a_schedule_past_23_59_is_warned_about_once(
+    hass: HomeAssistant,
+    set_up: Start,
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ScheduleMqtt.system = [*system_schedules(), PAST_MIDNIGHT]
+    await set_up()
+
+    for _ in range(3):
+        freezer.tick(timedelta(seconds=60))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert caplog.text.count("Schedule 14") == 1
+
+
+# -----------------------------
 # Adding
 # -----------------------------
 
@@ -320,6 +399,21 @@ async def test_add_takes_the_next_free_id(set_up: Start) -> None:
         )
     ]
     assert coordinator.schedules[13].power == 2500
+
+
+async def test_nothing_is_sent_while_mqtt_is_disconnected(set_up: Start) -> None:
+    """paho would hold the command and send it on reconnect, long after
+    Home Assistant reported it failed; a retry would then add it twice."""
+    coordinator = (await set_up()).runtime_data.cloud
+    _client().connected = False
+
+    with pytest.raises(HomeAssistantError) as error:
+        await coordinator.async_add_schedule(
+            schedule_type=SCHEDULE_CHARGE, power=2500, start=hm(2), end=hm(5)
+        )
+
+    assert _key(error) == "mqtt_not_connected"
+    assert _client().commands == []
 
 
 async def test_add_with_chosen_days_and_switched_off(set_up: Start) -> None:
