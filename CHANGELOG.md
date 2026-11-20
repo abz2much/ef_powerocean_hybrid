@@ -146,6 +146,13 @@
 - The inverter's firmware comes from Modbus and is shown on the inverter's
   device only; it no longer overwrites the firmware of other devices.
 
+### Fixed
+
+- With Modbus Control off, a reconnect no longer makes the next poll write a
+  control command to the inverter. An inverter that left the write unanswered
+  dropped the connection each time. From upstream EF-PowerOcean-TcpModbus
+  `e399e89` (v2.10.0).
+
 ## [0.2.0] - Unreleased
 
 ### Changed
