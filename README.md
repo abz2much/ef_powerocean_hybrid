@@ -137,7 +137,8 @@ Not ready yet; the integration is still in development. When it is:
 - Modbus Control always starts off when Home Assistant starts.
 - It cannot be switched on while EF-PowerOcean-TcpModbus, or a second entry of
   this integration, is loaded for the same inverter address, and it is switched
-  off if one is loaded later.
+  off if one is loaded later. The address is compared as entered: an IP address
+  in one and a host name in the other are not recognised as the same inverter.
 - The heartbeat that keeps the inverter following commands beats only while the
   control logic runs on recent polls; otherwise the inverter returns to its app
   settings within 60 seconds.

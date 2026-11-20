@@ -346,6 +346,11 @@ class ControlManager:
         self._app_reserve_charges = False
         # When a command sent with an expiry returns to automatic, unless renewed.
         self._expires_at: datetime | None = None
+        # When that expiry was set and for how long: it is judged by the time
+        # passed, so a clock stepping back ends the command rather than
+        # stretching it.
+        self._expiry_set_at: datetime | None = None
+        self._expire_in_s = 0.0
         # Which guard, if any, is forcing the current command.
         self._command_status: ControlStatus | None = None
         self._handback = GuardHandback()
@@ -402,6 +407,8 @@ class ControlManager:
         self._inputs = ControlInputs()
         # While the control test drives the inverter itself, nothing here writes.
         self._test_running = False
+        # Once stopping has released the command, nothing may send it again.
+        self._shut_down = False
 
     @property
     def deciding(self) -> bool:
@@ -438,7 +445,9 @@ class ControlManager:
         inverter's window, so control is not handed back in between. The selected
         mode, its power and its expiry stay as they are, to resume after the test.
         """
-        self._test_running = True
+        # After any command being sent, so none of its writes land in the test.
+        async with self._write_lock:
+            self._test_running = True
         await self._heartbeat.async_stop()
         self._on_update()
 
@@ -737,7 +746,15 @@ class ControlManager:
         """Release the command and stop beating, as Home Assistant stops."""
         if self._enabled:
             await self._async_release()
+        self._shut_down = True
         await self._heartbeat.async_stop()
+
+    def _require_running(self) -> None:
+        """Refuse a command once stopping has released the inverter."""
+        if self._shut_down:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="control_stopped"
+            )
 
     async def _async_clear_before_taking_control(self) -> None:
         """Clear the setpoints and select the default method, before any beat.
@@ -754,7 +771,7 @@ class ControlManager:
             if definition.setpoint_key in self._registers_by_key
         }
         try:
-            async with self._write_lock, asyncio.timeout(RELEASE_TIMEOUT_S):
+            async with asyncio.timeout(RELEASE_TIMEOUT_S), self._write_lock:
                 for feature in features.values():
                     await self._async_write_setpoint(feature, 0.0)
                 await self._async_write_control_word(
@@ -778,11 +795,13 @@ class ControlManager:
         ):
             return
         try:
-            async with self._write_lock, asyncio.timeout(RELEASE_TIMEOUT_S):
-                await self._async_write_setpoint(self._commanded_feature, 0.0)
+            async with asyncio.timeout(RELEASE_TIMEOUT_S), self._write_lock:
+                # The default method first: 0 alone means "no limit" to the
+                # battery-limits method, should the second write fail.
                 await self._async_write_control_word(
                     self._compose_control_command(ControlFeature.AUTOMATIC)
                 )
+                await self._async_write_setpoint(self._commanded_feature, 0.0)
         except (HomeAssistantError, TimeoutError) as err:
             _LOGGER.warning(
                 "Could not release the command (%r); the inverter returns to its "
@@ -800,6 +819,7 @@ class ControlManager:
         """
         if enabled == self._enabled:
             return
+        self._read_back_misses = 0
         if enabled:
             self._require_no_test()
             if self._check_sole_controller is not None:
@@ -840,6 +860,7 @@ class ControlManager:
 
     def _require_modbus_control(self) -> None:
         """Refuse a command the inverter would store and ignore."""
+        self._require_running()
         self._require_no_test()
         if not self._enabled:
             raise HomeAssistantError(
@@ -895,11 +916,14 @@ class ControlManager:
             self._feature = feature
             self._handback = GuardHandback()
         # Automatic is where an expiry would return to, so it has nothing to expire.
+        now = dt.now()
         self._expires_at = (
             None
             if expire_in_s is None or feature is ControlFeature.AUTOMATIC
-            else dt.now() + timedelta(seconds=expire_in_s)
+            else now + timedelta(seconds=expire_in_s)
         )
+        self._expiry_set_at = now
+        self._expire_in_s = float(expire_in_s or 0.0)
         await self.async_apply(force=True)
 
     async def async_set_feature_power(
@@ -1818,7 +1842,7 @@ class ControlManager:
         notify: bool,
         force: bool,
     ) -> None:
-        if self._test_running:
+        if self._test_running or self._shut_down:
             if notify:
                 self._on_update()
             return
@@ -1921,7 +1945,10 @@ class ControlManager:
 
     def _expire_command(self) -> None:
         """Return to automatic once a command's time runs out, leaving the limits."""
-        if self._expires_at is None or dt.now() < self._expires_at:
+        if (
+            self._expires_at is None
+            or seconds_since(self._expiry_set_at, dt.now()) < self._expire_in_s
+        ):
             return
         _LOGGER.debug(
             "The %s command was not renewed in time, returning to automatic",
@@ -1972,6 +1999,7 @@ class ControlManager:
 
     async def _async_apply_control_command(self) -> None:
         """Write the control word once and refresh so the read-back shows it."""
+        self._require_running()
         value = self._compose_control_command()
         # Before anything is written, not only before the word itself.
         self._require_safe(value)
@@ -2061,3 +2089,5 @@ class ControlManager:
         """Record a command as delivered, so polling neither repeats nor drops it."""
         self._last_control_write_time = dt.now()
         self._control_stale = False
+        # A new write is judged on its own reads.
+        self._read_back_misses = 0

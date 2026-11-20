@@ -210,11 +210,20 @@
   interleave their writes, and the poll could then commit its older command
   over the user's newer one until the next poll.
 - A clock that steps back no longer freezes the control timers. Every time
-  recorded before the step then lies in the future and now counts as long ago,
-  so the heartbeat is rewritten and a changed command goes out at once. Before,
-  a command change could be held back until the clock caught up (an hour after
-  a one-hour step), the heartbeat counted as current for as long, and a guard's
-  hand-back or a mode's cooldown stalled.
+  recorded before the step then lies in the future and now counts as long ago:
+  a changed command goes out at once, the heartbeat counts as lapsed and beats
+  again after the next poll, and a timed command (`expire_in`) ends at once
+  instead of running longer by the size of the step. Before, a command change
+  could be held back until the clock caught up (an hour after a one-hour step),
+  the heartbeat counted as current for as long, and a guard's hand-back or a
+  mode's cooldown stalled.
+- Once stopping has released the command, nothing sends it again: a late poll
+  writes nothing and an action is refused. The 5-second release limit includes
+  waiting for a command already being sent, the release sends the default
+  method before setpoint 0, and the control test waits for a command being sent
+  before it takes the inverter.
+- The read-back counts two wrong reads in a row of one command: a new command,
+  or switching control off and on, starts the count afresh.
 
 ### Fixed
 

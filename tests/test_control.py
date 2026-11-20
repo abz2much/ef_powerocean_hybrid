@@ -147,6 +147,42 @@ def test_a_clock_stepped_back_does_not_freeze_the_timers(
     assert control.deciding is False
 
 
+def test_a_clock_stepped_back_does_not_stretch_a_timed_command(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command sent to run for a minute must not run an hour longer."""
+    allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(
+        control.async_set_command(Feature.CHARGE_BATTERY, power=2000, expire_in_s=60)
+    )
+
+    # Ten seconds on, the clock steps back an hour.
+    stepped_back = HEARTBEAT_START + timedelta(seconds=10) - timedelta(hours=1)
+    monkeypatch.setattr(dt_util, "now", lambda: stepped_back)
+    control._heartbeat._last_success = stepped_back
+    asyncio.run(control.async_poll({"battery_soc": 50.0}))
+
+    assert control.selected_feature is Feature.AUTOMATIC
+
+
+def test_a_timed_command_still_runs_its_time(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(
+        control.async_set_command(Feature.CHARGE_BATTERY, power=2000, expire_in_s=60)
+    )
+
+    advance(control, monkeypatch, 59)
+    asyncio.run(control.async_poll({"battery_soc": 50.0}))
+    assert control.selected_feature is Feature.CHARGE_BATTERY
+    advance(control, monkeypatch, 61)
+    asyncio.run(control.async_poll({"battery_soc": 50.0}))
+    assert control.selected_feature is Feature.AUTOMATIC
+
+
 def test_a_recent_beat_is_reused_and_a_stale_one_is_rewritten(
     control, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -647,6 +683,20 @@ def test_control_stops_when_the_inverter_reads_back_another_setpoint(
 
     assert control.enabled is False
     assert "reads back" in caplog.text
+
+
+def test_a_new_command_starts_the_read_back_count_afresh(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two wrong reads in a row of one command, not one each of two commands."""
+    _charging_at(control, monkeypatch, 2500)
+    _poll_reading_back(control, monkeypatch, 30, 0)
+
+    advance(control, monkeypatch, 31)
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, 3000))
+    _poll_reading_back(control, monkeypatch, 60, 0)
+
+    assert control.enabled is True
 
 
 def test_control_goes_on_while_the_setpoint_reads_back_as_sent(
@@ -1261,9 +1311,10 @@ def test_switching_modbus_control_off_hands_back_and_on_takes_control_again(
     write.reset_mock()
     asyncio.run(control.async_poll({"battery_soc": 50.0}))
 
+    # The default method first: 0 alone means "no limit" under battery limits.
     assert released == [
-        (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0x0000, 0x0000]),
         (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0000]),
+        (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0x0000, 0x0000]),
     ]
     write.assert_not_awaited()
     assert control.status is Status.HANDING_BACK
@@ -1385,10 +1436,72 @@ def test_a_shutdown_releases_the_command_before_the_heartbeat_stops(
     asyncio.run(control.async_stop())
 
     assert commands(write) == [
-        (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0x0000, 0x0000]),
         # The default method, with battery saver kept as the user set it
         (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0008]),
+        (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0x0000, 0x0000]),
     ]
+
+
+def test_the_release_time_limit_covers_waiting_for_a_command_in_progress(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop must not wait on a stuck command for longer than the limit."""
+    allow_writes(control, monkeypatch)
+    monkeypatch.setattr(control_module, "RELEASE_TIMEOUT_S", 0.05)
+
+    async def run() -> None:
+        async with control._write_lock:  # a command stuck in its writes
+            await asyncio.wait_for(control._async_release(), 2)
+
+    asyncio.run(run())
+
+
+def test_nothing_is_sent_after_the_stop_released_the_command(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late poll or action would put the inverter back on it for 60 s."""
+    write = _charging_at(control, monkeypatch, 2500)
+    asyncio.run(control.async_stop())
+    write.reset_mock()
+
+    asyncio.run(control.async_poll({"battery_soc": 50.0}))
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(control.async_set_command(Feature.CHARGE_BATTERY, power=3000))
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(control.async_set_battery_saver(True))
+
+    write.assert_not_awaited()
+
+
+def test_the_control_test_waits_for_a_command_being_sent(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise the command's writes land after the test took the inverter."""
+    write = _charging_at(control, monkeypatch, 2500)
+    control._control_stale = True
+    order: list[str] = []
+
+    async def run() -> None:
+        released = asyncio.Event()
+
+        async def slow_write(*_args, **_kwargs) -> None:
+            order.append("write")
+            await released.wait()
+
+        write.side_effect = slow_write
+        poll = asyncio.create_task(control.async_poll({"battery_soc": 50.0}))
+        await asyncio.sleep(0)
+        test = asyncio.create_task(control.async_begin_test())
+        await asyncio.sleep(0)
+        released.set()
+        await poll
+        await test
+        order.append("test")
+
+    control._heartbeat.async_stop = AsyncMock(side_effect=lambda: order.append("t"))
+    asyncio.run(run())
+
+    assert order.index("t") > max(i for i, x in enumerate(order) if x == "write")
 
 
 def test_nothing_is_released_where_nothing_was_held(
