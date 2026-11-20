@@ -30,7 +30,8 @@ from custom_components.ef_powerocean_hybrid.models import (
 from custom_components.ef_powerocean_hybrid.telemetry import TelemetryData
 
 REGISTERS = frozenset(const.REGISTERS_BY_KEY)
-OWN = (TelemetryData.keys(REGISTERS) | ENERGY_KEYS) & REGISTERS
+# Grid Power is integrated into grid energy, so it is read whatever is shown.
+OWN = (TelemetryData.keys(REGISTERS) | ENERGY_KEYS | {"grid_power"}) & REGISTERS
 
 
 def test_control_inputs_hold_every_key_the_features_read() -> None:

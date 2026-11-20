@@ -29,11 +29,14 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
+from . import watchdog
 from .cloud import coordinator as cloud_module
 from .cloud.coordinator import async_check_cloud
 from .const import (
+    CONF_ALERT_VERBOSITY,
     CONF_BATTERY_COUNT,
     CONF_BATTERY_RESERVE,
+    CONF_CALC_GRID_ENERGY,
     CONF_CALC_SOLAR_POWER,
     CONF_CLOUD_SERIAL,
     CONF_ENERGY_OFFSETS,
@@ -62,7 +65,13 @@ from .const import (
     SERIAL_NUMBER,
 )
 from .modbus import TRANSPORT_ERRORS, ModbusClient, async_temporary_client
-from .models import InverterModel, ReserveSupport, battery_reserve_for
+from .models import (
+    AlertVerbosity,
+    InverterModel,
+    ReserveSupport,
+    battery_reserve_for,
+)
+from .outage import Cause, async_classify
 from .telemetry import decode_register, decode_serial_number
 from .util import parse_kwh, portal_history_url
 
@@ -113,6 +122,16 @@ async def async_read_device_settings(
     except Exception as e:
         _LOGGER.warning("EF-PowerOcean connection test failed: %s", e)
         return None
+
+
+async def async_connect_error(host: str, port: int) -> str:
+    """Return the error for an address that gave no answer, named by its cause.
+
+    The flow's own client is closed by now, so the probe has the port to itself.
+    """
+    if await async_classify(host, port) is Cause.MODBUS_SILENT:
+        return "modbus_silent"
+    return "cannot_connect"
 
 
 async def _async_read_settings(client: ModbusClient) -> dict[str, Any]:
@@ -292,7 +311,9 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
                     }
                 )
                 return await self.async_step_parameters()
-            errors["base"] = "cannot_connect"
+            errors["base"] = await async_connect_error(
+                user_input[CONF_HOST], user_input[CONF_PORT]
+            )
 
         return self.async_show_form(
             step_id="modbus",
@@ -364,6 +385,10 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
                     ): vol.All(int, vol.Range(min=2, max=30)),
                     vol.Required(
                         CONF_CALC_SOLAR_POWER,
+                        default=False,
+                    ): BooleanSelector({}),
+                    vol.Required(
+                        CONF_CALC_GRID_ENERGY,
                         default=False,
                     ): BooleanSelector({}),
                 }
@@ -564,7 +589,7 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
                 return self.async_abort(reason="already_configured")
             device_settings = await async_read_device_settings(self.hass, host, port)
             if device_settings is None:
-                errors["base"] = "cannot_connect"
+                errors["base"] = await async_connect_error(host, port)
             elif CONF_CLOUD_SERIAL in entry.data and not device_settings.get(
                 DEVICE_SERIAL_NUMBER
             ):
@@ -653,6 +678,16 @@ class EcoflowOptionsFlow(OptionsFlow):
                     self._warned_lower = lowered
                     errors["base"] = "energy_total_lowered"
             if not errors:
+                # Back to Essential forgets which alerts were ignored.
+                essential = AlertVerbosity.ESSENTIAL
+                if (
+                    self.config_entry.options.get(CONF_ALERT_VERBOSITY, essential)
+                    != essential
+                    and user_input.get(CONF_ALERT_VERBOSITY, essential) == essential
+                ):
+                    await watchdog.async_forget_ignores(
+                        self.hass, self.config_entry.entry_id
+                    )
                 options = {**self.config_entry.options, **user_input, **corrected}
                 if with_cloud:
                     # A field left empty removes the value, as in
@@ -748,6 +783,22 @@ class EcoflowOptionsFlow(OptionsFlow):
                 CONF_CALC_SOLAR_POWER,
                 default=self.config_entry.options.get(CONF_CALC_SOLAR_POWER, False),
             ): BooleanSelector({}),
+            vol.Required(
+                CONF_CALC_GRID_ENERGY,
+                default=self.config_entry.options.get(CONF_CALC_GRID_ENERGY, False),
+            ): BooleanSelector({}),
+            vol.Required(
+                CONF_ALERT_VERBOSITY,
+                default=self.config_entry.options.get(
+                    CONF_ALERT_VERBOSITY, AlertVerbosity.ESSENTIAL
+                ),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[level.value for level in AlertVerbosity],
+                    translation_key=CONF_ALERT_VERBOSITY,
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
             vol.Required(
                 CONF_BATTERY_RESERVE,
                 default=battery_reserve_for(

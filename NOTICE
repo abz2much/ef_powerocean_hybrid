@@ -10,6 +10,10 @@ Copyright (c) 2026 MaxGrmm.
   request, and the shorter reconnect delays.
 - Ported from commit e399e89 (in v2.10.0): no control write on a reconnect
   while Modbus Control is off.
+- Ported from v2.10.0 (commit cf8454a), English only: the not-answering issue
+  (#223, merge 44eb1e7), the reading checks rework (#234, merge a0ede36),
+  alert verbosity and the Modbus client counters (#233, merge
+  dd547e0), and the grid energy calculation (#228, merge bb621a8).
 
 The cloud code in custom_components/ef_powerocean_hybrid/cloud/ and its tests
 come from powerocean_single_phase by abz2much

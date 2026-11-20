@@ -22,16 +22,19 @@ from homeassistant.util import dt
 from pymodbus import __version__ as pyModbusVersion
 from pymodbus.exceptions import ModbusException
 
+from . import outage
+from .announcer import Announcer
 from .const import (
-    ATTR_CHECK,
+    ATTR_FROM,
     ATTR_MODE,
-    ATTR_STATUS,
+    ATTR_TO,
     BATTERY_CHARGE_W_PER_WH,
     BATTERY_DISCHARGE_W_PER_WH,
     BATTERY_MODE_SELECT,
     BATTERY_MODULES,
     CONF_BATTERY_COUNT,
     CONF_BATTERY_RESERVE,
+    CONF_CALC_GRID_ENERGY,
     CONF_CALC_SOLAR_POWER,
     CONF_ENERGY_OFFSETS,
     CONF_HOST,
@@ -56,8 +59,7 @@ from .const import (
     ECOFLOW_PORTAL_TOTALS,
     ENERGY_SENSOR_MAP,
     EVENT_COMMAND_EXPIRED,
-    EVENT_READING_CHECK_CLEARED,
-    EVENT_READING_CHECK_FAILED,
+    EVENT_FIRMWARE_CHANGED,
     FIRMWARE_VERSION,
     HELD_TOTAL_ISSUE_AFTER_S,
     MAX_BATTERY_CAPACITY_WH,
@@ -82,6 +84,7 @@ from .energy_processor import (
     HeldTotal,
     offsets_from,
 )
+from .grid_energy import GridEnergyIntegrator
 from .ids import system_id
 from .modbus import ModbusClient, ModbusReadRejected, create_client
 from .models import (
@@ -95,7 +98,8 @@ from .models import (
     battery_reserve_for,
     encode_register,
 )
-from .reading_checks import KEYS_BY_CHECK, Finding
+from .reading_checks import KEYS_BY_CHECK
+from .reading_checks import REPORTED as READING_CHECKS_REPORTED
 from .telemetry import (
     TelemetryData,
     calculate_derived_values,
@@ -115,6 +119,13 @@ def identity_mismatch_issue_id(entry: ConfigEntry) -> str:
 
 def held_totals_issue_id(entry: ConfigEntry) -> str:
     return f"energy_totals_held_{entry.entry_id}"
+
+
+GRID_ENERGY_ISSUE_PREFIX = "grid_energy_not_counted_"
+
+
+def grid_energy_issue_id(entry: ConfigEntry) -> str:
+    return f"{GRID_ENERGY_ISSUE_PREFIX}{entry.entry_id}"
 
 
 def battery_power_limits(capacity_wh: float) -> tuple[int, int]:
@@ -158,8 +169,9 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     _pinned_serial: str | None = None
     # The totals the held-totals issue was last raised for.
     _held_issue_keys: frozenset[str] = frozenset()
-    # The failed reading check last announced.
-    _announced_finding: Finding | None = None
+    # Tells the user about the reading checks' findings.
+    _announcer: Announcer
+    _grid_energy_issue_raised: bool = False
     # The checks the last poll failed and the words it read, to tell when one
     # starts failing and to show what came before.
     _failing_before: frozenset[str] = frozenset()
@@ -200,6 +212,10 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ena_calc_solar_power = config_entry.options.get(
             CONF_CALC_SOLAR_POWER, False
         )
+        self._ena_calc_grid_energy = config_entry.options.get(
+            CONF_CALC_GRID_ENERGY, False
+        )
+        self._grid_energy = GridEnergyIntegrator()
         self.inverter_model = InverterModel(
             config_entry.options.get(CONF_INVERTER_MODEL, DEFAULT_INVERTER_MODEL)
         )
@@ -226,6 +242,7 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._modbus_client.block_writes("identity_unverified")
         self._last_checked_data: dict[str, Any] = {}
         self._last_checked_time: datetime | None = None
+        self._announcer = Announcer()
 
         self.control = ControlManager(
             self._modbus_client,
@@ -346,6 +363,7 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "reading_check_snapshots": list(self._check_snapshots),
             **self.control.dump_state(),
             **self._energy_processor.dump_state(),
+            "grid_energy": self._grid_energy.dump_state(),
         }
 
     async def async_load_persisted_state(self) -> None:
@@ -380,6 +398,7 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_checked_data = stored.get("last_checked_data") or {}
         self._last_checked_time = parse_datetime(stored.get("last_checked_time"))
         self._energy_processor.load_state(stored)
+        self._grid_energy.load_state(stored.get("grid_energy"))
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -567,11 +586,17 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # batteries are devices of the entry too, with firmware of their own.
         registry = device_registry.async_get(self.hass)
         inverter = (DOMAIN, system_id(self.config_entry))
+        inverter_id: str | None = None
         for device in device_registry.async_entries_for_config_entry(
             registry, self.config_entry.entry_id
         ):
             if inverter in device.identifiers:
                 registry.async_update_device(device.id, sw_version=firmware)
+                inverter_id = device.id
+        self.hass.bus.async_fire(
+            EVENT_FIRMWARE_CHANGED,
+            {ATTR_DEVICE_ID: inverter_id, ATTR_FROM: previous, ATTR_TO: firmware},
+        )
 
     async def _async_read_device_info_extra(self) -> None:
         """Read the protocol version and device address, where the device has them.
@@ -668,6 +693,18 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._consecutive_modbus_disabled_reads = 0
         return data
 
+    async def async_poll_failed(self, answers_before: int) -> None:
+        """Count a failed poll or setup toward an outage, unless it got an answer.
+
+        A refusal, a device-info read that confirmed nothing, or blocks that came
+        back before the poll ran out of time all show the inverter is there.
+        *answers_before* is the client's count of answers when it started.
+        """
+        if self._modbus_client.answers > answers_before:
+            outage.async_answered(self.hass, self.config_entry)
+            return
+        await outage.async_failed(self.hass, self.config_entry, self.host, self.port)
+
     def _read_failed(self) -> None:
         self._modbus_client.close()
         # A shared link can reconnect without us seeing it drop.
@@ -745,6 +782,68 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception:
             _LOGGER.exception("Could not update the held energy totals issue")
 
+    @property
+    def grid_energy_not_counted(self) -> bool:
+        """Whether the grid energy registers stay at 0 while Grid Power reads.
+
+        Only while grid energy is not calculated: with it, there is nothing to fix.
+        """
+        return not self._ena_calc_grid_energy and (
+            self._grid_energy.registers_not_counting(dt.now())
+        )
+
+    @callback
+    def _async_update_grid_energy_issue_safely(self) -> None:
+        """Update the grid energy issue without ever failing the poll it follows."""
+        try:
+            self._async_update_grid_energy_issue()
+        except Exception:
+            _LOGGER.exception("Could not update the grid energy issue")
+
+    @callback
+    def _async_update_grid_energy_issue(self) -> None:
+        """Offer to calculate grid energy while its registers do not count.
+
+        Never turned on by itself: a register can read a bogus 0 for hours, and
+        the integrated totals are an estimate, so the user decides.
+        """
+        not_counted = self.grid_energy_not_counted
+        if not_counted == self._grid_energy_issue_raised:
+            return
+        self._grid_energy_issue_raised = not_counted
+        issue_id = grid_energy_issue_id(self.config_entry)
+        if not not_counted:
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            return
+        _LOGGER.warning(
+            "The grid energy registers have read 0 since %s while %.2f kWh went "
+            "through the grid; grid energy can be calculated from Grid Power instead",
+            self._grid_energy.zero_since,
+            self._grid_energy.kwh_while_zero,
+        )
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=True,
+            is_persistent=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="grid_energy_not_counted",
+            translation_placeholders={"host": str(self.host)},
+            data={"entry_id": self.config_entry.entry_id},
+        )
+
+    @callback
+    def async_enable_grid_energy_calculation(self) -> None:
+        """Turn grid energy calculation on, which the entry's reload applies."""
+        _LOGGER.warning(
+            "Calculating grid energy from Grid Power, as confirmed in repairs"
+        )
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            options={**self.config_entry.options, CONF_CALC_GRID_ENERGY: True},
+        )
+
     # ── Control stepping aside ────────────────────────────────────────────────
 
     def _async_track_reading_checks_safely(self) -> None:
@@ -756,20 +855,14 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _async_track_reading_checks(self) -> None:
-        """Announce a failed check and its end as events, which the logbook shows.
-
-        Not raised in repairs: what fails one, an outage, a battery the battery
-        saver turned off or an inverter fault, is nothing the user can fix, and
-        Control Status already shows why control stepped aside.
-        """
-        finding = self.control.reading_checks.active
-        previous, self._announced_finding = self._announced_finding, finding
-        # Another check standing for the same state is not news.
-        if (finding and finding.status) != (previous and previous.status):
-            if previous is not None:
-                self._fire_check_event(EVENT_READING_CHECK_CLEARED, previous)
-            if finding is not None:
-                self._fire_check_event(EVENT_READING_CHECK_FAILED, finding)
+        """Announce the findings that started or ended with this poll."""
+        self._announcer.update(
+            self.hass,
+            self.config_entry,
+            str(self.host),
+            self.control.reading_checks.findings,
+            dt.now(),
+        )
 
     def _record_check_snapshots(self, data: Mapping[str, Any]) -> None:
         """Keep the readings of a poll in which a check starts failing.
@@ -779,7 +872,9 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         readings the check judged.
         """
         raw = self.raw_registers
-        failing = self.control.reading_checks.failing
+        # Evidence for another check, such as counters a model updates late, would
+        # push out the snapshots of the checks that matter.
+        failing = self.control.reading_checks.failing & READING_CHECKS_REPORTED
         for check in sorted(failing - self._failing_before):
             self._check_snapshots.append(
                 {
@@ -798,20 +893,6 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def reading_check_snapshots(self) -> list[dict[str, Any]]:
         """Return the readings of the checks that last started failing, oldest first."""
         return list(self._check_snapshots)
-
-    @callback
-    def _fire_check_event(self, event_type: str, finding: Finding) -> None:
-        devices = device_registry.async_entries_for_config_entry(
-            device_registry.async_get(self.hass), self.config_entry.entry_id
-        )
-        self.hass.bus.async_fire(
-            event_type,
-            {
-                ATTR_DEVICE_ID: devices[0].id if devices else None,
-                ATTR_STATUS: str(finding.status),
-                ATTR_CHECK: finding.check,
-            },
-        )
 
     @callback
     def _async_update_held_totals_issue(self) -> None:
@@ -945,6 +1026,10 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for key, held in processor.held.items()
             },
             **processor.dump_state(),
+            "grid_energy": {
+                "calculated": self._ena_calc_grid_energy,
+                **self._grid_energy.dump_state(),
+            },
         }
 
     @property
@@ -980,7 +1065,9 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @property
     def _own_keys(self) -> frozenset[str]:
         """Return the keys the coordinator's own processing reads."""
-        return TelemetryData.keys(REGISTERS_BY_KEY) | ENERGY_KEYS
+        # Grid Power is integrated into grid energy, or watched for whether its
+        # registers count.
+        return TelemetryData.keys(REGISTERS_BY_KEY) | ENERGY_KEYS | {"grid_power"}
 
     def _plan_reads(self) -> None:
         """Group the registers to read, leaving out what nothing asks for."""
@@ -1148,13 +1235,17 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._last_checked_time
 
     async def _async_update_data(self) -> dict[str, Any]:
+        answers = self._modbus_client.answers
         try:
             raw_data = await self.async_get_raw_data()
         except IdentityMismatch:
             self._status = CoordinatorStatus.IDENTITY_MISMATCH
+            # Another device, but it answered; its own issue says what is wrong.
+            outage.async_answered(self.hass, self.config_entry)
             raise
         except UpdateFailed as err:
             self._status = CoordinatorStatus.RECONNECT_FAILED
+            await self.async_poll_failed(answers)
             raise UpdateFailed(
                 "Could not reconnect to the inverter; retrying in 30 s",
                 retry_after=30,
@@ -1162,9 +1253,11 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if raw_data is None:
             self._status = CoordinatorStatus.READ_FAILED
+            await self.async_poll_failed(answers)
             raise UpdateFailed(
                 "Read failed; entities stay unavailable until the next successful read."
             )
+        outage.async_answered(self.hass, self.config_entry)
 
         try:
             if "battery_capacity" in raw_data:
@@ -1173,7 +1266,7 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             self._size_battery_limits(raw_data.get("battery_capacity"))
             result = self._energy_processor.validate_totals(
-                self._energy_processor.apply_offsets(raw_data),
+                self._with_grid_energy(raw_data),
                 self._last_checked_data,
                 self._last_checked_time,
             )
@@ -1207,10 +1300,17 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_checked_data = dict(result)
             self._last_checked_time = dt.now()
             self._take_long_held_inverter_only_totals()
-            self._status = CoordinatorStatus.SUCCESS
+            # A poll that ran fine can still bring readings the inverter no
+            # longer updates (#227), which "success" would hide.
+            self._status = (
+                CoordinatorStatus.READINGS_STALLED
+                if self.control.reading_checks.stale
+                else CoordinatorStatus.SUCCESS
+            )
             if self._store is not None:
                 self._store.async_delay_save(self._persisted_state, STATE_SAVE_DELAY_S)
             self._async_update_held_totals_issue_safely()
+            self._async_update_grid_energy_issue_safely()
 
             return dict(result)
         except Exception:
@@ -1218,6 +1318,38 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # entities unavailable, rather than publishing an empty frame.
             self._status = CoordinatorStatus.PROCESSING_FAILED
             raise
+
+    def _with_grid_energy(self, raw_data: Mapping[str, Any]) -> dict[str, Any]:
+        """Return the device's readings, offset, with the grid totals to validate.
+
+        With grid energy calculated, the grid totals are integrated from Grid Power
+        instead. They already continue from the totals published, so no offset is
+        added to them. The (Device) sensors still show what the inverter reports.
+        """
+        integrator = self._grid_energy
+        if not self._ena_calc_grid_energy:
+            integrator.stop()
+        elif not integrator.active:
+            integrator.start(self._last_checked_data)
+            _LOGGER.info(
+                "Calculating grid energy from Grid Power, from %s",
+                integrator.totals(),
+            )
+        now = dt.now()
+        # A Grid Power the reading checks distrust, such as one frozen while the
+        # inverter stalls, would count energy that never flowed: take it as missing.
+        # The checks run later in the poll, so this is the last poll's verdict.
+        power = (
+            None
+            if "grid_power" in self.control.reading_checks.distrusted
+            else raw_data.get("grid_power")
+        )
+        kwh = sum(integrator.add(power, now))
+        integrator.observe_registers(raw_data, kwh, now)
+        result = self._energy_processor.apply_offsets(raw_data)
+        if integrator.active:
+            result.update(integrator.totals())
+        return result
 
     def _hold_battery_capacity(self, capacity_wh: float | None) -> float | None:
         """Return a plausible capacity, else the last one read.

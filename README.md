@@ -47,6 +47,20 @@ A system set up through the cloud alone can get its Modbus address later through
 
 ## Options
 
+With Modbus, the options are those of EF-PowerOcean-TcpModbus, among them:
+
+- **Calculation of grid energy:** for inverters whose grid import and export
+  registers stay at 0 while Grid Power reads right. Grid import and export are
+  then calculated from Grid Power, an estimate within a few percent of the
+  meter. Off by default; a repairs issue offers it when the registers have read
+  0 for a day while Grid Power showed energy flowing.
+- **Alert verbosity:** how much is raised under Settings > Repairs. Essential
+  (the default) raises only what you must act on. Readings adds readings that
+  cannot be trusted, Detailed adds the connection's health, and Debug adds
+  every warning and error the integration logs, the cloud's and MQTT's
+  included. Each alert can be ignored; going back to Essential forgets the
+  ignored ones.
+
 For a system with the EcoFlow cloud, the options have three more fields, as in
 powerocean_single_phase. All are off or empty at first.
 
@@ -116,6 +130,22 @@ Not ready yet; the integration is still in development. When it is:
 4. Change automations and scripts that call `powerocean_single_phase.add_schedule`,
    `update_schedule` or `delete_schedule` to the `ef_powerocean_hybrid` actions.
 5. Turn on the same options (MQTT, live power, max schedule power).
+
+## Troubleshooting
+
+- **Repairs shows "The inverter stopped answering Modbus" or "is not
+  reachable":** the inverter has not answered over Modbus for at least 5
+  minutes. "Stopped answering" means the port takes connections but sends no
+  replies; "not reachable" means nothing answers on the port. Check that the
+  inverter is powered and has the same IP address, and use **Reconfigure** if
+  it moved. In a few cases a firmware update has switched Modbus TCP off: ask
+  your installer to enable it again in the EcoFlow Pro app. With the EcoFlow
+  cloud set up, the cloud's values stand in meanwhile. The issue clears with
+  the next good read.
+- **Repairs shows "Modbus is disabled on the inverter":** the inverter answers,
+  but every value reads 0. Ask your installer to enable Modbus TCP.
+- **Repairs shows "stopped updating its readings":** the inverter answers, but
+  most readings stand still. Restart the inverter as its manual describes.
 
 ## Requirements
 

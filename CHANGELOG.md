@@ -69,6 +69,27 @@
   connection state, whether MQTT is on, the modules' firmware and the last
   cloud response, with every serial replaced by a placeholder.
 
+- From EF-PowerOcean-TcpModbus v2.10.0:
+  - A repairs issue when the inverter has not answered over Modbus for 5
+    minutes, naming whether nothing answers on the port or the port takes
+    connections but sends no Modbus replies (as after some firmware updates).
+    With the EcoFlow cloud set up, the 30-second checks while the cloud carries
+    the system keep counting, so the issue also shows then. Setup and
+    Reconfigure name a silent inverter too.
+  - A logbook entry and an event when the inverter's firmware changes, for the
+    inverter's device.
+  - Reading checks per reading: frozen readings are judged one by one, a
+    stalled inverter raises a repairs issue, a Reading Check diagnostic sensor
+    shows each finding, and Coordinator Status shows "Readings stalled".
+    Readings found wrong come from the EcoFlow cloud where it is connected.
+  - The option "Alert verbosity" (Modbus only): from Essential, the default, up
+    to Debug, which raises every warning and error the integration logs,
+    including the cloud's and MQTT's. Each alert can be ignored. The Modbus
+    client counts its writes and reconnects for it.
+  - The option "Calculation of grid energy" (Modbus only), and a repairs issue
+    that offers it when the inverter's grid energy registers stay at 0 for a
+    day while Grid Power shows energy flowing.
+
 ### Changed
 
 - Its own icon: a battery joined to the house (local Modbus) and the cloud,

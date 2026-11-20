@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
@@ -344,6 +345,12 @@ class ModbusClient:
         # Stops a reconnect in its backoff from reopening the link after unload.
         self._closed = False
         self._write_block: tuple[str, dict[str, str]] | None = None
+        # Reads the device replied to, a refusal included. Compared across a poll,
+        # it tells a slow or refusing inverter from a silent one.
+        self.answers = 0
+        # Writes sent, by address, and reconnects started, for the alerts.
+        self.writes: Counter[int] = Counter()
+        self.reconnects = 0
 
     @property
     def connected(self) -> bool:
@@ -380,6 +387,7 @@ class ModbusClient:
         The backoff waits outside the lock, so writes and unload are not stalled.
         """
         _LOGGER.debug("Modbus TCP is not connected. Start reconnect!")
+        self.reconnects += 1
         attempts = len(RECONNECT_DELAYS_S)
 
         for attempt, delay in enumerate(RECONNECT_DELAYS_S, start=1):
@@ -411,13 +419,16 @@ class ModbusClient:
         """Read *count* holding registers starting at *address*."""
         async with self._lock:
             try:
-                return await self._link.read_holding_registers(address, count)
+                registers = await self._link.read_holding_registers(address, count)
             except DeviceRefused as err:
+                self.answers += 1
                 raise ModbusReadRejected(
                     f"Modbus error response at 0x{address:04X} with "
                     f"Exception-Code {err.exception_code}",
                     exception_code=err.exception_code,
                 ) from err
+            self.answers += 1
+            return registers
 
     async def async_write(
         self, address: int, words: Sequence[int], *, what: str
@@ -440,6 +451,7 @@ class ModbusClient:
                 },
             )
         values = list(words)
+        self.writes[address] += 1
         _LOGGER.debug(
             "Sending Modbus write command [%s]: %s as %s to address %s",
             "FC6" if len(values) == 1 else "FC16",

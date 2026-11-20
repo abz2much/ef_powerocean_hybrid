@@ -5,19 +5,21 @@ from __future__ import annotations
 import socket
 from collections.abc import AsyncIterator
 from datetime import timedelta
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_fire_time_changed,
 )
 
-from custom_components.ef_powerocean_hybrid import config_flow, const
+from custom_components.ef_powerocean_hybrid import config_flow, const, outage
 from custom_components.ef_powerocean_hybrid import modbus as modbus_module
 from tests.cloud.conftest import SetUp
 from tests.cloud.fakes import CLOUD_SN, SERIAL, FakeApi, model86_response
@@ -161,6 +163,45 @@ async def test_the_watch_stops_when_the_entry_unloads(
         await hass.async_block_till_done()
 
     probe.assert_not_awaited()
+
+
+async def test_a_modbus_failure_at_setup_starts_an_outage(
+    down_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    """The cloud carries the system, but the inverter is still not answering."""
+    await set_up_hybrid(down_entry, FakeApi(fetch=[model86_response()]))
+
+    assert down_entry.entry_id in outage._outages
+
+
+async def test_the_not_answering_issue_is_raised_while_the_cloud_runs(
+    hass: HomeAssistant,
+    down_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    freezer: Any,
+) -> None:
+    """The probes go on counting the outage until the issue is due."""
+    await set_up_hybrid(down_entry, FakeApi(fetch=[model86_response()]))
+    issue_id = outage.issue_id(down_entry)
+
+    with (
+        patch.object(
+            config_flow, "async_read_device_settings", new=AsyncMock(return_value=None)
+        ),
+        patch.object(
+            outage,
+            "async_classify",
+            new=AsyncMock(return_value=outage.Cause.MODBUS_SILENT),
+        ),
+    ):
+        for _ in range(11):  # 11 probes 31 s apart: past the 300 s an issue waits
+            freezer.tick(RETRY)
+            async_fire_time_changed(hass)
+            await hass.async_block_till_done()
+
+    issue = ir.async_get(hass).async_get_issue(const.DOMAIN, issue_id)
+    assert issue is not None
+    assert issue.translation_key == "not_answering_modbus_silent"
 
 
 @pytest.mark.parametrize(
