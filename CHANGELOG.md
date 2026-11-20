@@ -193,6 +193,10 @@
   release has its own stop listener.
 - The stop listeners (this one and MQTT's) no longer log an error when the
   entry unloads after Home Assistant's stop.
+- Switching Modbus Control on first clears the power setpoints and selects the
+  default method, then starts the heartbeat. Without a heartbeat the inverter
+  ignores these writes, so a command left from an earlier session can no
+  longer come back to life with the first beat.
 
 ### Fixed
 

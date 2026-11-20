@@ -726,6 +726,30 @@ class ControlManager:
             await self._async_release()
         await self._heartbeat.async_stop()
 
+    async def _async_clear_before_taking_control(self) -> None:
+        """Clear the setpoints and select the default method, before any beat.
+
+        The inverter may hold a command from an earlier session, which the first
+        beat would bring back to life. Without a beat it stores these writes and
+        ignores them, so this is safe; a failure leaves it to the first poll.
+        """
+        if not self._modbus_client.connected or not self._modbus_client.writes_allowed:
+            return
+        features = {
+            definition.setpoint_key: feature
+            for feature, definition in CONTROL_FEATURES.items()
+            if definition.setpoint_key in self._registers_by_key
+        }
+        try:
+            async with asyncio.timeout(RELEASE_TIMEOUT_S):
+                for feature in features.values():
+                    await self._async_write_setpoint(feature, 0.0)
+                await self._async_write_control_word(
+                    self._compose_control_command(ControlFeature.AUTOMATIC)
+                )
+        except (HomeAssistantError, TimeoutError) as err:
+            _LOGGER.debug("Could not clear the inverter before control: %r", err)
+
     async def _async_release(self) -> None:
         """Tell the inverter to drop the command, before the heartbeat stops.
 
@@ -771,6 +795,7 @@ class ControlManager:
         if enabled:
             # We cannot know what the inverter follows now, so the next poll re-sends.
             self._control_stale = True
+            await self._async_clear_before_taking_control()
             self._heartbeat.start()
         else:
             await self._async_release()

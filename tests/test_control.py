@@ -1186,6 +1186,8 @@ def test_switching_modbus_control_off_hands_back_and_on_takes_control_again(
 
     control._heartbeat.start = Mock()
     asyncio.run(control.async_set_enabled(True))
+    # Switching on cleared what the inverter held; what follows is the poll.
+    write.reset_mock()
     # The restarted heartbeat has landed.
     advance(control, monkeypatch, const.HEARTBEAT_WINDOW_S + 2)
     asyncio.run(control.async_poll({"battery_soc": 50.0}))
@@ -1194,6 +1196,51 @@ def test_switching_modbus_control_off_hands_back_and_on_takes_control_again(
     # The inverter may still follow the old command, so the default is re-sent.
     assert commands(write) == [(const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0000])]
     assert control.status is Status.AUTOMATIC
+
+
+def test_switching_on_clears_the_inverter_before_the_first_beat(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command left from an earlier session would act with the first beat.
+
+    Without a heartbeat the inverter stores these writes and ignores them, so
+    clearing first is safe.
+    """
+    write = allow_writes(control, monkeypatch)
+    control._enabled = False
+    control._battery_saver = True
+    order: list[str] = []
+    write.side_effect = lambda *_args, **_kwargs: order.append("write")
+    control._heartbeat.start = Mock(side_effect=lambda: order.append("beat"))
+
+    asyncio.run(control.async_set_enabled(True))
+
+    sent = commands(write)
+    # Every setpoint at 0, then the default method with battery saver as set
+    assert sorted(sent[:-1]) == sorted(
+        [
+            (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0, 0]),
+            (const.REGISTERS_BY_KEY["system_power_setpoint"].address, [0, 0]),
+        ]
+    )
+    assert sent[-1] == (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0008])
+    assert order == ["write", "write", "write", "beat"]
+
+
+def test_switching_on_without_a_connection_still_switches_on(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first poll after the connection returns sends the command anyway."""
+    write = allow_writes(control, monkeypatch)
+    control._enabled = False
+    control._modbus_client.connected = False
+    control._heartbeat.start = Mock()
+
+    asyncio.run(control.async_set_enabled(True))
+
+    write.assert_not_awaited()
+    assert control.enabled is True
+    control._heartbeat.start.assert_called_once()
 
 
 def test_a_shutdown_releases_the_command_before_the_heartbeat_stops(
