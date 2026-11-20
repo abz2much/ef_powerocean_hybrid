@@ -103,6 +103,28 @@ def beat(control, now: datetime, monkeypatch: pytest.MonkeyPatch) -> bool:
     return asyncio.run(control._heartbeat.async_ensure_fresh())
 
 
+def test_only_a_poll_keeps_the_control_logic_counted_as_running(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The heartbeat follows this: guards and expiry run on each poll's readings."""
+    allow_writes(control, monkeypatch)
+    assert control.deciding is False
+
+    asyncio.run(control.async_poll({"battery_soc": 50.0}))
+    assert control.deciding is True
+
+    limit = 2 * const.DEFAULT_SCAN_INTERVAL_S + 30
+    advance(control, monkeypatch, limit + 1)
+    # A user action re-applies the last poll's readings: no new decision on them.
+    asyncio.run(control.async_apply())
+    assert control.deciding is False
+
+
+def test_the_heartbeat_asks_whether_the_control_logic_is_running(control) -> None:
+    assert control._heartbeat._alive is not None
+    assert control._heartbeat._alive() is control.deciding
+
+
 def test_a_recent_beat_is_reused_and_a_stale_one_is_rewritten(
     control, monkeypatch: pytest.MonkeyPatch
 ) -> None:

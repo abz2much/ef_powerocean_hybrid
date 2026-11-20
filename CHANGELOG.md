@@ -177,6 +177,13 @@
   second entry of this integration, is loaded for the same inverter address:
   two controllers would fight over it. If one is loaded while control is on,
   the next poll switches control off, with a warning in the log.
+- The heartbeat that keeps the inverter following Modbus commands now beats only
+  while the control logic (guards, expiry, modes) has run on a poll within two
+  poll intervals plus 30 seconds. Before, it beat on its own timer whatever
+  happened to the polls, so a bug that stopped the logic would leave the
+  inverter on its last command, such as charging from the grid, for as long as
+  Home Assistant ran. Now the inverter hands back to its app settings within
+  60 seconds, with a warning in the log.
 
 ### Fixed
 

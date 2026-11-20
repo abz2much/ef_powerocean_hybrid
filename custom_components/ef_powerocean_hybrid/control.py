@@ -73,6 +73,9 @@ from .reading_checks import ReadingChecks
 
 _LOGGER = logging.getLogger(__name__)
 
+# Added to two poll intervals before the control logic counts as stopped.
+CONTROL_LOGIC_GRACE_S = 30
+
 # Device states in which control steps aside and leaves the inverter to itself.
 _STEPPED_ASIDE = frozenset(
     {
@@ -293,9 +296,15 @@ class ControlManager:
         self._reserve_native = battery_reserve is ReserveSupport.NATIVE
 
         self._enabled = enabled
+        self._scan_interval_s = scan_interval_s
+        # When a poll's readings last went through the guards, expiry and modes.
+        self._decided_at: datetime | None = None
         # One beating on another clock can be passed in, as for a simulation.
         self._heartbeat = heartbeat or Heartbeat(
-            modbus_client, scan_interval_s=scan_interval_s, start_task=start_task
+            modbus_client,
+            scan_interval_s=scan_interval_s,
+            start_task=start_task,
+            alive=self._control_logic_running,
         )
 
         # A restart stops the heartbeat, so the inverter has already handed control
@@ -375,6 +384,22 @@ class ControlManager:
         self._inputs = ControlInputs()
         # While the control test drives the inverter itself, nothing here writes.
         self._test_running = False
+
+    @property
+    def deciding(self) -> bool:
+        """Return whether the control logic has run on a recent poll."""
+        return self._control_logic_running()
+
+    def _control_logic_running(self) -> bool:
+        """Return whether a poll's readings went through the logic lately.
+
+        Two missed polls and the time a reconnect takes: longer than that, the
+        guards and the expiry have stopped watching the command.
+        """
+        if self._decided_at is None:
+            return False
+        age = (dt.now() - self._decided_at).total_seconds()
+        return age <= 2 * self._scan_interval_s + CONTROL_LOGIC_GRACE_S
 
     @property
     def test_running(self) -> bool:
@@ -1723,6 +1748,8 @@ class ControlManager:
 
         self._one_way_ran = False
         decision = self._desired_command(inputs)
+        if polled:
+            self._decided_at = dt.now()
         if not self._one_way_ran:
             self._handback = GuardHandback()
             self._handback_for = frozenset()

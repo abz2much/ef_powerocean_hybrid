@@ -66,8 +66,14 @@ class Heartbeat:
         *,
         scan_interval_s: float,
         start_task: StartTask | None = None,
+        alive: Callable[[], bool] | None = None,
     ) -> None:
         self._modbus_client = modbus_client
+        # Whether the logic that changes or ends the command still runs. A beat
+        # lets the inverter go on with its last command, so none goes out while
+        # that logic has stopped: the inverter then hands back within its window.
+        self._alive = alive
+        self._paused = False
         self._retry_delays = retry_delays(scan_interval_s)
         self._start_task: StartTask = start_task or (
             lambda coro, name: asyncio.create_task(coro, name=name)
@@ -136,7 +142,8 @@ class Heartbeat:
     async def _run(self) -> None:
         while True:
             try:
-                await self._async_write_heartbeat()
+                if self._may_beat():
+                    await self._async_write_heartbeat()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -146,6 +153,20 @@ class Heartbeat:
                 0.0, HEARTBEAT_JITTER_S
             )
             await asyncio.sleep(delay)
+
+    def _may_beat(self) -> bool:
+        """Return whether the control logic still runs, saying so when it changes."""
+        alive = self._alive is None or self._alive()
+        if not alive and not self._paused:
+            _LOGGER.warning(
+                "Heartbeat paused: the control logic has not run on a recent poll, "
+                "so the inverter hands back to its app settings within %ss",
+                HEARTBEAT_WINDOW_S,
+            )
+        elif alive and self._paused:
+            _LOGGER.info("Heartbeat resumed: the control logic runs again")
+        self._paused = not alive
+        return alive
 
     def _delay_before_next_write(self) -> float:
         """Return how long to wait before writing again.
