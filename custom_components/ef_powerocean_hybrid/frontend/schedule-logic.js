@@ -124,6 +124,16 @@ export function overlaps(start1, end1, start2, end2) {
   );
 }
 
+// Where a new schedule starts: the first free hour, else 00:00-01:00.
+export function firstFreeWindow(schedules) {
+  for (let start = 0; start <= LAST_MINUTE; start += STEP) {
+    const end = (start + 60) % DAY_MINUTES;
+    if (!schedules.some((s) => overlaps(start, end, s.start, s.end)))
+      return { start, end };
+  }
+  return { start: 0, end: 60 };
+}
+
 function onStep(minutes) {
   return (
     Number.isInteger(minutes) &&

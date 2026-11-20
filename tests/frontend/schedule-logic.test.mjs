@@ -9,6 +9,7 @@ import {
   changedFields,
   checkDraft,
   findSchedules,
+  firstFreeWindow,
   overlaps,
   runsOn,
   toHm,
@@ -319,4 +320,14 @@ test("the data to add a schedule on chosen days", () => {
     "sat",
     "sun",
   ]);
+});
+
+test("a new schedule starts in the first free hour", () => {
+  const some = schedules().filter((s) => [13, 14, 15].includes(s.id));
+  // 23:00-02:00, 02:00-06:00 and 06:00-08:00 are taken
+  assert.deepEqual(firstFreeWindow(some), { start: 480, end: 540 });
+});
+
+test("a new schedule starts at 00:00 when no hour is free", () => {
+  assert.deepEqual(firstFreeWindow(schedules()), { start: 0, end: 60 });
 });
