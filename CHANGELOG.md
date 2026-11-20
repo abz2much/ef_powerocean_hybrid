@@ -97,6 +97,11 @@
   Modbus has a current reading, otherwise over the cloud (needs the MQTT
   option). On a system set up through the cloud alone it exists only with the
   MQTT option.
+- With the MQTT option, the backup reserve is one number: it shows the Modbus
+  reading (register 40536) while Modbus has a current one, otherwise the
+  cloud's, and is always written over MQTT. The Modbus "App Backup Reserve"
+  sensor, which shows the same value, is removed then, and comes back when
+  MQTT is turned off.
 - The cloud's state of charge comes from the EMS change report, as in
   powerocean_single_phase, and counts as current while the cloud's updates
   succeed (up to 60 seconds after the last one).

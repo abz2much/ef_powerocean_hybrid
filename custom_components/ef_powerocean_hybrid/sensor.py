@@ -14,6 +14,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 
@@ -27,9 +28,11 @@ from .const import (
     CONF_COUNTER_SOURCE,
     CONF_HOST,
     CONF_INVERTER_MODEL,
+    CONF_MQTT,
     CONTROL_STATUS_SENSOR,
     CONTROL_TEST_SENSOR,
     DAILY_ENERGY_SENSORS_DEVICE_RAW,
+    DOMAIN,
     EFFECTIVE_RESERVE_SENSOR,
     ENERGY_SENSOR_MAP,
     FAULT_KEYS,
@@ -42,6 +45,7 @@ from .display import VALUE_PRECISION, shown_number
 from .energy_processor import DEVICE_TOTAL_KEYS
 from .entity import EcoFlowBaseEntity
 from .fault_names import async_get_fault_names
+from .ids import system_id
 from .joined_sensor import JoinedSensor
 from .models import EnergySensorDef, InverterModel, SensorDef
 from .telemetry import active_fault_codes
@@ -72,10 +76,17 @@ async def async_setup_entry(
     with_cloud = cloud is not None and model == InverterModel.POWEROCEAN_SINGLE_PHASE
     joined = [e for e in CATALOGUE_86 if e.kind == "joined"] if with_cloud else []
 
+    skip = {e.key for e in joined}
+    if with_cloud and entry.options.get(CONF_MQTT, False):
+        # The backup reserve is then one number for both sides (number.py).
+        skip.add(BATTERY_RESERVE_REGISTER_KEY)
+        registry = er.async_get(hass)
+        if app_reserve := registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{system_id(entry)}_{BATTERY_RESERVE_REGISTER_KEY}"
+        ):
+            registry.async_remove(app_reserve)
     if coordinator is not None:
-        _add_modbus_sensors(
-            coordinator, entry, async_add_entities, skip={e.key for e in joined}
-        )
+        _add_modbus_sensors(coordinator, entry, async_add_entities, skip=skip)
     elif CONF_HOST in entry.data:
         # Running on the cloud because Modbus did not answer at start: the
         # Modbus counters keep their last value until the entry reloads.

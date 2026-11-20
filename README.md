@@ -68,6 +68,10 @@ With MQTT on you get:
   confirmation Home Assistant shows an error.
 - **LED brightness:** one number. With Modbus it reads and writes over Modbus
   while Modbus has a current reading, otherwise over MQTT.
+- **Backup reserve:** one number. It shows the Modbus reading while Modbus has
+  a current one, otherwise the cloud's, and is always changed over MQTT. It
+  replaces the Modbus "App Backup Reserve" sensor, which shows the same value
+  and returns when MQTT is turned off.
 - **Scheduled tasks:** a switch per schedule, named after what it does, and an
   "Active schedule" sensor. The actions `add_schedule` (aimed at the inverter
   device), `update_schedule` and `delete_schedule` (aimed at a schedule

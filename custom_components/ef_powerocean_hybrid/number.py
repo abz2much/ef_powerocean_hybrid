@@ -33,7 +33,7 @@ from .const import (
 from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
 from .entity import EcoFlowBaseEntity
 from .ids import system_id
-from .joined_number import LED_NUMBER, JoinedLedNumber
+from .joined_number import LED_NUMBER, JoinedBackupReserve, JoinedLedNumber
 from .models import (
     ControlEntityDef,
     ControlFeature,
@@ -70,6 +70,14 @@ async def async_setup_entry(
             "number", DOMAIN, f"{system_id(entry)}_{LED_NUMBER.key}"
         ):
             registry.async_remove(led)
+        # The backup reserve: Modbus only reads it, so one number for both
+        # sides exists with the cloud integration's MQTT option, as there.
+        if entry.options.get(CONF_MQTT, False):
+            entities.append(JoinedBackupReserve(entry, coordinator, cloud))
+        elif reserve := registry.async_get_entity_id(
+            "number", DOMAIN, f"{system_id(entry)}_backup_reserve"
+        ):
+            registry.async_remove(reserve)
     if coordinator is not None:
         entities.extend(
             _modbus_numbers(entry, coordinator, registry, with_cloud=cloud is not None)

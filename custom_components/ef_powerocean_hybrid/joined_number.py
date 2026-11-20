@@ -1,9 +1,15 @@
-"""The LED brightness, a setting Modbus and the cloud both have, as one entity.
+"""Settings Modbus and the cloud both show, as one number each.
 
-While Modbus is online it is the Modbus integration's number: read from and
-written to register 40541. Otherwise it is the cloud integration's: read from
-the cloud and written over MQTT. It keeps the unique ID of the Modbus number, so
-its entity ID, name, labels and area never change when the cloud is added.
+LED brightness: while Modbus is online it is the Modbus integration's number,
+read from and written to register 40541. Otherwise it is the cloud
+integration's: read from the cloud and written over MQTT. It keeps the unique
+ID of the Modbus number, so its entity ID, name, labels and area never change
+when the cloud is added.
+
+Backup reserve: the Modbus integration only reads it (register 40536, its App
+Backup Reserve sensor); the cloud integration reads and writes it. One number:
+read from Modbus while it is online, else from the cloud, and always written
+over MQTT. It is the cloud integration's number, with its unique ID.
 """
 
 from __future__ import annotations
@@ -13,13 +19,14 @@ from typing import TYPE_CHECKING, Final, Literal
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory
+from homeassistant.const import PERCENTAGE, EntityCategory
 from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, WRITABLE_NUMBERS_MAP
+from .cloud.coordinator import SOC_LIMITS
+from .const import BATTERY_RESERVE_REGISTER_KEY, DOMAIN, WRITABLE_NUMBERS_MAP
 from .ids import system_id
 from .sources import modbus_reading
 
@@ -34,6 +41,7 @@ LED_NUMBER: Final = next(
 )
 # The cloud's datapoint of the same setting
 LED_DATAPOINT: Final = "emsCtrlLedBright"
+RESERVE_DATAPOINT: Final = "sysBatDsgDownLimit"
 # Checked this often even when neither source sends an update, so the entity
 # hands over to the cloud on time when Modbus goes quiet.
 RECHECK: Final = timedelta(seconds=10)
@@ -41,8 +49,8 @@ RECHECK: Final = timedelta(seconds=10)
 type Side = Literal["modbus", "cloud"]
 
 
-class JoinedLedNumber(NumberEntity):
-    """The LED brightness of the inverter in %."""
+class JoinedNumber(NumberEntity):
+    """A setting both sides show: Modbus while online, else the cloud."""
 
     _attr_has_entity_name = True
     _attr_should_poll = False
@@ -50,6 +58,11 @@ class JoinedLedNumber(NumberEntity):
     _attr_mode = NumberMode.SLIDER
     # Changes with every switch of source; not worth a row in the recorder.
     _unrecorded_attributes = frozenset({"source"})
+
+    # The Modbus reading of the same value
+    _modbus_key: str
+    # The unique ID after the system's serial, also the translation key
+    _key: str
 
     def __init__(
         self,
@@ -60,31 +73,23 @@ class JoinedLedNumber(NumberEntity):
         self._modbus = modbus
         self._cloud = cloud
         system = system_id(entry)
-        self._attr_unique_id = f"{system}_{LED_NUMBER.key}"
-        self._attr_translation_key = LED_NUMBER.key
-        self._attr_native_min_value = LED_NUMBER.min_value
-        self._attr_native_max_value = LED_NUMBER.max_value
-        self._attr_native_step = LED_NUMBER.step
-        self._attr_native_unit_of_measurement = LED_NUMBER.unit
+        self._attr_unique_id = f"{system}_{self._key}"
+        self._attr_translation_key = self._key
         self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, system)})
         # What the entity last showed: available, value, source.
         self._shown: tuple[bool, float | None, Side | None] | None = None
 
+    def _cloud_value(self) -> float | None:
+        """Return the cloud's value, if the cloud integration would show it."""
+        raise NotImplementedError
+
     def _pick(self) -> tuple[float, Side] | None:
         """Return the value and its side: Modbus while online, else the cloud."""
         if self._modbus is not None and (
-            reading := modbus_reading(
-                self._modbus, LED_NUMBER.read_key, dt_util.utcnow()
-            )
+            reading := modbus_reading(self._modbus, self._modbus_key, dt_util.utcnow())
         ):
             return reading.value, "modbus"
-        cloud = self._cloud
-        # As the cloud integration's number: only with an MQTT connection.
-        if (
-            cloud.last_update_success
-            and cloud.mqtt is not None
-            and (value := cloud.setting(LED_DATAPOINT)) is not None
-        ):
+        if (value := self._cloud_value()) is not None:
             return value, "cloud"
         return None
 
@@ -110,7 +115,7 @@ class JoinedLedNumber(NumberEntity):
             # The context makes the Modbus coordinator read this register.
             self.async_on_remove(
                 self._modbus.async_add_listener(
-                    self._updated, frozenset({LED_NUMBER.read_key})
+                    self._updated, frozenset({self._modbus_key})
                 )
             )
         self.async_on_remove(self._cloud.async_add_listener(self._updated))
@@ -127,6 +132,24 @@ class JoinedLedNumber(NumberEntity):
     def _rechecked(self, _now: datetime) -> None:
         self._updated()
 
+
+class JoinedLedNumber(JoinedNumber):
+    """The LED brightness of the inverter in %."""
+
+    _modbus_key = LED_NUMBER.read_key
+    _key = LED_NUMBER.key
+    _attr_native_min_value = LED_NUMBER.min_value
+    _attr_native_max_value = LED_NUMBER.max_value
+    _attr_native_step = LED_NUMBER.step
+    _attr_native_unit_of_measurement = LED_NUMBER.unit
+
+    def _cloud_value(self) -> float | None:
+        cloud = self._cloud
+        # As the cloud integration's number: only with an MQTT connection.
+        if cloud.last_update_success and cloud.mqtt is not None:
+            return cloud.setting(LED_DATAPOINT)
+        return None
+
     async def async_set_native_value(self, value: float) -> None:
         """Write over the side the value comes from; raises if not confirmed."""
         picked = self._pick()
@@ -136,4 +159,32 @@ class JoinedLedNumber(NumberEntity):
             )
         else:
             await self._cloud.async_set_led_brightness(int(value))
+        self._updated()
+
+
+class JoinedBackupReserve(JoinedNumber):
+    """The backup reserve of the battery in %, as the EcoFlow app sets it."""
+
+    _modbus_key = BATTERY_RESERVE_REGISTER_KEY
+    _key = "backup_reserve"
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = PERCENTAGE
+
+    def _cloud_value(self) -> float | None:
+        cloud = self._cloud
+        # As the cloud integration's number: with an MQTT connection and the
+        # other values its command sends along.
+        if (
+            cloud.last_update_success
+            and cloud.mqtt is not None
+            and all(name in cloud.soc_limits for name in SOC_LIMITS)
+        ):
+            return cloud.setting(RESERVE_DATAPOINT)
+        return None
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Write over MQTT, the only side that writes it; raises if not confirmed."""
+        await self._cloud.async_set_backup_reserve(int(value))
         self._updated()

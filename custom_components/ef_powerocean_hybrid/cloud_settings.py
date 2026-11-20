@@ -1,8 +1,8 @@
 """Settings sent to the system over the EcoFlow app's MQTT.
 
-Only with the option MQTT: the backup reserve, the surplus solar energy
-delivery and the battery save mode, set as the EcoFlow app does. The LED
-brightness, which Modbus has too, is in joined_number.py. The number and switch
+Only with the option MQTT: the surplus solar energy delivery and the battery
+save mode, set as the EcoFlow app does. The LED brightness and the backup
+reserve, which Modbus shows too, are in joined_number.py. The number and switch
 entities of powerocean_single_phase (v1.0.1), MIT, (c) 2026 niltrip, abz2much.
 """
 
@@ -46,10 +46,8 @@ def setting_numbers(
     hass: HomeAssistant, entry: ConfigEntry, cloud: CloudCoordinator
 ) -> list[CloudPercentSetting]:
     """Return the numbers, if the MQTT option is on."""
-    numbers: list[CloudPercentSetting] = [
-        CloudBackupReserve(cloud, entry),
-        CloudSolarSurplus(cloud, entry),
-    ]
+    # The backup reserve is a joined number (joined_number.py).
+    numbers: list[CloudPercentSetting] = [CloudSolarSurplus(cloud, entry)]
     return cloud_settings(hass, entry, numbers)
 
 
@@ -111,17 +109,6 @@ class CloudSocLimit(CloudPercentSetting):
         return super().available and all(
             name in self.coordinator.soc_limits for name in SOC_LIMITS
         )
-
-
-class CloudBackupReserve(CloudSocLimit):
-    """Backup reserve of the battery in % (sysBatDsgDownLimit)."""
-
-    _attr_translation_key = "backup_reserve"
-    _datapoint = "sysBatDsgDownLimit"
-
-    async def async_set_native_value(self, value: float) -> None:
-        """Send the new backup reserve; raises if the system does not confirm it."""
-        await self.coordinator.async_set_backup_reserve(int(value))
 
 
 class CloudSolarSurplus(CloudSocLimit):

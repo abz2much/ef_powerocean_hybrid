@@ -9,6 +9,11 @@ LED brightness 100, backup reserve 5, charge limit 100 and devSoc 100.
 The LED brightness is also a Modbus setting (register 40541), so it is one
 entity: the Modbus integration's number while Modbus is online, the cloud
 integration's otherwise. Its cloud tests run on a cloud-only entry.
+
+The backup reserve is also a Modbus reading (register 40536, the Modbus
+integration's App Backup Reserve sensor), so it is one number: read from Modbus
+while it is online, else from the cloud, and always written over MQTT, the only
+side that writes it. Its cloud tests run on a cloud-only entry.
 """
 
 from __future__ import annotations
@@ -45,6 +50,10 @@ LED_NUMBER = f"{SERIAL}_{LED_KEY}"
 CLOUD_LED_NUMBER = f"{CLOUD_SN}_{LED_KEY}"
 LED_REGISTER = 40541
 BACKUP_NUMBER = f"{SERIAL}_backup_reserve"
+CLOUD_BACKUP_NUMBER = f"{CLOUD_SN}_backup_reserve"
+RESERVE_REGISTER = 40536
+# The Modbus integration's read-only twin of the backup reserve
+APP_RESERVE_SENSOR = f"{SERIAL}_min_soc_limit"
 SOLAR_NUMBER = f"{SERIAL}_solar_surplus"
 SAVE_SWITCH = f"{SERIAL}_battery_save_mode"
 # Only the cloud has these
@@ -301,14 +310,14 @@ async def test_settings_available_once_mqtt_starts_late(
     """MQTT starts with the cloud's first answer; the settings come with it."""
     api = FakeApi(login=EcoflowConnectionError("offline"), fetch=[model86_response()])
     await _setup(hass, hybrid_entry, set_up_hybrid, api=api)
-    assert _state(hass, BACKUP_NUMBER) == STATE_UNAVAILABLE
+    assert _state(hass, SOLAR_NUMBER) == STATE_UNAVAILABLE
 
     api.recover()
     await hybrid_entry.runtime_data.cloud.async_refresh()
     await hass.async_block_till_done(wait_background_tasks=True)
 
     assert _client().started
-    assert _state(hass, BACKUP_NUMBER) == "5"
+    assert _state(hass, SOLAR_NUMBER) == "100"
 
 
 async def test_settings_unavailable_without_connection(
@@ -321,7 +330,10 @@ async def test_settings_unavailable_without_connection(
 
     assert not FakeMqtt.instances
     for domain, unique_id in SETTINGS:
-        assert _state(hass, unique_id, domain) == STATE_UNAVAILABLE
+        if unique_id != BACKUP_NUMBER:
+            assert _state(hass, unique_id, domain) == STATE_UNAVAILABLE
+    # The backup reserve still shows the Modbus reading
+    assert _source(hass, BACKUP_NUMBER) == "modbus"
 
 
 # LED brightness: Modbus while it is online, the cloud otherwise
@@ -460,8 +472,12 @@ async def test_set_led_brightness_without_acknowledgement(
 
 
 async def test_backup_reserve_entity(
-    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+    hass: HomeAssistant,
+    hybrid_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    inverter: FakeInverter,
 ) -> None:
+    inverter.registers[RESERVE_REGISTER] = 12
     await _setup(hass, hybrid_entry, set_up_hybrid)
 
     entity = er.async_get(hass).async_get(_entity_id(hass, BACKUP_NUMBER))
@@ -470,8 +486,9 @@ async def test_backup_reserve_entity(
     assert entity.translation_key == "backup_reserve"
     state = hass.states.get(entity.entity_id)
     assert state
-    # From the EMS change report
-    assert state.state == "5"
+    # Modbus comes first
+    assert state.state == "12"
+    assert state.attributes["source"] == "modbus"
     assert state.attributes["min"] == 0
     assert state.attributes["max"] == 100
     assert state.attributes["step"] == 1
@@ -479,58 +496,120 @@ async def test_backup_reserve_entity(
 
 
 async def test_set_backup_reserve(
-    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+    hass: HomeAssistant, cloud_entry: MockConfigEntry, set_up_hybrid: SetUp
 ) -> None:
+    await _setup(hass, cloud_entry, set_up_hybrid)
+
+    await _set(hass, CLOUD_BACKUP_NUMBER, 16)
+
+    # Charge limit and devSoc are sent unchanged, as the app does
+    assert _client().soc_limit_commands == [(100, 16, 100)]
+    assert _state(hass, CLOUD_BACKUP_NUMBER) == "16"
+    assert cloud_entry.runtime_data.cloud.data[DISCHARGE_LIMIT] == 16
+
+
+async def test_backup_reserve_written_over_mqtt_while_modbus_is_online(
+    hass: HomeAssistant,
+    hybrid_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    inverter: FakeInverter,
+) -> None:
+    """Only the cloud integration writes it; the Modbus one only reads it."""
+    inverter.registers[RESERVE_REGISTER] = 12
     await _setup(hass, hybrid_entry, set_up_hybrid)
 
     await _set(hass, BACKUP_NUMBER, 16)
 
-    # Charge limit and devSoc are sent unchanged, as the app does
     assert _client().soc_limit_commands == [(100, 16, 100)]
-    assert _state(hass, BACKUP_NUMBER) == "16"
-    assert hybrid_entry.runtime_data.cloud.data[DISCHARGE_LIMIT] == 16
+    assert inverter.registers[RESERVE_REGISTER] == 12
+
+
+async def test_backup_reserve_from_the_cloud_when_modbus_fails(
+    hass: HomeAssistant,
+    hybrid_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    inverter: FakeInverter,
+) -> None:
+    inverter.registers[RESERVE_REGISTER] = 12
+    await _setup(hass, hybrid_entry, set_up_hybrid)
+
+    await _fail_modbus(hass, hybrid_entry)
+
+    assert _state(hass, BACKUP_NUMBER) == "5"
+    assert _source(hass, BACKUP_NUMBER) == "cloud"
+
+
+async def test_backup_reserve_unavailable_without_modbus_or_mqtt(
+    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    api = FakeApi(fetch=[model86_response()])
+    api.mqtt_credentials = EcoflowConnectionError("offline")
+    await _setup(hass, hybrid_entry, set_up_hybrid, api=api)
+
+    await _fail_modbus(hass, hybrid_entry)
+
+    assert _state(hass, BACKUP_NUMBER) == STATE_UNAVAILABLE
+
+
+@pytest.mark.parametrize("mqtt", (False, True))
+async def test_one_backup_reserve_on_a_hybrid_entry(
+    hass: HomeAssistant,
+    hybrid_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    mqtt: bool,
+) -> None:
+    """With MQTT the number, without it the Modbus sensor; never both."""
+    # The Modbus sensor, as an entry that had it before MQTT was turned on
+    er.async_get(hass).async_get_or_create(
+        "sensor", const.DOMAIN, APP_RESERVE_SENSOR, config_entry=hybrid_entry
+    )
+
+    await _setup(hass, hybrid_entry, set_up_hybrid, mqtt=mqtt)
+
+    assert _registered(hass, "number", BACKUP_NUMBER) is mqtt
+    assert _registered(hass, "sensor", APP_RESERVE_SENSOR) is not mqtt
 
 
 async def test_backup_reserve_sends_the_reported_charge_limit(
-    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+    hass: HomeAssistant, cloud_entry: MockConfigEntry, set_up_hybrid: SetUp
 ) -> None:
-    await _setup(hass, hybrid_entry, set_up_hybrid)
+    await _setup(hass, cloud_entry, set_up_hybrid)
 
     # Changed in the app: the system reports both values
     await _report(hass, {"sysBatChgUpLimit": 90, "sysBatDsgDownLimit": 20})
-    assert _state(hass, BACKUP_NUMBER) == "20"
+    assert _state(hass, CLOUD_BACKUP_NUMBER) == "20"
 
-    await _set(hass, BACKUP_NUMBER, 10)
+    await _set(hass, CLOUD_BACKUP_NUMBER, 10)
 
     assert _client().soc_limit_commands == [(90, 10, 100)]
 
 
 async def test_backup_reserve_not_sent_without_dev_soc(
-    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+    hass: HomeAssistant, cloud_entry: MockConfigEntry, set_up_hybrid: SetUp
 ) -> None:
     response = copy.deepcopy(model86_response())
     del response["data"]["quota"]["JTS1_EMS_PARAM_CHANGE_REPORT"]["devSoc"]
-    await _setup(hass, hybrid_entry, set_up_hybrid, api=FakeApi(fetch=[response]))
+    await _setup(hass, cloud_entry, set_up_hybrid, api=FakeApi(fetch=[response]))
 
-    assert _state(hass, BACKUP_NUMBER) == STATE_UNAVAILABLE
+    assert _state(hass, CLOUD_BACKUP_NUMBER) == STATE_UNAVAILABLE
     with pytest.raises(HomeAssistantError) as error:
-        await hybrid_entry.runtime_data.cloud.async_set_backup_reserve(16)
+        await cloud_entry.runtime_data.cloud.async_set_backup_reserve(16)
 
     assert error.value.translation_key == "soc_limits_unknown"
     assert _client().soc_limit_commands == []
 
 
 async def test_set_backup_reserve_without_acknowledgement(
-    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+    hass: HomeAssistant, cloud_entry: MockConfigEntry, set_up_hybrid: SetUp
 ) -> None:
-    await _setup(hass, hybrid_entry, set_up_hybrid)
+    await _setup(hass, cloud_entry, set_up_hybrid)
     SettingsMqtt.acknowledge = False
 
     with patch(TIMEOUT, 0.01), pytest.raises(HomeAssistantError) as error:
-        await _set(hass, BACKUP_NUMBER, 16)
+        await _set(hass, CLOUD_BACKUP_NUMBER, 16)
 
     assert error.value.translation_key == "not_acknowledged"
-    assert _state(hass, BACKUP_NUMBER) == "5"
+    assert _state(hass, CLOUD_BACKUP_NUMBER) == "5"
 
 
 # Surplus solar energy delivery
@@ -694,7 +773,7 @@ async def test_backup_reserve_kept_for_the_next_command(
 
     # Not (100, 5, 80): that would undo the backup reserve on the system
     assert _client().soc_limit_commands == [(100, 16, 100), (100, 16, 80)]
-    assert _state(hass, BACKUP_NUMBER) == "16"
+    assert hybrid_entry.runtime_data.cloud.data[DISCHARGE_LIMIT] == 16
 
 
 async def test_reported_setting_kept_while_the_cloud_is_behind(
