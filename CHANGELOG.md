@@ -59,6 +59,9 @@
 
 ### Changed
 
+- Its own icon: a battery joined to the house (local Modbus) and the cloud,
+  instead of the icon copied from EF-PowerOcean-TcpModbus.
+- The version in the manifest is 0.3.0.
 - Entities and the device are keyed by the inverter's serial instead of the
   config entry ID.
 - Setting up a PowerOcean Single Phase is refused if the inverter reports a
