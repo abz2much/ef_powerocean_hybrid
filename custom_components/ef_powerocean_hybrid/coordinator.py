@@ -43,7 +43,6 @@ from .const import (
     CONF_MAX_BATTERY_DISCHARGED_POWER,
     CONF_MAX_GRID_POWER,
     CONF_MAX_SOLAR_POWER,
-    CONF_MODBUS_CONTROL,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
     DEFAULT_BATTERY_COUNT,
@@ -249,7 +248,8 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             registers_by_key=self._registers_by_key,
             limits=self.limits,
             inverter_model=self.inverter_model,
-            enabled=config_entry.options.get(CONF_MODBUS_CONTROL, False),
+            # Always off at the start; the owner switches it on.
+            enabled=False,
             scan_interval_s=self.scan_interval,
             on_update=self.async_update_listeners,
             on_refresh=self.async_refresh,

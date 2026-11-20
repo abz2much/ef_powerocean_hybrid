@@ -641,7 +641,6 @@ class ControlManager:
     def dump_state(self) -> dict[str, Any]:
         """Return what must survive a restart, in a JSON-serializable form."""
         return {
-            "modbus_control": self._enabled,
             "feature_power": {
                 str(feature): power for feature, power in self._feature_power.items()
             },
@@ -656,10 +655,10 @@ class ControlManager:
         }
 
     def load_state(self, stored: dict[str, Any]) -> None:
-        """Restore what each mode would command, but never which one was selected."""
-        if (enabled := stored.get("modbus_control")) is not None:
-            self._enabled = bool(enabled)
-            self._control_stale = self._enabled
+        """Restore what each mode would command, but never which one was selected,
+        nor whether Modbus Control was on."""
+        # Not whether Modbus Control was on (older releases saved it): it always
+        # starts off, so a crash cannot bring control back by itself.
         for feature in self._feature_power:
             if (
                 power := (stored.get("feature_power") or {}).get(str(feature))

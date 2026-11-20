@@ -1288,10 +1288,13 @@ def test_the_status_reports_no_control_until_the_device_answers(
     assert control.status is Status.NO_MODBUS_CONTROL
 
 
-def test_the_parameters_survive_a_restart_but_the_selected_mode_does_not(
+def test_the_parameters_survive_a_restart_but_the_mode_and_control_do_not(
     control,
 ) -> None:
-    """Re-arming a mode the user cannot see would command the inverter silently."""
+    """Re-arming a mode the user cannot see would command the inverter silently.
+
+    Modbus Control starts off after every restart too (owner, 20 Nov 2026).
+    """
     control._feature_power[Feature.CHARGE_BATTERY] = 4000.0
     control._charge_limit_soc = 80.0
     # A restart does not clear battery saver on the device, so it must not lie.
@@ -1301,6 +1304,8 @@ def test_the_parameters_survive_a_restart_but_the_selected_mode_does_not(
     control._feature = Feature.CHARGE_BATTERY
 
     stored = control.dump_state()
+    # As an older release saved it
+    stored["modbus_control"] = True
     control._enabled = False
     control._feature_power[Feature.CHARGE_BATTERY] = 0.0
     control._battery_saver = False
@@ -1309,7 +1314,7 @@ def test_the_parameters_survive_a_restart_but_the_selected_mode_does_not(
     control._feature = Feature.AUTOMATIC
     control.load_state(stored)
 
-    assert control.enabled is True
+    assert control.enabled is False
     assert control.feature_power(Feature.CHARGE_BATTERY) == 4000.0
     assert control.charge_limit_soc == 80.0
     assert control.battery_saver_commanded is True

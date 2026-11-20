@@ -130,16 +130,13 @@ def run_update(
     return asyncio.run(coordinator._async_update_data())
 
 
-@pytest.mark.parametrize(
-    ("entry_options", "expected"),
-    (({}, False), ({const.CONF_MODBUS_CONTROL: True}, True)),
-)
-async def test_modbus_control_enablement_comes_from_config_entry(
+@pytest.mark.parametrize("entry_options", ({}, {const.CONF_MODBUS_CONTROL: True}))
+async def test_modbus_control_starts_off_whatever_the_entry_options_say(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
     entry_options: dict,
-    expected: bool,
 ) -> None:
+    """The owner switches it on after every start (decided 20 Nov 2026)."""
     monkeypatch.setattr(
         coordinator_module,
         "create_client",
@@ -154,7 +151,7 @@ async def test_modbus_control_enablement_comes_from_config_entry(
 
     instance = coordinator_module.EcoflowCoordinator(hass, config_entry)
 
-    assert instance.control.enabled is expected
+    assert instance.control.enabled is False
 
 
 @pytest.mark.parametrize(

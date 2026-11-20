@@ -167,6 +167,13 @@
 - The inverter's firmware comes from Modbus and is shown on the inverter's
   device only; it no longer overwrites the firmware of other devices.
 
+### Control safeguards
+
+- Modbus Control always starts off when Home Assistant starts or the entry
+  loads; switch it on yourself. Before, it came back as it was, and switching
+  it off was saved only 30 seconds later, so a crash in that time turned it
+  back on. An old "Modbus Control" setting in the entry's options is ignored.
+
 ### Fixed
 
 - With Modbus Control off, a reconnect no longer makes the next poll write a

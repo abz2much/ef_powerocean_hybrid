@@ -770,6 +770,10 @@ def _closed_port() -> int:
 
 
 def _controlled_entry(port: int) -> MockConfigEntry:
+    """An entry whose options once switched Modbus Control on at the start.
+
+    It now always starts off, so no heartbeat can leak from a failed setup.
+    """
     return MockConfigEntry(
         domain=const.DOMAIN,
         data={const.CONF_HOST: HOST, const.CONF_PORT: port},
@@ -841,8 +845,11 @@ async def test_unloading_stops_the_heartbeat_and_closes_the_client(
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    assert len(_heartbeats()) == 1
+    assert _heartbeats() == []  # Modbus Control starts off
     coordinator: EcoflowCoordinator = entry.runtime_data.modbus
+    await coordinator.control.async_set_enabled(True)
+    await hass.async_block_till_done()
+    assert len(_heartbeats()) == 1
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

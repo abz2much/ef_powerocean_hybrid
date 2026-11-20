@@ -229,7 +229,15 @@ async def test_battery_controls_are_unavailable_while_modbus_control_is_off(
 async def test_a_command_that_runs_out_returns_to_automatic_and_says_why(
     hass: HomeAssistant, set_up: SetUp, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    entry = await set_up(**{const.CONF_MODBUS_CONTROL: True})
+    entry = await set_up()
+    # Modbus Control always starts off; the owner switches it on.
+    await hass.services.async_call(
+        "switch",
+        "turn_on",
+        {"entity_id": _entity_id(hass, entry, "switch", "modbus_control")},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
     device = dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id)[0]
     select_id = _entity_id(hass, entry, "select", const.BATTERY_MODE_SELECT.key)
     expired = async_capture_events(hass, const.EVENT_COMMAND_EXPIRED)
