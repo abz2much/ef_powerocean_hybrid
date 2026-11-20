@@ -74,6 +74,14 @@ CONF_MODBUS_CONTROL: Final = "modbus_control"
 CONF_INVERTER_MODEL: Final = "inverter_model"
 # The inverter serial the EcoFlow cloud knows it by; set with a cloud connection.
 CONF_CLOUD_SERIAL: Final = "cloud_serial"
+# Option: the EcoFlow app's MQTT connection (off by default), as in
+# powerocean_single_phase.
+CONF_MQTT: Final = "mqtt"
+# Option: power values via MQTT about every 5 s (needs CONF_MQTT, off by default).
+CONF_LIVE_POWER: Final = "live_power"
+# Option: the highest power a schedule may have, in W; schedule edits are refused
+# until it is set (as powerocean_single_phase).
+CONF_MAX_SCHEDULE_POWER: Final = "max_schedule_power"
 # Where the battery energy totals come from: "modbus" or "cloud". Fixed when the
 # entry is first set up, so the Energy dashboard never switches source.
 CONF_COUNTER_SOURCE: Final = "counter_source"

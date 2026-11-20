@@ -1,4 +1,4 @@
-"""Diagnostics support for EcoFlow PowerOcean Plus."""
+"""Diagnostics: the Modbus side, and the cloud part of powerocean_single_phase."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 
+from .cloud.anonymize import Anonymizer
+from .cloud.coordinator import CloudCoordinator
 from .const import (
     CONF_CLOUD_SERIAL,
     CONF_HOST,
@@ -68,11 +70,16 @@ async def async_get_config_entry_diagnostics(
     entry: EcoflowConfigEntry,
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
+    cloud = entry.runtime_data.cloud
+    cloud_part = None if cloud is None else _cloud_diagnostics(cloud)
     coordinator = entry.runtime_data.modbus
     if coordinator is None:
-        return async_redact_data(
-            {"entry": entry.as_dict(), "domain": DOMAIN, "modbus": None}, TO_REDACT
-        )
+        return {
+            **async_redact_data(
+                {"entry": entry.as_dict(), "domain": DOMAIN, "modbus": None}, TO_REDACT
+            ),
+            "cloud": cloud_part,
+        }
 
     identity = asdict(coordinator.identity)
     if identity["serial_number"] not in (None, "unknown"):
@@ -135,4 +142,36 @@ async def async_get_config_entry_diagnostics(
             },
         },
         TO_REDACT,
-    )
+    ) | {"cloud": cloud_part}
+
+
+def _cloud_diagnostics(cloud: CloudCoordinator) -> dict[str, Any]:
+    """Return the cloud part, as powerocean_single_phase (v1.0.1) gives it.
+
+    Not passed through async_redact_data: the serials in the response become
+    placeholders instead, so the response can be used as a test fixture.
+    """
+    return {
+        "coordinator": {
+            "last_update_success": cloud.last_update_success,
+            "last_exception": (
+                repr(cloud.last_exception) if cloud.last_exception else None
+            ),
+            "update_interval": (
+                cloud.update_interval.total_seconds() if cloud.update_interval else None
+            ),
+            "variant": cloud.api.variant,
+            "mqtt": cloud.mqtt is not None,
+        },
+        # Firmware of the modules from MQTT, by address (without serials). The
+        # EMS firmware is shown here only.
+        "modules": {
+            address: {
+                "type": module.module_type,
+                "firmware": module.firmware,
+                "loader": module.loader,
+            }
+            for address, module in sorted(cloud.modules.items())
+        },
+        "api_response": Anonymizer(cloud.api.sn).anonymize(cloud.last_response),
+    }

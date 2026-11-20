@@ -18,6 +18,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 
 from .catalogue import CATALOGUE_86
+from .cloud_schedules import active_schedule_sensor
 from .cloud_sensor import CloudCounter, HeldCounter, cloud_sensors
 from .const import (
     BATTERY_RESERVE_REGISTER_KEY,
@@ -95,6 +96,8 @@ async def async_setup_entry(
     )
     if with_cloud and cloud is not None:
         entry.async_on_unload(cloud_sensors(hass, entry, cloud, async_add_entities))
+        if stop := active_schedule_sensor(hass, entry, cloud, async_add_entities):
+            entry.async_on_unload(stop)
         if entry.data.get(CONF_COUNTER_SOURCE) == "cloud":
             async_add_entities(
                 CloudCounter(cloud, entry, definition)

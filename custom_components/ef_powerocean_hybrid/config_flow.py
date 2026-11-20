@@ -18,6 +18,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import section
 from homeassistant.helpers.selector import (
     BooleanSelector,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -36,8 +39,11 @@ from .const import (
     CONF_ENERGY_OFFSETS,
     CONF_HOST,
     CONF_INVERTER_MODEL,
+    CONF_LIVE_POWER,
     CONF_MAX_GRID_POWER,
+    CONF_MAX_SCHEDULE_POWER,
     CONF_MAX_SOLAR_POWER,
+    CONF_MQTT,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
     DEFAULT_BATTERY_COUNT,
@@ -140,6 +146,17 @@ async def _async_read_settings(client: ModbusClient) -> dict[str, Any]:
 
     _LOGGER.debug("Settings reported by the device: %s", settings)
     return settings
+
+
+# As in powerocean_single_phase: whole watts from 1, no upper limit known
+MAX_SCHEDULE_POWER_SELECTOR: Final = NumberSelector(
+    NumberSelectorConfig(
+        min=1,
+        step=1,
+        unit_of_measurement="W",
+        mode=NumberSelectorMode.BOX,
+    )
+)
 
 
 def _connection_schema() -> vol.Schema:
@@ -605,8 +622,10 @@ class EcoflowConfigFlow(ConfigFlow, domain=DOMAIN):
 class EcoflowOptionsFlow(OptionsFlow):
     """Change how the integration treats the inverter, without reconnecting.
 
-    The address is not here: it is changed with the reconfigure flow, which tests
-    the connection and checks that the same inverter answers.
+    The Modbus settings, with Modbus; the cloud options of
+    powerocean_single_phase (MQTT, live power, max schedule power), with the
+    cloud. The address is not here: it is changed with the reconfigure flow,
+    which tests the connection and checks that the same inverter answers.
     """
 
     def __init__(self) -> None:
@@ -620,9 +639,8 @@ class EcoflowOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
-        if CONF_HOST not in self.config_entry.data:
-            # The settings below are all Modbus ones.
-            return self.async_abort(reason="no_settings")
+        with_modbus = CONF_HOST in self.config_entry.data
+        with_cloud = CONF_CLOUD_SERIAL in self.config_entry.data
 
         if user_input is not None:
             entered = user_input.pop(ENERGY_TOTALS, {})
@@ -635,11 +653,56 @@ class EcoflowOptionsFlow(OptionsFlow):
                     self._warned_lower = lowered
                     errors["base"] = "energy_total_lowered"
             if not errors:
-                return self.async_create_entry(
-                    data={**self.config_entry.options, **user_input, **corrected}
-                )
+                options = {**self.config_entry.options, **user_input, **corrected}
+                if with_cloud:
+                    # A field left empty removes the value, as in
+                    # powerocean_single_phase; the number selector gives a float.
+                    options.pop(CONF_MAX_SCHEDULE_POWER, None)
+                    if CONF_MAX_SCHEDULE_POWER in user_input:
+                        options[CONF_MAX_SCHEDULE_POWER] = int(
+                            user_input[CONF_MAX_SCHEDULE_POWER]
+                        )
+                return self.async_create_entry(data=options)
 
-        fields: dict[Any, Any] = {
+        fields: dict[Any, Any] = self._modbus_fields() if with_modbus else {}
+        if with_modbus and (
+            energy_totals := self._energy_totals_section(collapsed=not errors)
+        ):
+            fields[vol.Required(ENERGY_TOTALS)] = energy_totals
+        if with_cloud:
+            fields.update(self._cloud_fields())
+        schema = vol.Schema(fields)
+        if user_input is not None:
+            # Shown again with an error: keep what the user typed.
+            schema = self.add_suggested_values_to_schema(
+                schema, {**user_input, ENERGY_TOTALS: entered}
+            )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders={
+                "portal_url": portal_history_url(self.hass.config.language)
+            },
+        )
+
+    def _cloud_fields(self) -> dict[Any, Any]:
+        """Return the options of powerocean_single_phase: off, no guessed power."""
+        options = self.config_entry.options
+        return {
+            vol.Required(CONF_MQTT, default=options.get(CONF_MQTT, False)): bool,
+            vol.Required(
+                CONF_LIVE_POWER, default=options.get(CONF_LIVE_POWER, False)
+            ): bool,
+            vol.Optional(
+                CONF_MAX_SCHEDULE_POWER,
+                description={"suggested_value": options.get(CONF_MAX_SCHEDULE_POWER)},
+            ): MAX_SCHEDULE_POWER_SELECTOR,
+        }
+
+    def _modbus_fields(self) -> dict[Any, Any]:
+        """Return the settings of the Modbus side."""
+        return {
             vol.Required(
                 CONF_INVERTER_MODEL,
                 default=self.config_entry.options.get(
@@ -703,22 +766,6 @@ class EcoflowOptionsFlow(OptionsFlow):
                 )
             ),
         }
-        if energy_totals := self._energy_totals_section(collapsed=not errors):
-            fields[vol.Required(ENERGY_TOTALS)] = energy_totals
-        schema = vol.Schema(fields)
-        if user_input is not None:
-            # Shown again with an error: keep what the user typed.
-            schema = self.add_suggested_values_to_schema(
-                schema, {**user_input, ENERGY_TOTALS: entered}
-            )
-        return self.async_show_form(
-            step_id="init",
-            data_schema=schema,
-            errors=errors,
-            description_placeholders={
-                "portal_url": portal_history_url(self.hass.config.language)
-            },
-        )
 
     def _coordinator(self) -> EcoflowCoordinator | None:
         runtime: HybridData | None = getattr(self.config_entry, "runtime_data", None)

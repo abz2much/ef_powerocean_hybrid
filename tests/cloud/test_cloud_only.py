@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-
 import pytest
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -18,25 +15,6 @@ from tests.cloud.fakes import CLOUD_SN, FakeApi, model86_response
 from tests.fake_inverter import HOST, FakeInverter
 
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
-
-
-@pytest.fixture
-async def cloud_entry(hass: HomeAssistant) -> AsyncIterator[MockConfigEntry]:
-    entry = MockConfigEntry(
-        domain=const.DOMAIN,
-        unique_id=CLOUD_SN,
-        minor_version=2,
-        data={
-            CONF_EMAIL: "owner@example.com",
-            CONF_PASSWORD: "secret",
-            const.CONF_CLOUD_SERIAL: CLOUD_SN,
-        },
-        options={const.CONF_INVERTER_MODEL: "powerocean_single_phase"},
-    )
-    entry.add_to_hass(hass)
-    yield entry
-    await hass.config_entries.async_unload(entry.entry_id)
-    await hass.async_block_till_done()
 
 
 async def test_a_cloud_only_entry_loads(

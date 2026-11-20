@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Final
 
@@ -23,6 +24,7 @@ from .const import (
     CONF_CLOUD_SERIAL,
     CONF_COUNTER_SOURCE,
     CONF_HOST,
+    CONF_MQTT,
     CONF_PORT,
     DOMAIN,
 )
@@ -217,6 +219,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> b
     _async_make_device_physical(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    if cloud is not None:
+        # Optional, as in powerocean_single_phase: a failed start does not stop
+        # the setup; MQTT then stays off until a reload.
+        if entry.options.get(CONF_MQTT, False):
+            entry.async_on_unload(cloud.async_stop_mqtt)
+            if cloud.last_update_success:
+                await cloud.async_start_mqtt()
+            else:
+                _async_start_mqtt_with_cloud(entry, cloud)
+        else:
+            # Switched off: no outdated firmware on the device pages
+            cloud.clear_mqtt_firmware()
+
     if coordinator is not None:
         # The control loop reads its inputs, and what its reading checks compare,
         # whatever entities are enabled. With it and the entities all asking, the
@@ -230,6 +245,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> b
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
 
     return True
+
+
+@callback
+def _async_start_mqtt_with_cloud(
+    entry: EcoflowConfigEntry, cloud: CloudCoordinator
+) -> None:
+    """Start MQTT once, with the cloud's first answer.
+
+    powerocean_single_phase retries its whole setup until the cloud answers
+    (__init__.py:88) and starts MQTT then (:111). This entry loads without the
+    cloud, so its MQTT waits for that answer instead. As there, a start that then
+    fails is not retried: MQTT needs a reload.
+    """
+    unsubscribe: list[Callable[[], None]] = []
+
+    @callback
+    def _cloud_updated() -> None:
+        # Called with the first successful poll: a coordinator does not call its
+        # listeners while its polls keep failing.
+        unsubscribe.pop()()
+        entry.async_create_background_task(
+            cloud.hass, cloud.async_start_mqtt(), f"{DOMAIN} MQTT start"
+        )
+
+    # Unloading shuts the cloud coordinator down, so no update arrives later.
+    unsubscribe.append(cloud.async_add_listener(_cloud_updated))
 
 
 async def _async_start_modbus(

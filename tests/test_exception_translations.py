@@ -13,12 +13,15 @@ from custom_components.ef_powerocean_hybrid import const
 
 INTEGRATION = Path(const.__file__).parent
 LANGUAGES = sorted(path.stem for path in (INTEGRATION / "translations").glob("*.json"))
-SOURCE = "\n".join(path.read_text() for path in INTEGRATION.glob("*.py"))
+# The cloud package too: its errors reach the user as well.
+SOURCE = "\n".join(path.read_text() for path in INTEGRATION.rglob("*.py"))
 
 RAISED = (
     set(re.findall(r'translation_domain=DOMAIN,\s*translation_key="(\w+)"', SOURCE))
     | set(re.findall(r'block_writes\(\s*"(\w+)"', SOURCE))
     | set(re.findall(r'translation_key="(\w+)" if message is None', SOURCE))
+    # The schedule rules raise through a helper.
+    | set(re.findall(r'\brefuse\(\s*"(\w+)"', SOURCE))
 )
 
 
@@ -29,7 +32,13 @@ def _messages(language: str) -> dict[str, str]:
 
 
 def test_the_scan_finds_the_errors() -> None:
-    assert {"not_connected", "write_rejected", "identity_mismatch"} <= RAISED
+    assert {
+        "not_connected",
+        "write_rejected",
+        "identity_mismatch",
+        "schedule_invalid_time",
+        "not_acknowledged",
+    } <= RAISED
 
 
 @pytest.mark.parametrize("language", LANGUAGES)

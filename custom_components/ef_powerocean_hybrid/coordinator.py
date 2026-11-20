@@ -563,12 +563,15 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.info("Firmware changed from %s to %s", previous, firmware)
 
         # Only written when the entities are created, so it would show the old
-        # version until a reload.
+        # version until a reload. Only the inverter's: with a cloud connection the
+        # batteries are devices of the entry too, with firmware of their own.
         registry = device_registry.async_get(self.hass)
+        inverter = (DOMAIN, system_id(self.config_entry))
         for device in device_registry.async_entries_for_config_entry(
             registry, self.config_entry.entry_id
         ):
-            registry.async_update_device(device.id, sw_version=firmware)
+            if inverter in device.identifiers:
+                registry.async_update_device(device.id, sw_version=firmware)
 
     async def _async_read_device_info_extra(self) -> None:
         """Read the protocol version and device address, where the device has them.

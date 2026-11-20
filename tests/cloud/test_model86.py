@@ -47,8 +47,3 @@ def test_phases_b_and_c_read_zero_on_a_single_phase() -> None:
 
     for phase in "BC":
         assert _suffix(values, f"_EMS_HEARTBEAT_pcs{phase}Phase_vol") == 0
-
-
-def test_the_energy_stream_soc_is_read() -> None:
-    """The system SOC's backup when Modbus is down: refreshed every 30 s."""
-    assert 0 <= _suffix(_values(), "_ENERGY_STREAM_REPORT_bpSoc") <= 100

@@ -54,7 +54,8 @@ class CloudSource:
     report: str | None = None
     # Applied to numbers: 0.001 turns Wh into kWh, -1 flips a sign.
     factor: float = 1
-    # The report time that shows how fresh the value is (joined values only).
+    # The report time that shows how fresh the value is (joined values only);
+    # None: fresh while the cloud's polls succeed.
     time_key: str | None = None
 
 
@@ -165,7 +166,9 @@ _JOINED: Final = (
     ("house_power", CloudSource("sysLoadPwr", time_key=STREAM_TIME)),
     ("battery_power", CloudSource("bpPwr", time_key=STREAM_TIME)),
     ("grid_power", CloudSource("sysGridPwr", time_key=STREAM_TIME)),
-    ("battery_soc", CloudSource("bpSoc", STREAM, time_key=STREAM_TIME)),
+    # As the cloud integration reads it. The report is sent only when a value
+    # changes, so it counts while the cloud's polls succeed, not by its time.
+    ("battery_soc", CloudSource("bpSoc", CHANGE)),
     ("voltage_l1", CloudSource("pcsAPhase_vol", HEARTBEAT, time_key=HEARTBEAT_TIME)),
     ("frequency", CloudSource("pcsAcFreq", HEARTBEAT, time_key=HEARTBEAT_TIME)),
 )

@@ -24,6 +24,12 @@
       },
       "import_from_grid_power": {
         "default": "mdi:speedometer"
+      },
+      "backup_reserve": {
+        "default": "mdi:battery-lock"
+      },
+      "solar_surplus": {
+        "default": "mdi:solar-power-variant"
       }
     },
     "select": {
@@ -85,6 +91,9 @@
       },
       "system_alerts": {
         "default": "mdi:alert-outline"
+      },
+      "active_schedule": {
+        "default": "mdi:calendar-clock"
       }
     },
     "switch": {
@@ -99,6 +108,9 @@
       },
       "modbus_control": {
         "default": "mdi:remote"
+      },
+      "battery_save_mode": {
+        "default": "mdi:battery-heart-variant"
       }
     }
   },
@@ -111,6 +123,15 @@
     },
     "cancel_control_test": {
       "service": "mdi:test-tube-off"
+    },
+    "add_schedule": {
+      "service": "mdi:calendar-plus"
+    },
+    "update_schedule": {
+      "service": "mdi:calendar-edit"
+    },
+    "delete_schedule": {
+      "service": "mdi:calendar-remove"
     }
   }
 }

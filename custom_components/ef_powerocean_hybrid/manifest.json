@@ -15,6 +15,7 @@
     "custom_components.ef_powerocean_hybrid"
   ],
   "requirements": [
+    "paho-mqtt>=2.1.0",
     "pymodbus>=3.11"
   ],
   "version": "0.2.0"

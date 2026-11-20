@@ -85,9 +85,15 @@ def http_reading(
     """Return the cloud's HTTP value of *source*, timed by Home Assistant's clock.
 
     The time is when Home Assistant last saw the report's time change, so the
-    cloud's own clock, fast or slow, never makes a value look fresh.
+    cloud's own clock, fast or slow, never makes a value look fresh. A value
+    whose report is sent only on a change has no time of its own: it counts from
+    the cloud's last successful poll.
     """
-    seen = cloud.report_seen.get(source.time_key or "")
+    seen = (
+        cloud.report_seen.get(source.time_key)
+        if source.time_key
+        else cloud.last_success_at
+    )
     value = cloud_value(cloud.data or {}, serial, source)
     if seen is None or not isinstance(value, int | float):
         return None

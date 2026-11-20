@@ -10,7 +10,7 @@ import pytest
 from homeassistant import config_entries
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.data_entry_flow import FlowResultType, InvalidData
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ef_powerocean_hybrid import config_flow, const
@@ -343,13 +343,159 @@ def _hybrid_entry(hass: HomeAssistant) -> MockConfigEntry:
     return entry
 
 
-async def test_a_cloud_only_entry_has_no_settings_yet(hass: HomeAssistant) -> None:
+# Task 6: the cloud options of powerocean_single_phase (v1.0.1).
+
+CLOUD_OPTIONS = [
+    const.CONF_MQTT,
+    const.CONF_LIVE_POWER,
+    const.CONF_MAX_SCHEDULE_POWER,
+]
+
+
+def _keys(result: Any) -> list[Any]:
+    schema = result["data_schema"]
+    assert schema is not None
+    return list(schema.schema)
+
+
+def _fields(result: Any) -> list[str]:
+    return [str(key) for key in _keys(result)]
+
+
+def _default(result: Any, field: str) -> Any:
+    (key,) = (key for key in _keys(result) if str(key) == field)
+    return key.default() if callable(key.default) else None
+
+
+async def test_a_cloud_only_entry_shows_the_cloud_options(
+    hass: HomeAssistant,
+) -> None:
     entry = _cloud_entry(hass)
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
 
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "no_settings"
+    assert result["type"] is FlowResultType.FORM
+    # The Modbus settings would do nothing without Modbus.
+    assert _fields(result) == CLOUD_OPTIONS
+    # Off by default, and no guessed schedule power.
+    assert _default(result, const.CONF_MQTT) is False
+    assert _default(result, const.CONF_LIVE_POWER) is False
+    assert _default(result, const.CONF_MAX_SCHEDULE_POWER) is None
+
+
+async def test_the_cloud_options_are_saved_with_whole_watts(
+    hass: HomeAssistant,
+) -> None:
+    entry = _cloud_entry(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            const.CONF_MQTT: True,
+            const.CONF_LIVE_POWER: True,
+            const.CONF_MAX_SCHEDULE_POWER: 3000.0,
+        },
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options == {
+        const.CONF_INVERTER_MODEL: SINGLE,
+        const.CONF_MQTT: True,
+        const.CONF_LIVE_POWER: True,
+        const.CONF_MAX_SCHEDULE_POWER: 3000,
+    }
+    assert isinstance(entry.options[const.CONF_MAX_SCHEDULE_POWER], int)
+
+
+async def test_the_cloud_options_show_what_is_set(hass: HomeAssistant) -> None:
+    entry = _cloud_entry(hass)
+    hass.config_entries.async_update_entry(
+        entry,
+        options={
+            **entry.options,
+            const.CONF_MQTT: True,
+            const.CONF_LIVE_POWER: True,
+            const.CONF_MAX_SCHEDULE_POWER: 3000,
+        },
+    )
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    assert _default(result, const.CONF_MQTT) is True
+    assert _default(result, const.CONF_LIVE_POWER) is True
+    (key,) = (key for key in _keys(result) if key == const.CONF_MAX_SCHEDULE_POWER)
+    assert key.description == {"suggested_value": 3000}
+
+
+async def test_clearing_the_schedule_power_removes_it(hass: HomeAssistant) -> None:
+    entry = _cloud_entry(hass)
+    hass.config_entries.async_update_entry(
+        entry, options={**entry.options, const.CONF_MAX_SCHEDULE_POWER: 3000}
+    )
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    await hass.config_entries.options.async_configure(
+        result["flow_id"], {const.CONF_MQTT: True, const.CONF_LIVE_POWER: False}
+    )
+
+    assert const.CONF_MAX_SCHEDULE_POWER not in entry.options
+
+
+async def test_the_schedule_power_is_at_least_one_watt(hass: HomeAssistant) -> None:
+    entry = _cloud_entry(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    with pytest.raises(InvalidData):
+        await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {
+                const.CONF_MQTT: True,
+                const.CONF_LIVE_POWER: False,
+                const.CONF_MAX_SCHEDULE_POWER: 0,
+            },
+        )
+
+
+async def test_a_hybrid_entry_shows_both_settings(hass: HomeAssistant) -> None:
+    entry = _hybrid_entry(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    fields = _fields(result)
+    assert const.CONF_INVERTER_MODEL in fields
+    assert fields[-3:] == CLOUD_OPTIONS
+
+
+async def test_a_hybrid_entry_saves_both_settings(hass: HomeAssistant) -> None:
+    entry = _hybrid_entry(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    user_input = {
+        str(key): key.default() for key in _keys(result) if callable(key.default)
+    }
+
+    await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {**user_input, const.CONF_MQTT: True, const.CONF_MAX_SCHEDULE_POWER: 2500},
+    )
+
+    assert entry.options[const.CONF_MQTT] is True
+    assert entry.options[const.CONF_LIVE_POWER] is False
+    assert entry.options[const.CONF_MAX_SCHEDULE_POWER] == 2500
+    assert entry.options[const.CONF_INVERTER_MODEL] == SINGLE
+
+
+async def test_a_modbus_only_entry_has_no_cloud_options(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        data={const.CONF_HOST: "192.0.2.10", const.CONF_PORT: 502},
+        options={const.CONF_INVERTER_MODEL: SINGLE},
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    assert not set(_fields(result)) & set(CLOUD_OPTIONS)
 
 
 async def test_an_entry_with_the_cloud_keeps_the_single_phase_model(

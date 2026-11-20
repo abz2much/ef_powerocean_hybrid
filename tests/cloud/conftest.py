@@ -43,6 +43,26 @@ async def hybrid_entry(
 
 
 @pytest.fixture
+async def cloud_entry(hass: HomeAssistant) -> AsyncIterator[MockConfigEntry]:
+    """Cloud only: no Modbus, so the joined values show the cloud's sources."""
+    entry = MockConfigEntry(
+        domain=const.DOMAIN,
+        unique_id=CLOUD_SN,
+        minor_version=2,
+        data={
+            CONF_EMAIL: "owner@example.com",
+            CONF_PASSWORD: "secret",
+            const.CONF_CLOUD_SERIAL: CLOUD_SN,
+        },
+        options={const.CONF_INVERTER_MODEL: "powerocean_single_phase"},
+    )
+    entry.add_to_hass(hass)
+    yield entry
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+@pytest.fixture
 def set_up_hybrid(hass: HomeAssistant) -> SetUp:
     """Set the entry up with *api* as its cloud; return how often reauth started."""
 

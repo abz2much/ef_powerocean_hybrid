@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Final, cast
 
 from homeassistant.components.sensor import (
     RestoreSensor,
@@ -25,16 +25,56 @@ from homeassistant.util import dt as dt_util
 
 from .catalogue import CATALOGUE_86, CatalogueEntry, CloudSource, cloud_value
 from .cloud.coordinator import CloudCoordinator
-from .const import CONF_CLOUD_SERIAL, DOMAIN
+from .const import (
+    BATTERY_MODULES,
+    CONF_CLOUD_SERIAL,
+    CONF_MAX_BATTERY_CHARGED_POWER,
+    CONF_MAX_GRID_POWER,
+    CONF_MAX_SOLAR_POWER,
+    DEFAULT_MAX_GRID_POWER,
+    DEFAULT_MAX_SOLAR_POWER,
+    DOMAIN,
+    ENERGY_RESOLUTION_KWH,
+)
+from .coordinator import battery_power_limits
 from .ids import system_id
-from .models import InverterModel
+from .models import EnergySensorDef, InverterModel
 
 _LOGGER = logging.getLogger(__name__)
 
-# Faster than any PowerOcean Single Phase can charge or discharge its battery,
-# so a rise beyond it is a bad reading, not energy.
-COUNTER_MAX_POWER_W = 10_000
-COUNTER_RESOLUTION_KWH = 0.01
+# The power that bounds how fast a total may rise, as the Modbus integration's
+# energy processor bounds its own (energy_processor._max_believable_energy_delta).
+_OPTION_DEFAULTS: Final = {
+    CONF_MAX_SOLAR_POWER: DEFAULT_MAX_SOLAR_POWER,
+    CONF_MAX_GRID_POWER: DEFAULT_MAX_GRID_POWER,
+}
+# Until the capacity is known, every pack counts as the largest module.
+_LARGEST_MODULE_WH: Final = max(module.reported_wh for module in BATTERY_MODULES)
+
+
+def total_limit_w(
+    max_power_key: str,
+    options: Mapping[str, Any],
+    modbus_limits: Mapping[str, Any] | None,
+    pack_count: int,
+) -> float:
+    """Return the power in W that caps a total's rise.
+
+    With Modbus, the Modbus coordinator's limits, sized from the capacity the
+    inverter reports. Without, the user's max solar and grid power with the
+    Modbus integration's defaults, and the battery's from the packs the cloud
+    reports, each counted as the largest module: 0 W with no packs, which holds
+    the totals until packs are reported, as in the Modbus integration.
+    """
+    if modbus_limits is not None and max_power_key in modbus_limits:
+        return float(modbus_limits[max_power_key])
+    if max_power_key in _OPTION_DEFAULTS:
+        return float(options.get(max_power_key, _OPTION_DEFAULTS[max_power_key]))
+    charge_w, discharge_w = battery_power_limits(pack_count * _LARGEST_MODULE_WH)
+    return float(
+        charge_w if max_power_key == CONF_MAX_BATTERY_CHARGED_POWER else discharge_w
+    )
+
 
 _PACK_SOC = re.compile(r"^(?P<serial>.+?)_(?:[A-Z0-9]+_)?BP_STA_REPORT_bpSoc$")
 
@@ -94,6 +134,7 @@ class CloudSensor(CoordinatorEntity[CloudCoordinator], SensorEntity):
             manufacturer="EcoFlow",
             model="PowerOcean Battery",
             serial_number=self._pack,
+            sw_version=self.coordinator.firmware.get(self._pack),
         )
 
     def _value(self) -> Any:
@@ -210,7 +251,13 @@ class CloudCounter(CoordinatorEntity[CloudCoordinator], RestoreSensor):
         definition: CatalogueEntry,
     ) -> None:
         super().__init__(coordinator)
+        self._entry = entry
         self._source = cast(CloudSource, definition.cloud)
+        # The limit the Modbus integration caps the same total with; every
+        # battery total has one (const.ENERGY_SENSOR_MAP).
+        self._max_power_key = cast(
+            str, cast(EnergySensorDef, definition.description).max_power
+        )
         self._serial = entry.data[CONF_CLOUD_SERIAL]
         self._value: float | None = None
         # When the shown value was taken; a rise is judged against it.
@@ -243,6 +290,16 @@ class CloudCounter(CoordinatorEntity[CloudCoordinator], RestoreSensor):
         self._take()
         super()._handle_coordinator_update()
 
+    def _limit_w(self) -> float:
+        modbus = self._entry.runtime_data.modbus
+        data = self.coordinator.data or {}
+        return total_limit_w(
+            self._max_power_key,
+            self._entry.options,
+            modbus.limits if modbus is not None else None,
+            len(pack_serials(data, self._serial)),
+        )
+
     def _take(self) -> None:
         if not self.coordinator.last_update_success:
             return
@@ -256,7 +313,7 @@ class CloudCounter(CoordinatorEntity[CloudCoordinator], RestoreSensor):
             # lifetime again. Never faster than the battery can charge either:
             # a spike, once booked, would hold the counter there for good.
             hours = max((now - self._accepted_at).total_seconds(), 0) / 3600
-            believable = COUNTER_MAX_POWER_W * hours / 1000 + COUNTER_RESOLUTION_KWH
+            believable = self._limit_w() * hours / 1000 + ENERGY_RESOLUTION_KWH
             if not 0 <= value - self._value <= believable:
                 if value > self._value and not self._spike_logged:
                     _LOGGER.warning(

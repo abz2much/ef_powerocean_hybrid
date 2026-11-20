@@ -12,7 +12,6 @@
   history removed.
 - The entity catalogue for the PowerOcean Single Phase: one entity per value,
   each with its Modbus and cloud source. Not used by the integration yet.
-- The cloud parser now also reads the system SOC from the energy stream report.
 - A cloud connection beside Modbus in one entry (set up in the entry's data for
   now; the setup form follows). The cloud is read every 10 seconds. If the
   cloud is down, or rejects the login, the entry still loads, Modbus keeps
@@ -30,6 +29,33 @@
   not answer over Modbus at start: the cloud's values carry on, and the entry
   reloads with Modbus as soon as the inverter answers (checked every 30 seconds).
   Without the cloud, setup retries as before.
+- The EcoFlow app's MQTT connection, from powerocean_single_phase v1.0.1, as
+  the option "Extended connection (MQTT)", off by default. It reads the
+  firmware of the modules: the smart meter's shows on its device page, the
+  others (such as the EMS) in the diagnostics. If it fails to start, it stays
+  off until the entry is reloaded. If the cloud was down when Home Assistant
+  started, it starts once with the cloud's first successful update.
+- The option "Live power values (MQTT)", off by default: asks the system for its
+  power values every 20 seconds, as the EcoFlow app does while it is open.
+  House, battery and grid power then come from it about every 5 seconds
+  whenever Modbus has no current reading, and so do the cloud's own solar
+  power, PV strings and energy flows. A dual installation's stream is ignored,
+  as in powerocean_single_phase.
+- With the MQTT option: the app's settings "Backup reserve", "Surplus solar
+  energy delivery" and "Battery save mode". The system confirms each change;
+  without a confirmation within 10 seconds Home Assistant shows an error.
+- With the MQTT option: the app's scheduled tasks. A switch per schedule, named
+  after what it does (for example "Charge 02:00-06:00 3000 W"), an "Active
+  schedule" sensor, and the actions `add_schedule`, `update_schedule` and
+  `delete_schedule`. The list is read when MQTT connects and every minute, so
+  a change made in the app shows within a minute. The same checks as the
+  EcoFlow app: at most 6 schedules, no overlaps, times in steps of 30 minutes.
+- The option "Max schedule power (W)": the highest power a schedule may use.
+  Without it, schedules cannot be added or changed. There is no default.
+- The battery packs' firmware from the cloud on their device pages.
+- Diagnostics have a cloud part, as powerocean_single_phase gives it: the
+  connection state, whether MQTT is on, the modules' firmware and the last
+  cloud response, with every serial replaced by a placeholder.
 
 ### Changed
 
@@ -52,7 +78,7 @@
 - A lifetime total whose first reading on a new installation is 0 shows its
   last known value, or unknown, until a real value follows, instead of 0.
 - A system with the EcoFlow cloud keeps PowerOcean Single Phase as its model in
-  the options; a system on the cloud alone has no options yet.
+  the options. A system on the cloud alone has the three MQTT options only.
 - Reconfigure adds a Modbus address to a system set up through the cloud alone,
   after checking the inverter's serial and model.
 - The cloud is only added when the inverter's serial could be read over Modbus.
@@ -67,6 +93,19 @@
   over Modbus, not when any device at the address accepts a connection.
 - Adding an inverter that is already set up through the cloud alone asks you to
   use Reconfigure instead.
+- The LED brightness is one number: it reads and writes over Modbus while
+  Modbus has a current reading, otherwise over the cloud (needs the MQTT
+  option). On a system set up through the cloud alone it exists only with the
+  MQTT option.
+- The cloud's state of charge comes from the EMS change report, as in
+  powerocean_single_phase, and counts as current while the cloud's updates
+  succeed (up to 60 seconds after the last one).
+- The cloud's battery energy totals may rise only as fast as the battery's
+  power limit allows, as the Modbus totals do, instead of a fixed 10 kW: the
+  Modbus limits with Modbus, otherwise limits sized from the packs the cloud
+  reports.
+- The inverter's firmware comes from Modbus and is shown on the inverter's
+  device only; it no longer overwrites the firmware of other devices.
 
 ## [0.2.0] - Unreleased
 

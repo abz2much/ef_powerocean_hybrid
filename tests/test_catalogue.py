@@ -63,7 +63,8 @@ def test_joined_values_name_the_report_time_that_shows_freshness() -> None:
         "house_power": "energyStreamUpdateTime",
         "battery_power": "energyStreamUpdateTime",
         "grid_power": "energyStreamUpdateTime",
-        "battery_soc": "energyStreamUpdateTime",
+        # Sent only when a value changes: its time says nothing of freshness.
+        "battery_soc": None,
         "voltage_l1": "heartbeatUpdateTime",
         "frequency": "heartbeatUpdateTime",
     }
@@ -142,3 +143,9 @@ def test_the_pack_counters_stay_in_watt_hours() -> None:
     for key in ("pack_charged_total", "pack_discharged_total"):
         entry = next(e for e in CATALOGUE_86 if e.key == key)
         assert entry.description.unit == "Wh"
+
+
+def test_soc_comes_from_the_change_report_as_in_the_cloud_integration() -> None:
+    source = next(e.cloud for e in CATALOGUE_86 if e.key == "battery_soc")
+    assert source is not None
+    assert (source.report, source.key) == ("EMS_CHANGE_REPORT", "bpSoc")

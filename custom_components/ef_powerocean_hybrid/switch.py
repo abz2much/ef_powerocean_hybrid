@@ -10,6 +10,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .cloud_schedules import schedule_switches
+from .cloud_settings import setting_switches
 from .const import DOMAIN
 from .control import ControlManager
 from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
@@ -88,9 +90,14 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up EcoFlow switches from a config entry."""
+    cloud = entry.runtime_data.cloud
+    if cloud is not None:
+        async_add_entities(setting_switches(hass, entry, cloud))
+        if stop := schedule_switches(hass, entry, cloud, async_add_entities):
+            entry.async_on_unload(stop)
     coordinator = entry.runtime_data.modbus
     if coordinator is None:
-        # Only Modbus has these.
+        # The rest only Modbus has.
         return
     native = coordinator.control.reserve_native
 

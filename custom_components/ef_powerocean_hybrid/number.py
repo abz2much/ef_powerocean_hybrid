@@ -18,9 +18,12 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .cloud_settings import setting_numbers
 from .const import (
     BATTERY_RESERVE_SOC_NUMBER,
     CHARGE_LIMIT_SOC_NUMBER,
+    CONF_HOST,
+    CONF_MQTT,
     CONTROL_FEATURES,
     DOMAIN,
     RETIRED_MIN_SOC_NUMBER_KEY,
@@ -30,6 +33,7 @@ from .const import (
 from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
 from .entity import EcoFlowBaseEntity
 from .ids import system_id
+from .joined_number import LED_NUMBER, JoinedLedNumber
 from .models import (
     ControlEntityDef,
     ControlFeature,
@@ -51,12 +55,36 @@ async def async_setup_entry(
     entry: EcoflowConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the control numbers and the writable registers."""
+    """Set up the control numbers, the writable registers and the cloud settings."""
+    entities: list[NumberEntity] = []
+    registry = er.async_get(hass)
+    cloud = entry.runtime_data.cloud
     coordinator = entry.runtime_data.modbus
-    if coordinator is None:
-        # Only Modbus has these.
-        return
+    if cloud is not None:
+        entities.extend(setting_numbers(hass, entry, cloud))
+        # The LED brightness is one value on both sides: one entity for both.
+        # Cloud only, it exists only with MQTT, as in the cloud integration.
+        if CONF_HOST in entry.data or entry.options.get(CONF_MQTT, False):
+            entities.append(JoinedLedNumber(entry, coordinator, cloud))
+        elif led := registry.async_get_entity_id(
+            "number", DOMAIN, f"{system_id(entry)}_{LED_NUMBER.key}"
+        ):
+            registry.async_remove(led)
+    if coordinator is not None:
+        entities.extend(
+            _modbus_numbers(entry, coordinator, registry, with_cloud=cloud is not None)
+        )
+    async_add_entities(entities)
 
+
+def _modbus_numbers(
+    entry: EcoflowConfigEntry,
+    coordinator: EcoflowCoordinator,
+    registry: er.EntityRegistry,
+    *,
+    with_cloud: bool,
+) -> list[NumberEntity]:
+    """Return the numbers Modbus brings."""
     entities: list[NumberEntity] = [
         EcoFlowFeaturePowerNumber(coordinator, entry, feature)
         for feature, definition in CONTROL_FEATURES.items()
@@ -86,7 +114,6 @@ async def async_setup_entry(
         )
     )
     # The Battery Reserve took over the number that wrote the reserve register.
-    registry = er.async_get(hass)
     if retired := registry.async_get_entity_id(
         "number", DOMAIN, f"{system_id(entry)}_{RETIRED_MIN_SOC_NUMBER_KEY}"
     ):
@@ -95,9 +122,10 @@ async def async_setup_entry(
         EcoFlowGenericNumber(coordinator, entry, number_def)
         for number_def in WRITABLE_NUMBERS_MAP
         if coordinator.inverter_model not in number_def.unsupported_models
+        # With the cloud, the joined number takes its place.
+        and not (with_cloud and number_def is LED_NUMBER)
     )
-
-    async_add_entities(entities)
+    return entities
 
 
 class EcoFlowFeaturePowerNumber(EcoFlowBaseEntity[ControlEntityDef], NumberEntity):

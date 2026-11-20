@@ -224,7 +224,10 @@ def _fake_modbus(key: str, value: float) -> SimpleNamespace:
 
 def _fake_cloud(key: str, value: float) -> SimpleNamespace:
     return SimpleNamespace(
-        data={}, report_seen={}, live={key: Reading(value, dt_util.utcnow())}
+        data={},
+        report_seen={},
+        last_success_at=None,
+        live={key: Reading(value, dt_util.utcnow())},
     )
 
 

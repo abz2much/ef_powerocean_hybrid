@@ -16,6 +16,7 @@ from .const import ATTR_MODE, CONTROL_FEATURES, DOMAIN
 from .control_test_core import DEFAULT_TEST_POWER_W, MAX_TEST_POWER_W, MIN_TEST_POWER_W
 from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
 from .models import ControlFeature
+from .schedule_services import async_setup_schedule_services
 
 SERVICE_SET_BATTERY_COMMAND: Final = "set_battery_command"
 SERVICE_RUN_CONTROL_TEST: Final = "run_control_test"
@@ -61,6 +62,7 @@ CANCEL_CONTROL_TEST_SCHEMA: Final = vol.Schema(
 
 def async_setup_services(hass: HomeAssistant) -> None:
     """Register the integration's actions."""
+    async_setup_schedule_services(hass)
 
     async def async_set_battery_command(call: ServiceCall) -> None:
         feature = ControlFeature(call.data[ATTR_MODE])

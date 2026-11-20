@@ -15,6 +15,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ef_powerocean_hybrid import const
 from custom_components.ef_powerocean_hybrid.catalogue import CATALOGUE_86
+from custom_components.ef_powerocean_hybrid.cloud.api import EcoflowConnectionError
 from custom_components.ef_powerocean_hybrid.cloud.coordinator import CloudCoordinator
 from custom_components.ef_powerocean_hybrid.sources import (
     Reading,
@@ -245,3 +246,36 @@ async def test_mqtt_gives_its_live_reading(hass: HomeAssistant) -> None:
     cloud.live["house_power"] = Reading(2060.0, NOW)
 
     assert mqtt_reading(cloud, "house_power") == Reading(2060.0, NOW)
+
+
+async def test_soc_counts_while_the_cloud_polls_succeed(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """The change report is sent only on a change; its time can be minutes old."""
+    api = FakeApi(
+        fetch=[_with_report_times("2026-11-19 20:00:00", "2026-11-19 20:00:00")]
+    )
+    cloud = await _cloud(hass, api)
+    await cloud.async_refresh()
+
+    reading = http_reading(cloud, CLOUD_SN, _source("battery_soc"))
+    assert reading is not None
+    assert reading.value == cloud.data[f"{CLOUD_SN}_JTS1_EMS_CHANGE_REPORT_bpSoc"]
+    assert reading.at == dt_util.utcnow()
+
+    # The cloud stops answering: the value stops counting after the limit.
+    freezer.tick(timedelta(seconds=61))
+    api.respond(EcoflowConnectionError("down"))
+    await cloud.async_refresh()
+    later = http_reading(cloud, CLOUD_SN, _source("battery_soc"))
+    assert (
+        pick(
+            None,
+            None,
+            later,
+            now=dt_util.utcnow(),
+            mqtt_limit=timedelta(seconds=30),
+            http_limit=HTTP_LIMIT,
+        )
+        is None
+    )

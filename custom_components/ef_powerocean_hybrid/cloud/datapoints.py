@@ -57,8 +57,6 @@ REPORT_DATAPOINTS: dict[str, set[str]] = {
         "sysGridSta",
     },
     ReportMode.ENERGY_STREAM.value: {
-        # System SOC, refreshed with the stream: the hybrid's backup for it
-        "bpSoc",
         "pv1Pwr",
         "pv2Pwr",
         "pv3Pwr",

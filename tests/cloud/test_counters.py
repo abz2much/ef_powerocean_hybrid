@@ -284,3 +284,63 @@ async def test_a_believable_rise_after_a_long_cloud_outage_is_taken(
     await hass.async_block_till_done()
 
     assert float(_state(hass, CHARGED).state) == 3350.0
+
+
+def _without_packs(response: dict[str, Any]) -> dict[str, Any]:
+    quota = response["data"]["quota"]
+    quota["JTS1_BP_STA_REPORT"] = {
+        k: v
+        for k, v in quota["JTS1_BP_STA_REPORT"].items()
+        if not k.startswith("SN_BP")
+    }
+    return response
+
+
+async def test_a_cloud_total_rises_no_faster_than_its_packs_can_charge(
+    hass: HomeAssistant,
+    cloud_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Two packs: 8,200 W, so 8.21 kWh an hour at most (with 0.01 kWh resolution)."""
+    api = FakeApi(fetch=[_charged_wh(3_300_000)])
+    await set_up_hybrid(cloud_entry, api)
+    refresh = cloud_entry.runtime_data.cloud.async_refresh
+
+    shown = []
+    for wh in (3_308_500, 3_308_000):
+        freezer.tick(timedelta(hours=1))
+        api.respond(_charged_wh(wh))
+        await refresh()
+        await hass.async_block_till_done()
+        shown.append(float(_state(hass, CHARGED).state))
+
+    # 8.5 kWh in the first hour is refused; 8.0 kWh over two hours is taken.
+    assert shown == [3300.0, 3308.0]
+
+
+async def test_without_packs_a_total_is_held_then_catches_up(
+    hass: HomeAssistant,
+    cloud_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """0 W with no packs, as in the blueprint; the budget runs on from the last
+    accepted value, so the total catches up once packs are reported."""
+    api = FakeApi(fetch=[_charged_wh(3_300_000)])
+    await set_up_hybrid(cloud_entry, api)
+    refresh = cloud_entry.runtime_data.cloud.async_refresh
+
+    freezer.tick(timedelta(minutes=30))
+    api.respond(_without_packs(_charged_wh(3_301_000)))
+    await refresh()
+    await hass.async_block_till_done()
+    held = float(_state(hass, CHARGED).state)
+
+    freezer.tick(timedelta(minutes=30))
+    api.respond(_charged_wh(3_302_000))
+    await refresh()
+    await hass.async_block_till_done()
+
+    assert held == 3300.0
+    assert float(_state(hass, CHARGED).state) == 3302.0
