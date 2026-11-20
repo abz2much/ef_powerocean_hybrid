@@ -50,10 +50,16 @@
   `delete_schedule`. The list is read when MQTT connects and every minute, so
   a change made in the app shows within a minute. The same checks as the
   EcoFlow app: at most 6 schedules, no overlaps, times in steps of 30 minutes.
+- The MQTT connection logs a disconnect as a warning, a connect, each command
+  sent and each reply with its number (debug), and paho's own log; a command
+  the system does not confirm is a warning that says whether MQTT was still
+  connected. A message that cannot be read is logged instead of stopping
+  paho's thread.
 - A dashboard card for the scheduled tasks, served with the integration ("EF
   PowerOcean schedules" in the card picker): a bar of today's schedules, the
   list with on/off switches, and a form to add, change and delete them that
-  checks the rules as you type and sends only on Save. The Active schedule
+  checks the rules as you type and sends only on Save. The form closes at
+  once; the card says what is being done and, if the system refuses it, why. The Active schedule
   sensor tells the card the max schedule power (attribute
   `max_schedule_power`, not recorded).
 - The option "Max schedule power (W)": the highest power a schedule may use.
@@ -117,6 +123,9 @@
 - Wi-Fi, Ethernet and 4G state show "Connected" for code 0 and "Not
   connected" for code 2, as seen on a real system; other codes show as the
   number. powerocean_single_phase shows only the number.
+- The Heartbeat update time sensor is off by default, unlike in
+  powerocean_single_phase: its change every 30 seconds filled the activity
+  log.
 - The cloud's sensors are on or off by default as in powerocean_single_phase:
   active power L1, PV insulation resistance, online, and each pack's BMS run
   state, module state, balance state and update time are now on; each pack's

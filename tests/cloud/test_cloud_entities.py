@@ -109,6 +109,14 @@ async def test_a_value_sent_as_text_is_a_number(
 async def test_an_update_time_is_a_timestamp(
     hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
 ) -> None:
+    # Off by default (owner): switched on, as the owner could.
+    er.async_get(hass).async_get_or_create(
+        "sensor",
+        const.DOMAIN,
+        f"{SERIAL}_heartbeat_update_time",
+        config_entry=hybrid_entry,
+        disabled_by=None,
+    )
     await set_up_hybrid(hybrid_entry, FakeApi(fetch=[model86_response()]))
 
     assert _state(hass, f"{SERIAL}_heartbeat_update_time").state.startswith(
@@ -180,3 +188,16 @@ def test_every_catalogue_entity_has_a_name() -> None:
     names = json.loads(TRANSLATIONS.read_text(encoding="utf-8"))["entity"]["sensor"]
     missing = [e.key for e in CATALOGUE_86 if "name" not in names.get(e.key, {})]
     assert missing == []
+
+
+async def test_the_heartbeat_update_time_starts_off(
+    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    """Owner: its change every 30 s fills the activity log."""
+    await set_up_hybrid(hybrid_entry, FakeApi(fetch=[model86_response()]))
+
+    entity_id = _entity_id(hass, f"{SERIAL}_heartbeat_update_time")
+    assert entity_id is not None
+    entry = er.async_get(hass).async_get(entity_id)
+    assert entry is not None
+    assert entry.disabled_by is er.RegistryEntryDisabler.INTEGRATION

@@ -178,12 +178,23 @@ def test_the_parser_key_is_the_datapoint_key() -> None:
     assert {parser_key(e.cloud) for e in _cloud_only() if e.cloud} <= keys
 
 
+# Off by default where the owner decided so, though the cloud integration has
+# them on (owner, 20 Nov 2026: its state changes fill the activity log).
+OWNER_OFF = {"heartbeat_update_time"}
+
+
 def test_cloud_values_are_on_or_off_as_in_the_cloud_integration() -> None:
     assert {
         e.key
         for e in _cloud_only()
-        if e.cloud and e.enabled == (parser_key(e.cloud) in DISABLED_BY_DEFAULT)
+        if e.cloud
+        and e.key not in OWNER_OFF
+        and e.enabled == (parser_key(e.cloud) in DISABLED_BY_DEFAULT)
     } == set()
+
+
+def test_the_owner_turned_off_the_heartbeat_update_time() -> None:
+    assert not any(e.enabled for e in CATALOGUE_86 if e.key in OWNER_OFF)
 
 
 def test_the_cloud_integrations_translated_states_are_translated() -> None:

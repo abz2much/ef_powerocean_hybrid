@@ -374,6 +374,9 @@ _INVERTER_CLOUD: Final = (
             state_class=None,
             category=DIAG,
         ),
+        # Off, unlike the cloud integration (owner): a change every 30 s fills
+        # the activity log. The joined values read the time without it.
+        enabled=False,
     ),
     _cloud(
         "energy_stream_update_time",
