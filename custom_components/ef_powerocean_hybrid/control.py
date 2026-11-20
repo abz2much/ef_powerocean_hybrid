@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timedelta
 from enum import Enum, auto
@@ -276,8 +276,11 @@ class ControlManager:
         heartbeat: Heartbeat | None = None,
         start_task: StartTask | None = None,
         battery_reserve: ReserveSupport = ReserveSupport.EMULATED,
+        check_sole_controller: Callable[[], None] | None = None,
     ) -> None:
         self._modbus_client = modbus_client
+        # Raises while another integration could write to the same inverter.
+        self._check_sole_controller = check_sole_controller
         self._registers_by_key = registers_by_key
         self._limits = limits
         self._inverter_model = inverter_model
@@ -702,6 +705,8 @@ class ControlManager:
             return
         if enabled:
             self._require_no_test()
+            if self._check_sole_controller is not None:
+                self._check_sole_controller()
         self._enabled = enabled
         if enabled:
             # We cannot know what the inverter follows now, so the next poll re-sends.

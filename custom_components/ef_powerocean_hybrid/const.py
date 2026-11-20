@@ -79,6 +79,8 @@ CONF_CALC_GRID_ENERGY: Final = "calc_grid_energy"
 # How much the integration raises in repairs, beyond what the user must act on.
 CONF_ALERT_VERBOSITY: Final = "alert_verbosity"
 CONF_MODBUS_CONTROL: Final = "modbus_control"
+# The Modbus integration this one is based on: it can write to the inverter too.
+OTHER_MODBUS_DOMAIN: Final = "ef_powerocean_tcpmodbus"
 CONF_INVERTER_MODEL: Final = "inverter_model"
 # The inverter serial the EcoFlow cloud knows it by; set with a cloud connection.
 CONF_CLOUD_SERIAL: Final = "cloud_serial"

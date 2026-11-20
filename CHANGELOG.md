@@ -173,6 +173,10 @@
   loads; switch it on yourself. Before, it came back as it was, and switching
   it off was saved only 30 seconds later, so a crash in that time turned it
   back on. An old "Modbus Control" setting in the entry's options is ignored.
+- Modbus Control cannot be switched on while EF-PowerOcean-TcpModbus, or a
+  second entry of this integration, is loaded for the same inverter address:
+  two controllers would fight over it. If one is loaded while control is on,
+  the next poll switches control off, with a warning in the log.
 
 ### Fixed
 

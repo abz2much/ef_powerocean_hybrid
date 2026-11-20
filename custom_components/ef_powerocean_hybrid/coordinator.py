@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import ATTR_DEVICE_ID, ATTR_ENTITY_ID, Platform
 from homeassistant.core import Context, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -65,6 +65,7 @@ from .const import (
     MODBUS_DISABLED_READ_THRESHOLD,
     MODBUS_POLL_BUDGET_S,
     OPTIONAL_STALLS_TO_DROP,
+    OTHER_MODBUS_DOMAIN,
     PRODUCT_CATEGORY,
     PRODUCT_NUMBER,
     READING_CHECK_SNAPSHOTS,
@@ -260,6 +261,7 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             start_task=lambda coro, name: config_entry.async_create_background_task(
                 hass, coro, name
             ),
+            check_sole_controller=self._check_sole_controller,
             battery_reserve=battery_reserve_for(
                 self.inverter_model,
                 config_entry.options.get(CONF_BATTERY_RESERVE),
@@ -427,6 +429,45 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # From here on the heartbeat skips beats while the connection is down and
         # beats again the moment a reconnect succeeds.
         self.control.start()
+
+    def _other_controller(self) -> ConfigEntry | None:
+        """Return another loaded entry that can write to this inverter, if any.
+
+        The Modbus integration this one is based on, or a second entry of this
+        one, set up for the same address. Matched by the address as entered.
+        """
+        host = self.host.strip().lower()
+        for domain in (OTHER_MODBUS_DOMAIN, DOMAIN):
+            for other in self.hass.config_entries.async_entries(domain):
+                if (
+                    other.entry_id != self.config_entry.entry_id
+                    and other.state is ConfigEntryState.LOADED
+                    and str(other.data.get(CONF_HOST, "")).strip().lower() == host
+                ):
+                    return other
+        return None
+
+    def _check_sole_controller(self) -> None:
+        """Refuse to take control while another integration has the inverter."""
+        if (other := self._other_controller()) is not None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="other_modbus_controller",
+                translation_placeholders={"host": self.host, "other": other.title},
+            )
+
+    async def _async_hand_back_beside_another_controller(self) -> None:
+        """Hand control back once another integration has the inverter too."""
+        if not self.control.enabled or (other := self._other_controller()) is None:
+            return
+        _LOGGER.warning(
+            "%s (%s) is also set up for the inverter at %s; Modbus Control is "
+            "switched off, as two controllers would fight over it",
+            other.title,
+            other.domain,
+            self.host,
+        )
+        await self.control.async_set_enabled(False)
 
     async def async_shutdown(self) -> None:
         """Hand control back, save the state and close the connection.
@@ -1290,6 +1331,7 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # The poll needs to happen after the derived values are calculated so that
             # the control sees the correct solar power, in case the user has configured
             # them to be calculated.
+            await self._async_hand_back_beside_another_controller()
             await self.control.async_poll(result)
             self._async_track_reading_checks_safely()
             try:

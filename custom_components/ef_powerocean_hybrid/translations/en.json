@@ -1448,6 +1448,9 @@
     },
     "schedule_not_confirmed": {
       "message": "The system acknowledged the command, but its list does not show the change yet. Check the app before you try again."
+    },
+    "other_modbus_controller": {
+      "message": "{other} is also set up for the inverter at {host}, and two controllers would fight over it. Remove or disable that integration, then switch Modbus Control on."
     }
   }
 }
