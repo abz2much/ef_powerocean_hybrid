@@ -101,6 +101,10 @@
   lower case, with a readable name ("Charging", "Self-powered", "Running")
   for the pack state, charge state, BMS run state and module state, and the
   inverter's operating mode, run state, feed-in mode, online and grid state.
+- The cloud sensors powerocean_single_phase has switched off by default are
+  there too, switched off: Wi-Fi, Ethernet and 4G state, system name, and four
+  values of an energy management report (feed power cap, PCL power base,
+  current SOC, start state), whose meaning is unclear.
 - The cloud's sensors are on or off by default as in powerocean_single_phase:
   active power L1, PV insulation resistance, online, and each pack's BMS run
   state, module state, balance state and update time are now on; each pack's

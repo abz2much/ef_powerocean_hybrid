@@ -1001,6 +1001,30 @@
       },
       "active_schedule": {
         "name": "Active schedule"
+      },
+      "wifi_state": {
+        "name": "Wi-Fi state"
+      },
+      "ethernet_state": {
+        "name": "Ethernet state"
+      },
+      "cellular_state": {
+        "name": "4G state"
+      },
+      "system_name": {
+        "name": "System name"
+      },
+      "edev_feed_power_cap": {
+        "name": "Feed power cap (EDEV)"
+      },
+      "edev_pcl_power_base": {
+        "name": "PCL power base (EDEV)"
+      },
+      "edev_current_soc": {
+        "name": "Current SOC (EDEV)"
+      },
+      "edev_start_state": {
+        "name": "Start state (EDEV)"
       }
     },
     "binary_sensor": {

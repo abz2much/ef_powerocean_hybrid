@@ -198,3 +198,21 @@ def test_the_cloud_integrations_translated_states_are_translated() -> None:
         states = TRANSLATIONS[entry.key].get("state", {})
         assert states, entry.key
         assert all(state == state.lower() for state in states), entry.key
+
+
+def test_the_connection_and_system_values_are_there_switched_off() -> None:
+    """powerocean_single_phase has them, off by default (DISABLED_BY_DEFAULT)."""
+    wanted = {
+        "wifiStaStat",
+        "ethWanStat",
+        "iot4gSta",
+        "systemName",
+        "feedPwrCap",
+        "pclPwrBase",
+        "socCur",
+        "startState",
+    }
+    entries = {parser_key(e.cloud): e for e in _cloud_only() if e.cloud}
+
+    assert wanted <= entries.keys()
+    assert not any(entries[key].enabled for key in wanted)

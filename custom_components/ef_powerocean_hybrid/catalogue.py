@@ -457,6 +457,22 @@ _INVERTER_CLOUD: Final = (
         enabled=False,
     ),
     _text("online", CloudSource("online")),
+    # Off by default in the cloud integration (DISABLED_BY_DEFAULT): codes of
+    # the connections, the system's name, and an energy management report
+    # whose meaning is unclear (socCur repeats the state of charge).
+    _text("wifi_state", CloudSource("wifiStaStat", CHANGE)),
+    _text("ethernet_state", CloudSource("ethWanStat", CHANGE)),
+    _text("cellular_state", CloudSource("iot4gSta", CHANGE)),
+    _text("system_name", CloudSource("systemName")),
+    *(
+        _text(key, CloudSource(name, "EDEV_SYS_REPORT"))
+        for key, name in (
+            ("edev_feed_power_cap", "feedPwrCap"),
+            ("edev_pcl_power_base", "pclPwrBase"),
+            ("edev_current_soc", "socCur"),
+            ("edev_start_state", "startState"),
+        )
+    ),
     _text("grid_state", CloudSource("sysGridSta"), enabled=False),
     _cloud(
         "charge_limit",

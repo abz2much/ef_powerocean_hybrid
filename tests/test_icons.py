@@ -12,10 +12,12 @@ import pytest
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_platform
+from homeassistant.helpers import entity_registry as er
 from homeassistant.util.yaml import load_yaml_dict
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ef_powerocean_hybrid import const
+from custom_components.ef_powerocean_hybrid.catalogue import CATALOGUE_86
 from custom_components.ef_powerocean_hybrid.cloud import coordinator as cloud_module
 from custom_components.ef_powerocean_hybrid.models import InverterModel
 from custom_components.ef_powerocean_hybrid.switch import (
@@ -75,6 +77,20 @@ async def _cloud_entities(hass: HomeAssistant) -> list[tuple[str, Any]]:
         },
     )
     entry.add_to_hass(hass)
+    # The cloud's sensors that start off, registered on so they load too.
+    registry = er.async_get(hass)
+    for definition in CATALOGUE_86:
+        if definition.kind == "cloud" and not definition.enabled:
+            for serial in (
+                ("SN_BP01", "SN_BP02") if definition.per_pack else (CLOUD_SN,)
+            ):
+                registry.async_get_or_create(
+                    "sensor",
+                    const.DOMAIN,
+                    f"{serial}_{definition.key}",
+                    config_entry=entry,
+                    disabled_by=None,
+                )
     api = FakeApi(fetch=[model86_response()])
     with (
         patch.object(cloud_module, "create_api", Mock(return_value=api)),

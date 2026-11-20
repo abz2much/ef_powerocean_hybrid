@@ -94,6 +94,15 @@
       },
       "active_schedule": {
         "default": "mdi:calendar-clock"
+      },
+      "wifi_state": {
+        "default": "mdi:wifi"
+      },
+      "ethernet_state": {
+        "default": "mdi:ethernet"
+      },
+      "cellular_state": {
+        "default": "mdi:signal"
       }
     },
     "switch": {
