@@ -11,7 +11,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
-from homeassistant.const import ATTR_DEVICE_ID, ATTR_ENTITY_ID, Platform
+from homeassistant.const import ATTR_DEVICE_ID, ATTR_ENTITY_ID, STATE_OFF, Platform
 from homeassistant.core import Context, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry, entity_registry
@@ -43,6 +43,7 @@ from .const import (
     CONF_MAX_BATTERY_DISCHARGED_POWER,
     CONF_MAX_GRID_POWER,
     CONF_MAX_SOLAR_POWER,
+    CONF_MODBUS_CONTROL,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
     DEFAULT_BATTERY_COUNT,
@@ -431,10 +432,12 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.control.start()
 
     def _other_controller(self) -> ConfigEntry | None:
-        """Return another loaded entry that can write to this inverter, if any.
+        """Return another loaded entry controlling this inverter, if any.
 
         The Modbus integration this one is based on, or a second entry of this
-        one, set up for the same address. Matched by the address as entered.
+        one, set up for the same address (matched as entered), with its own
+        Modbus Control on. With it off, it only reads over the same shared
+        connection and writes nothing (from EF-PowerOcean-TcpModbus 2.10.0).
         """
         host = self.host.strip().lower()
         for domain in (OTHER_MODBUS_DOMAIN, DOMAIN):
@@ -443,9 +446,26 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     other.entry_id != self.config_entry.entry_id
                     and other.state is ConfigEntryState.LOADED
                     and str(other.data.get(CONF_HOST, "")).strip().lower() == host
+                    and self._controls(other)
                 ):
                     return other
         return None
+
+    def _controls(self, other: ConfigEntry) -> bool:
+        """Return whether *other* has its Modbus Control on, or may have.
+
+        Read from its switch; without one, whether it writes is unknown, and the
+        safe answer is that it may.
+        """
+        for registered in entity_registry.async_entries_for_config_entry(
+            entity_registry.async_get(self.hass), other.entry_id
+        ):
+            if registered.domain == "switch" and registered.unique_id.endswith(
+                f"_{CONF_MODBUS_CONTROL}"
+            ):
+                state = self.hass.states.get(registered.entity_id)
+                return state is None or state.state != STATE_OFF
+        return True
 
     def _check_sole_controller(self) -> None:
         """Refuse to take control while another integration has the inverter."""
@@ -461,8 +481,8 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self.control.enabled or (other := self._other_controller()) is None:
             return
         _LOGGER.warning(
-            "%s (%s) is also set up for the inverter at %s; Modbus Control is "
-            "switched off, as two controllers would fight over it",
+            "%s (%s) has Modbus Control on for the inverter at %s too; Modbus "
+            "Control is switched off here, as two controllers would fight over it",
             other.title,
             other.domain,
             self.host,

@@ -226,14 +226,29 @@ async def test_battery_controls_are_unavailable_while_modbus_control_is_off(
     assert _state(hass, select_id) == "automatic"
 
 
-def _other_controller(host: str = HOST) -> MockConfigEntry:
-    """The Modbus integration this one is based on, loaded for an inverter."""
-    return MockConfigEntry(
+def _other_controller(
+    hass: HomeAssistant, host: str = HOST, control: str | None = "on"
+) -> MockConfigEntry:
+    """The Modbus integration this one is based on, loaded for an inverter.
+
+    *control* is the state of its Modbus Control switch; None leaves it out.
+    """
+    other = MockConfigEntry(
         domain="ef_powerocean_tcpmodbus",
         title="EcoFlow PowerOcean",
         data={const.CONF_HOST: host, const.CONF_PORT: 502},
         state=ConfigEntryState.LOADED,
     )
+    other.add_to_hass(hass)
+    if control is not None:
+        switch = er.async_get(hass).async_get_or_create(
+            "switch",
+            "ef_powerocean_tcpmodbus",
+            f"{other.entry_id}_modbus_control",
+            config_entry=other,
+        )
+        hass.states.async_set(switch.entity_id, control)
+    return other
 
 
 async def _switch_on(hass: HomeAssistant, entry: MockConfigEntry) -> None:
@@ -252,7 +267,7 @@ async def test_control_is_refused_while_another_integration_has_the_inverter(
 ) -> None:
     """Two Modbus controllers would fight over the inverter."""
     entry = await set_up()
-    _other_controller().add_to_hass(hass)
+    _other_controller(hass)
 
     with pytest.raises(HomeAssistantError) as error:
         await _switch_on(hass, entry)
@@ -266,11 +281,36 @@ async def test_control_is_allowed_beside_one_for_another_inverter(
     hass: HomeAssistant, set_up: SetUp
 ) -> None:
     entry = await set_up()
-    _other_controller("192.0.2.99").add_to_hass(hass)
+    _other_controller(hass, "192.0.2.99")
 
     await _switch_on(hass, entry)
 
     assert entry.runtime_data.modbus.control.enabled is True
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_control_is_allowed_beside_one_whose_own_control_is_off(
+    hass: HomeAssistant, set_up: SetUp
+) -> None:
+    """It only reads then, over the same shared connection; it writes nothing."""
+    entry = await set_up()
+    _other_controller(hass, control="off")
+
+    await _switch_on(hass, entry)
+
+    assert entry.runtime_data.modbus.control.enabled is True
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_control_is_refused_beside_one_whose_control_cannot_be_seen(
+    hass: HomeAssistant, set_up: SetUp
+) -> None:
+    """Without its switch, whether it writes is unknown: the safe answer is no."""
+    entry = await set_up()
+    _other_controller(hass, control=None)
+
+    with pytest.raises(HomeAssistantError):
+        await _switch_on(hass, entry)
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
@@ -281,7 +321,7 @@ async def test_control_is_handed_back_when_another_integration_arrives(
     await _switch_on(hass, entry)
     coordinator = entry.runtime_data.modbus
 
-    _other_controller().add_to_hass(hass)
+    _other_controller(hass)
     await coordinator.async_refresh()
     await hass.async_block_till_done()
 

@@ -174,9 +174,12 @@
   it off was saved only 30 seconds later, so a crash in that time turned it
   back on. An old "Modbus Control" setting in the entry's options is ignored.
 - Modbus Control cannot be switched on while EF-PowerOcean-TcpModbus, or a
-  second entry of this integration, is loaded for the same inverter address:
-  two controllers would fight over it. If one is loaded while control is on,
-  the next poll switches control off, with a warning in the log.
+  second entry of this integration, has its own Modbus Control on for the same
+  inverter address: two controllers would fight over it. One with its control
+  off only reads, over the same shared connection, and is left alone; one whose
+  Modbus Control switch cannot be found counts as controlling. If the other's
+  control comes on while control is on here, the next poll switches it off
+  here, with a warning in the log.
 - The heartbeat that keeps the inverter following Modbus commands now beats only
   while the control logic (guards, expiry, modes) has run on a poll within two
   poll intervals plus 30 seconds. Before, it beat on its own timer whatever
