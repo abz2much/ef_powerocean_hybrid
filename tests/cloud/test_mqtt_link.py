@@ -56,6 +56,7 @@ class FakeMqtt:
     """Stands in for PowerOceanMqtt: no network, records the calls."""
 
     instances: ClassVar[list[FakeMqtt]] = []
+    connected = True
 
     def __init__(
         self,

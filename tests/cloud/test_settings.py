@@ -786,3 +786,19 @@ async def test_reported_setting_kept_while_the_cloud_is_behind(
     await _poll(hass, hybrid_entry)
 
     assert _state(hass, SOLAR_NUMBER) == "77"
+
+
+async def test_an_unconfirmed_command_is_a_warning(
+    hass: HomeAssistant,
+    cloud_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Which command, after how long, and whether MQTT was still connected."""
+    await _setup(hass, cloud_entry, set_up_hybrid)
+    SettingsMqtt.acknowledge = False
+
+    with patch(TIMEOUT, 0.01), pytest.raises(HomeAssistantError):
+        await _set(hass, CLOUD_BACKUP_NUMBER, 16)
+
+    assert "not acknowledged within 0.01 s (MQTT connected: True)" in caplog.text

@@ -688,7 +688,10 @@ class PowerOceanMqtt:
             credentials["certificateAccount"], credentials["certificatePassword"]
         )
         self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
+        # paho's own log (keep alive, reconnects) in the integration's debug log
+        self.client.enable_logger(LOGGER.getChild("paho"))
         self.client.reconnect_delay_set(min_delay=5, max_delay=300)
 
     @property
@@ -718,83 +721,70 @@ class PowerOceanMqtt:
         self.client.disconnect()
         self.client.loop_stop()
 
+    @property
+    def connected(self) -> bool:
+        """Return whether paho holds a connection to the broker now."""
+        return self.client.is_connected()
+
+    def _send(self, payload: bytes, seq: int) -> None:
+        """Publish to .../set; log it, and warn when paho could not send it."""
+        info = self.client.publish(f"{self._property_topic}/set", payload, qos=1)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            LOGGER.warning(
+                "MQTT command %s not sent: %s", seq, mqtt.error_string(info.rc)
+            )
+        else:
+            LOGGER.debug("MQTT sent command %s", seq)
+
     def request_full_state(self) -> None:
         """Ask the system for its full state, which holds the module info."""
         self.client.publish(f"{self._property_topic}/get", get_all_request(), qos=1)
 
     def request_energy_stream(self) -> None:
         """Ask the system for the energy stream (power values every ~5 s)."""
-        self.client.publish(
-            f"{self._property_topic}/set",
-            energy_stream_request(self.serial, new_seq()),
-            qos=1,
-        )
+        seq = new_seq()
+        self._send(energy_stream_request(self.serial, seq), seq)
 
     def set_led_brightness(self, percent: int, seq: int) -> None:
         """Send the LED brightness in % (acknowledged with `seq`)."""
-        self.client.publish(
-            f"{self._property_topic}/set",
-            led_brightness_request(self.serial, percent, seq),
-            qos=1,
-        )
+        self._send(led_brightness_request(self.serial, percent, seq), seq)
 
     def set_soc_limits(
         self, charge_limit: int, backup_reserve: int, dev_soc: int, seq: int
     ) -> None:
         """Send charge limit, backup reserve and devSoc in % (ack with `seq`)."""
-        self.client.publish(
-            f"{self._property_topic}/set",
+        self._send(
             soc_limits_request(self.serial, charge_limit, backup_reserve, dev_soc, seq),
-            qos=1,
+            seq,
         )
 
     def set_battery_save_mode(self, enabled: int, zone: int, seq: int) -> None:
         """Switch the battery save mode with sysZone (acknowledged with `seq`)."""
-        self.client.publish(
-            f"{self._property_topic}/set",
-            battery_save_mode_request(self.serial, enabled, zone, seq),
-            qos=1,
-        )
+        self._send(battery_save_mode_request(self.serial, enabled, zone, seq), seq)
 
     def request_schedules(self) -> None:
         """Ask the system for the list of its schedules (answer on set_reply)."""
-        self.client.publish(
-            f"{self._property_topic}/set",
-            schedule_list_request(self.serial, new_seq()),
-            qos=1,
-        )
+        seq = new_seq()
+        self._send(schedule_list_request(self.serial, seq), seq)
 
     def request_schedule(self, schedule_id: int, schedule_type: int) -> None:
         """Ask the system for one schedule (answer on set_reply)."""
-        self.client.publish(
-            f"{self._property_topic}/set",
-            schedule_read_request(self.serial, schedule_id, schedule_type, new_seq()),
-            qos=1,
+        seq = new_seq()
+        self._send(
+            schedule_read_request(self.serial, schedule_id, schedule_type, seq), seq
         )
 
     def set_schedule_enabled(self, schedule_id: int, enabled: int, seq: int) -> None:
         """Switch a schedule on (1) or off (0), acknowledged with `seq`."""
-        self.client.publish(
-            f"{self._property_topic}/set",
-            schedule_switch_request(self.serial, schedule_id, enabled, seq),
-            qos=1,
-        )
+        self._send(schedule_switch_request(self.serial, schedule_id, enabled, seq), seq)
 
     def save_schedule(self, action: int, schedule: Schedule, seq: int) -> None:
         """Add (SCHEDULE_ADD) or edit (SCHEDULE_EDIT) a schedule, ack with `seq`."""
-        self.client.publish(
-            f"{self._property_topic}/set",
-            schedule_save_request(self.serial, action, schedule, seq),
-            qos=1,
-        )
+        self._send(schedule_save_request(self.serial, action, schedule, seq), seq)
 
     def delete_schedule(self, schedule_id: int, seq: int) -> None:
         """Delete a schedule, acknowledged with `seq`."""
-        self.client.publish(
-            f"{self._property_topic}/set",
-            schedule_delete_request(self.serial, schedule_id, seq),
-            qos=1,
-        )
+        self._send(schedule_delete_request(self.serial, schedule_id, seq), seq)
 
     def _on_connect(
         self,
@@ -807,14 +797,26 @@ class PowerOceanMqtt:
         if reason.is_failure:
             LOGGER.warning("MQTT connection refused: %s", reason)
             return
-        LOGGER.debug("MQTT connected")
+        LOGGER.info("MQTT connected")
         for topic in self.topics():
             client.subscribe(topic, qos=1)
         # Also after a reconnect: the system may have restarted (update)
         self.request_full_state()
 
+    def _on_disconnect(
+        self,
+        _client: mqtt.Client,
+        _userdata: Any,
+        _flags: Any,
+        reason: ReasonCode,
+        _props: Any,
+    ) -> None:
+        # paho reconnects by itself (5 s up to 5 min); commands wait meanwhile
+        LOGGER.warning("MQTT disconnected: %s", reason)
+
     def _on_reply(self, part: Part) -> None:
         """Hand over a reply: schedules first, then the acknowledgement."""
+        LOGGER.debug("MQTT reply %s/%s seq %s", part.cmd_func, part.cmd_id, part.seq)
         # Schedules first: state is there when the waiting command goes on
         if (schedules := schedule_list(part)) is not None:
             self.callbacks.on_schedules(schedules)
@@ -841,3 +843,7 @@ class PowerOceanMqtt:
                     self.callbacks.on_energy_stream(values)
         except ValueError:
             LOGGER.debug("MQTT message is no protobuf message")
+        except Exception:
+            # Raised into paho, it would stop its thread: nothing would arrive
+            # any more, with nothing in the log.
+            LOGGER.exception("MQTT message could not be read (%s)", message.topic)

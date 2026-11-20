@@ -573,6 +573,13 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             async with asyncio.timeout(COMMAND_TIMEOUT):
                 await acknowledged
         except TimeoutError as err:
+            mqtt = self.mqtt
+            _LOGGER.warning(
+                "MQTT command %s not acknowledged within %s s (MQTT connected: %s)",
+                seq,
+                COMMAND_TIMEOUT,
+                mqtt.connected if mqtt is not None else False,
+            )
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="not_acknowledged"
             ) from err
