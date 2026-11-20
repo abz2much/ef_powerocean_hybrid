@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta
-from typing import Final
+from typing import Any, Final
 
 from homeassistant.config_entries import (
     SIGNAL_CONFIG_ENTRY_CHANGED,
@@ -251,14 +251,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> b
         if entry.options.get(CONF_MQTT, False):
             entry.async_on_unload(cloud.async_stop_mqtt)
 
-            async def _async_stop_mqtt(_event: Event) -> None:
-                await cloud.async_stop_mqtt()
-
             # Entries are not unloaded when Home Assistant stops, and paho's
             # thread must not hand over to a closed event loop.
-            entry.async_on_unload(
-                hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_mqtt)
-            )
+            _async_on_stop(hass, entry, cloud.async_stop_mqtt)
             if cloud.last_update_success:
                 await cloud.async_start_mqtt()
             else:
@@ -351,6 +346,39 @@ async def _async_start_modbus(
             lambda: _async_update_modbus_disabled_issue(hass, entry, coordinator)
         )
     )
+
+    # Entries are not unloaded when Home Assistant stops: release the command
+    # while the connection is still open, rather than leave the inverter on it
+    # until its window runs out.
+    _async_on_stop(hass, entry, lambda: coordinator.control.async_stop())
+
+
+@callback
+def _async_on_stop(
+    hass: HomeAssistant,
+    entry: EcoflowConfigEntry,
+    action: Callable[[], Coroutine[Any, Any, None]],
+) -> None:
+    """Run *action* when Home Assistant stops, while the entry is loaded.
+
+    A one-time listener is gone once it has fired, so the unload removes it
+    only if it has not.
+    """
+    fired = False
+
+    async def _async_stopped(_event: Event) -> None:
+        nonlocal fired
+        fired = True
+        await action()
+
+    remove = hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stopped)
+
+    @callback
+    def _async_unloaded() -> None:
+        if not fired:
+            remove()
+
+    entry.async_on_unload(_async_unloaded)
 
 
 @callback

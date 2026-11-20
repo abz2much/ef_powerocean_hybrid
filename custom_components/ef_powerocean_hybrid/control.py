@@ -7,6 +7,7 @@ and nothing reaches the wire unless the inverter is currently following us.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from collections.abc import Callable, Mapping
@@ -75,6 +76,8 @@ _LOGGER = logging.getLogger(__name__)
 
 # Added to two poll intervals before the control logic counts as stopped.
 CONTROL_LOGIC_GRACE_S = 30
+# How long releasing the command may hold up a switch-off or a shutdown.
+RELEASE_TIMEOUT_S = 5
 
 # Device states in which control steps aside and leaves the inverter to itself.
 _STEPPED_ASIDE = frozenset(
@@ -718,13 +721,45 @@ class ControlManager:
             self._heartbeat.start()
 
     async def async_stop(self) -> None:
+        """Release the command and stop beating, as Home Assistant stops."""
+        if self._enabled:
+            await self._async_release()
         await self._heartbeat.async_stop()
+
+    async def _async_release(self) -> None:
+        """Tell the inverter to drop the command, before the heartbeat stops.
+
+        Otherwise it goes on with it, charging or discharging, until its window
+        runs out. Best effort and quick: a failure only leaves the window to end
+        it, as before.
+        """
+        if (
+            self._test_running
+            or not self._heartbeat.in_control
+            or not self._modbus_client.connected
+            or not self._modbus_client.writes_allowed
+        ):
+            return
+        try:
+            async with asyncio.timeout(RELEASE_TIMEOUT_S):
+                await self._async_write_setpoint(self._commanded_feature, 0.0)
+                await self._async_write_control_word(
+                    self._compose_control_command(ControlFeature.AUTOMATIC)
+                )
+        except (HomeAssistantError, TimeoutError) as err:
+            _LOGGER.warning(
+                "Could not release the command (%r); the inverter returns to its "
+                "app settings within %ss",
+                err,
+                HEARTBEAT_WINDOW_S,
+            )
 
     async def async_set_enabled(self, enabled: bool) -> None:
         """Take control from the app, or hand it back.
 
-        Nothing is written when handing back: stopping the heartbeat is enough, and
-        the inverter returns to its app settings once its 60 s window runs out.
+        Handing back releases the command first (setpoint 0, the default method),
+        then stops the heartbeat; the inverter returns to its app settings once
+        its 60 s window runs out.
         """
         if enabled == self._enabled:
             return
@@ -738,6 +773,7 @@ class ControlManager:
             self._control_stale = True
             self._heartbeat.start()
         else:
+            await self._async_release()
             await self._heartbeat.async_stop()
             # Start over as if freshly loaded, so no mode comes back by itself.
             self._feature = ControlFeature.AUTOMATIC

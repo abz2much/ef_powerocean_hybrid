@@ -294,7 +294,10 @@ async def test_no_timed_request_while_mqtt_is_disconnected(
 
 
 async def test_mqtt_stops_when_home_assistant_stops(
-    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+    hass: HomeAssistant,
+    hybrid_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Entries are not unloaded at a stop; paho's thread must not outlive the loop."""
     await _setup(hass, hybrid_entry, set_up_hybrid, mqtt=True)
@@ -305,6 +308,10 @@ async def test_mqtt_stops_when_home_assistant_stops(
 
     assert client.stopped
     assert hybrid_entry.runtime_data.cloud.mqtt is None
+    # The listener has fired once; the unload must not try to remove it again.
+    assert await hass.config_entries.async_unload(hybrid_entry.entry_id)
+    await hass.async_block_till_done()
+    assert "Unable to remove unknown job listener" not in caplog.text
 
 
 async def test_late_message_after_unload_is_ignored(

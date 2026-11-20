@@ -65,6 +65,8 @@ class FakeInverter:
     system_setpoint: int = 0
     system_setpoint_writes: int = 0
     connected: bool = True
+    # As the real client once the inverter's identity is checked
+    writes_allowed: bool = True
     reachable: bool = True
     # Polls the battery stays put after each new setpoint.
     setback_polls: int = 0

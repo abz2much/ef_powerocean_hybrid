@@ -19,7 +19,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.config_entries import ConfigEntryDisabler, ConfigEntryState
-from homeassistant.const import MAJOR_VERSION, MINOR_VERSION, STATE_UNAVAILABLE
+from homeassistant.const import (
+    EVENT_HOMEASSISTANT_STOP,
+    MAJOR_VERSION,
+    MINOR_VERSION,
+    STATE_UNAVAILABLE,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_platform
@@ -856,6 +861,29 @@ async def test_unloading_stops_the_heartbeat_and_closes_the_client(
 
     assert _heartbeats() == []
     assert not coordinator.connected
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_home_assistant_stopping_releases_control(
+    hass: HomeAssistant, inverter: FakeInverter, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Entries are not unloaded at a stop, so the release needs its own listener."""
+    _serve_serial(inverter, SERIAL)
+    entry = _entry(inverter.port)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    control = entry.runtime_data.modbus.control
+
+    with patch.object(control, "async_stop", AsyncMock()) as stop:
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+        await hass.async_block_till_done()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    stop.assert_awaited_once()
+    # The listener has fired once; the unload must not try to remove it again.
+    assert "Unable to remove unknown job listener" not in caplog.text
 
 
 # ── An outage outlives a reload ───────────────────────────────────────────────

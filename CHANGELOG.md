@@ -184,6 +184,15 @@
   inverter on its last command, such as charging from the grid, for as long as
   Home Assistant ran. Now the inverter hands back to its app settings within
   60 seconds, with a warning in the log.
+- Switching Modbus Control off, unloading the entry or stopping Home Assistant
+  now releases the command first (setpoint 0 and the default method, battery
+  saver kept), within 5 seconds, then stops the heartbeat. Before, nothing was
+  written, and the inverter went on with the command, such as charging or
+  discharging, for up to 60 seconds. A release that fails only leaves the 60
+  seconds, as before. Entries are not unloaded when Home Assistant stops, so the
+  release has its own stop listener.
+- The stop listeners (this one and MQTT's) no longer log an error when the
+  entry unloads after Home Assistant's stop.
 
 ### Fixed
 

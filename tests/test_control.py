@@ -229,6 +229,8 @@ def test_a_reconnect_writes_nothing_while_modbus_control_is_off(
     Ported from EF-PowerOcean-TcpModbus e399e89 (v2.10.0)."""
     write = allow_writes(control, monkeypatch)
     asyncio.run(control.async_set_enabled(False))
+    # Switching off released the command; what follows is the reconnect.
+    write.reset_mock()
     control._heartbeat._last_success = None
 
     control.mark_stale()
@@ -1155,15 +1157,21 @@ def test_polls_write_nothing_while_modbus_control_is_off(control) -> None:
 def test_switching_modbus_control_off_hands_back_and_on_takes_control_again(
     control, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Letting the heartbeat lapse is the hand-back, so nothing is written for it."""
+    """Switching off releases the command first; the heartbeat then lapses."""
     write = allow_writes(control, monkeypatch)
     control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
     asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
     write.reset_mock()
 
     asyncio.run(control.async_set_enabled(False))
+    released = commands(write)
+    write.reset_mock()
     asyncio.run(control.async_poll({"battery_soc": 50.0}))
 
+    assert released == [
+        (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0x0000, 0x0000]),
+        (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0000]),
+    ]
     write.assert_not_awaited()
     assert control.status is Status.HANDING_BACK
     assert control.hands_back_at == HEARTBEAT_START + timedelta(
@@ -1186,6 +1194,50 @@ def test_switching_modbus_control_off_hands_back_and_on_takes_control_again(
     # The inverter may still follow the old command, so the default is re-sent.
     assert commands(write) == [(const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0000])]
     assert control.status is Status.AUTOMATIC
+
+
+def test_a_shutdown_releases_the_command_before_the_heartbeat_stops(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise the inverter goes on charging or discharging for up to 60 s."""
+    write = allow_writes(control, monkeypatch)
+    control._battery_saver = True
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+    write.reset_mock()
+
+    asyncio.run(control.async_stop())
+
+    assert commands(write) == [
+        (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0x0000, 0x0000]),
+        # The default method, with battery saver kept as the user set it
+        (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0008]),
+    ]
+
+
+def test_nothing_is_released_where_nothing_was_held(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Modbus Control off: the inverter was never ours, so it is left alone."""
+    write = allow_writes(control, monkeypatch)
+    control._enabled = False
+
+    asyncio.run(control.async_stop())
+
+    write.assert_not_awaited()
+
+
+def test_a_failed_release_still_hands_back(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The heartbeat stops anyway, and the inverter returns to its app in 60 s."""
+    allow_writes(control, monkeypatch, rejected=True)
+    control._heartbeat.async_stop = AsyncMock()
+
+    asyncio.run(control.async_set_enabled(False))
+
+    control._heartbeat.async_stop.assert_awaited_once()
+    assert control.enabled is False
 
 
 def test_a_reserve_of_zero_disables_the_guard(
