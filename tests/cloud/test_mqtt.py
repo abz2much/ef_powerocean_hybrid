@@ -6,6 +6,8 @@ from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
+from paho.mqtt.client import convert_disconnect_error_code_to_reason_code
+from paho.mqtt.enums import MQTTErrorCode
 
 from custom_components.ef_powerocean_hybrid.cloud.mqtt import (
     ModuleVersion,
@@ -366,6 +368,38 @@ def test_a_refused_connection_is_not_reported(
     mqtt._on_connect(mqtt.client, None, None, MagicMock(is_failure=True), None)
 
     connected.assert_not_called()
+
+
+def test_a_disconnect_we_asked_for_is_no_warning(
+    connection: tuple[PowerOceanMqtt, MqttCallbacks],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Stopping at every shutdown would otherwise raise a Debug alert."""
+    mqtt, _ = connection
+
+    reason = convert_disconnect_error_code_to_reason_code(
+        MQTTErrorCode.MQTT_ERR_SUCCESS
+    )
+
+    mqtt._on_disconnect(mqtt.client, None, None, reason, None)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.mark.parametrize(
+    "error", (MQTTErrorCode.MQTT_ERR_CONN_LOST, MQTTErrorCode.MQTT_ERR_KEEPALIVE)
+)
+def test_a_dropped_connection_is_a_warning(
+    connection: tuple[PowerOceanMqtt, MqttCallbacks],
+    caplog: pytest.LogCaptureFixture,
+    error: MQTTErrorCode,
+) -> None:
+    mqtt, _ = connection
+    reason = convert_disconnect_error_code_to_reason_code(error)
+
+    mqtt._on_disconnect(mqtt.client, None, None, reason, None)
+
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
 
 
 def test_on_connect_refused_sends_nothing(

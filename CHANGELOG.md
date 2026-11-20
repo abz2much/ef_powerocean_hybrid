@@ -180,6 +180,8 @@
   requests wait instead of warning each time.
 - MQTT now stops when Home Assistant stops. Before, a message arriving during
   the shutdown logged "Event loop is closed".
+- A disconnect the integration asked for (an unload or Home Assistant's stop)
+  is logged at debug level, not as a warning; a dropped connection still is.
 - A command is refused at once while MQTT is reconnecting, with a message to
   try again in a minute. Before, paho held it and sent it on reconnect, long
   after Home Assistant reported it failed: a backup reserve change could then

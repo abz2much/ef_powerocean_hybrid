@@ -810,7 +810,12 @@ class PowerOceanMqtt:
         reason: ReasonCode,
         _props: Any,
     ) -> None:
-        # paho reconnects by itself (5 s up to 5 min); commands wait meanwhile
+        if not reason.is_failure:
+            # Asked for: stopped at an unload or at Home Assistant's stop
+            LOGGER.debug("MQTT disconnected: %s", reason)
+            return
+        # paho reconnects by itself (5 s up to 5 min); commands are refused
+        # meanwhile
         LOGGER.warning("MQTT disconnected: %s", reason)
 
     def _on_reply(self, part: Part) -> None:
