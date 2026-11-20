@@ -63,10 +63,26 @@ def test_a_number_sent_as_text_still_counts() -> None:
     assert sensor.native_value == 7498.12
 
 
-def test_a_text_sensor_keeps_its_text() -> None:
+def test_a_translated_state_is_lowercase() -> None:
+    """As powerocean_single_phase (sensor.py:190-192): the state names it."""
     sensor = _sensor(
         "pcs_run_state", {f"{CLOUD_SN}_JTS1_EMS_CHANGE_REPORT_pcsRunSta": "RUNSTA_RUN"}
     )
 
     assert sensor.available is True
-    assert sensor.native_value == "RUNSTA_RUN"
+    assert sensor.native_value == "runsta_run"
+
+
+def test_a_translated_number_state_becomes_text() -> None:
+    sensor = _sensor("online", {f"{CLOUD_SN}_online": 1})
+
+    assert sensor.native_value == "1"
+
+
+def test_other_text_keeps_its_case() -> None:
+    sensor = _sensor(
+        "pcs_ac_error_code",
+        {f"{CLOUD_SN}_JTS1_EMS_CHANGE_REPORT_pcsAcErrCode": "ERR_A"},
+    )
+
+    assert sensor.native_value == "ERR_A"

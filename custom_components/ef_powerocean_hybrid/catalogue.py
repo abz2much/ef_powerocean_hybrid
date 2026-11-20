@@ -30,6 +30,7 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 
+from .cloud.datapoints import DISABLED_BY_DEFAULT, TRANSLATED_STATES
 from .const import ENERGY_SENSOR_MAP, SENSOR_MAP
 from .models import EnergySensorDef, InverterModel, SensorDef
 
@@ -72,8 +73,26 @@ class CatalogueEntry:
     per_pack: bool = False
     enabled: bool = True
 
+    @property
+    def translated_states(self) -> bool:
+        """Whether the state is shown in lowercase, named by the translations.
+
+        As powerocean_single_phase does for these datapoints.
+        """
+        return (
+            self.kind == "cloud"
+            and self.cloud is not None
+            and parser_key(self.cloud) in TRANSLATED_STATES
+        )
+
 
 _MODEL_PREFIX = re.compile(r"(?:[A-Z0-9]+_)?")
+
+
+def parser_key(source: CloudSource) -> str:
+    """Return the parser's key of the datapoint, as the cloud integration's lists
+    name it (the heartbeat's MPPT values without their group)."""
+    return source.key.removeprefix(MPPT)
 
 
 def cloud_value(values: dict[str, Any], serial: str, source: CloudSource) -> Any:
@@ -147,15 +166,23 @@ def _cloud(
     description: SensorDef,
     *,
     per_pack: bool = False,
-    enabled: bool = True,
+    enabled: bool | None = None,
 ) -> CatalogueEntry:
+    """A value only the cloud has; on or off by default as the cloud
+    integration decides it (DISABLED_BY_DEFAULT), unless *enabled* says."""
+    if enabled is None:
+        enabled = parser_key(source) not in DISABLED_BY_DEFAULT
     return CatalogueEntry(
         key, "cloud", description, cloud=source, per_pack=per_pack, enabled=enabled
     )
 
 
 def _text(
-    key: str, source: CloudSource, *, enabled: bool = True, per_pack: bool = False
+    key: str,
+    source: CloudSource,
+    *,
+    enabled: bool | None = None,
+    per_pack: bool = False,
 ) -> CatalogueEntry:
     return _cloud(
         key, source, _sensor(key, category=DIAG), enabled=enabled, per_pack=per_pack
@@ -259,7 +286,6 @@ _INVERTER_CLOUD: Final = (
         "cloud_active_power_l1",
         CloudSource("pcsAPhase_actPwr", HEARTBEAT),
         _power("cloud_active_power_l1", DIAG),
-        enabled=False,
     ),
     _cloud(
         "cloud_reactive_power_l1",
@@ -319,7 +345,6 @@ _INVERTER_CLOUD: Final = (
         "insulation_resistance",
         CloudSource(f"{MPPT}mpptInsResist", HEARTBEAT),
         _sensor("insulation_resistance", "Ω", category=DIAG),
-        enabled=False,
     ),
     _text(
         "ems_battery_selfcheck_state",
@@ -431,7 +456,7 @@ _INVERTER_CLOUD: Final = (
         ),
         enabled=False,
     ),
-    _text("online", CloudSource("online"), enabled=False),
+    _text("online", CloudSource("online")),
     _text("grid_state", CloudSource("sysGridSta"), enabled=False),
     _cloud(
         "charge_limit",
@@ -474,7 +499,7 @@ def _pack(
     *,
     state_class: SensorStateClass | None = MEASUREMENT,
     category: EntityCategory | None = None,
-    enabled: bool = True,
+    enabled: bool | None = None,
 ) -> CatalogueEntry:
     return _cloud(
         key,
@@ -558,14 +583,14 @@ _PACK_CLOUD: Final = (
         state_class=SensorStateClass.TOTAL_INCREASING,
     ),
     *(
-        _text(key, CloudSource(name, PACK), per_pack=True, enabled=enabled)
-        for key, name, enabled in (
-            ("pack_state", "bpSysState", True),
-            ("pack_bms_run_state", "bmsRunSta", False),
-            ("pack_charge_state", "bmsChgDsgSta", True),
-            ("pack_module_state", "dabModSta", False),
-            ("pack_balance_state", "bpBalanceState", False),
-            ("pack_error_code", "bpErrCode", True),
+        _text(key, CloudSource(name, PACK), per_pack=True)
+        for key, name in (
+            ("pack_state", "bpSysState"),
+            ("pack_bms_run_state", "bmsRunSta"),
+            ("pack_charge_state", "bmsChgDsgSta"),
+            ("pack_module_state", "dabModSta"),
+            ("pack_balance_state", "bpBalanceState"),
+            ("pack_error_code", "bpErrCode"),
         )
     ),
     _cloud(
@@ -578,7 +603,6 @@ _PACK_CLOUD: Final = (
             category=DIAG,
         ),
         per_pack=True,
-        enabled=False,
     ),
 )
 

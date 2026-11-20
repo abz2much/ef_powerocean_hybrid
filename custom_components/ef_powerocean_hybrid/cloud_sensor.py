@@ -157,6 +157,10 @@ class CloudSensor(CoordinatorEntity[CloudCoordinator], SensorEntity):
     def native_value(self) -> Any:
         # Only asked while available, so the value is there.
         value = self._value()
+        if self._definition.translated_states:
+            # As powerocean_single_phase: translated states must be lowercase
+            # (WORKMODE_SELFUSE, 1); one without a translation shows as it is.
+            return str(value).lower()
         if self.device_class is SensorDeviceClass.TIMESTAMP:
             return datetime.fromtimestamp(float(value), UTC)
         if (

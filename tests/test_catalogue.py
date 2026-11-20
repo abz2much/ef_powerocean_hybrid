@@ -5,11 +5,17 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 from custom_components.ef_powerocean_hybrid import const
 from custom_components.ef_powerocean_hybrid.catalogue import (
     CATALOGUE_86,
     cloud_value,
+    parser_key,
+)
+from custom_components.ef_powerocean_hybrid.cloud.datapoints import (
+    DISABLED_BY_DEFAULT,
+    TRANSLATED_STATES,
 )
 from custom_components.ef_powerocean_hybrid.cloud.parse import parse
 from custom_components.ef_powerocean_hybrid.models import InverterModel
@@ -149,3 +155,46 @@ def test_soc_comes_from_the_change_report_as_in_the_cloud_integration() -> None:
     source = next(e.cloud for e in CATALOGUE_86 if e.key == "battery_soc")
     assert source is not None
     assert (source.report, source.key) == ("EMS_CHANGE_REPORT", "bpSoc")
+
+
+# As powerocean_single_phase decides it (datapoints.py DISABLED_BY_DEFAULT,
+# TRANSLATED_STATES, applied in types.py from_datapoint).
+
+TRANSLATIONS = json.loads(
+    (Path(const.__file__).parent / "translations" / "en.json").read_text()
+)["entity"]["sensor"]
+
+
+def _cloud_only() -> list[Any]:
+    return [e for e in CATALOGUE_86 if e.kind == "cloud" and e.cloud is not None]
+
+
+def test_the_parser_key_is_the_datapoint_key() -> None:
+    keys = {
+        d.key
+        for d in parse(json.loads(FIXTURE.read_text()), "SN_MAIN", "86").datapoints
+    }
+
+    assert {parser_key(e.cloud) for e in _cloud_only() if e.cloud} <= keys
+
+
+def test_cloud_values_are_on_or_off_as_in_the_cloud_integration() -> None:
+    assert {
+        e.key
+        for e in _cloud_only()
+        if e.cloud and e.enabled == (parser_key(e.cloud) in DISABLED_BY_DEFAULT)
+    } == set()
+
+
+def test_the_cloud_integrations_translated_states_are_translated() -> None:
+    translated = [
+        e for e in _cloud_only() if e.cloud and parser_key(e.cloud) in TRANSLATED_STATES
+    ]
+
+    assert {e.key for e in translated} == {
+        e.key for e in CATALOGUE_86 if e.translated_states
+    }
+    for entry in translated:
+        states = TRANSLATIONS[entry.key].get("state", {})
+        assert states, entry.key
+        assert all(state == state.lower() for state in states), entry.key

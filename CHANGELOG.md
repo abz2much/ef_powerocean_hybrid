@@ -97,6 +97,15 @@
   Modbus has a current reading, otherwise over the cloud (needs the MQTT
   option). On a system set up through the cloud alone it exists only with the
   MQTT option.
+- The cloud's text values show as powerocean_single_phase shows them: in
+  lower case, with a readable name ("Charging", "Self-powered", "Running")
+  for the pack state, charge state, BMS run state and module state, and the
+  inverter's operating mode, run state, feed-in mode, online and grid state.
+- The cloud's sensors are on or off by default as in powerocean_single_phase:
+  active power L1, PV insulation resistance, online, and each pack's BMS run
+  state, module state, balance state and update time are now on; each pack's
+  highest and lowest MOSFET temperature are now off. Entities already in Home
+  Assistant keep their setting.
 - With the MQTT option, the backup reserve is one number: it shows the Modbus
   reading (register 40536) while Modbus has a current one, otherwise the
   cloud's, and is always written over MQTT. The Modbus "App Backup Reserve"

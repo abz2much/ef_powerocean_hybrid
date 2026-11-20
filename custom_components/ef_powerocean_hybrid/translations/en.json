@@ -779,16 +779,37 @@
         "name": "EMS change update time"
       },
       "cloud_operating_mode": {
-        "name": "Operating mode (cloud)"
+        "name": "Operating mode (cloud)",
+        "state": {
+          "workmode_selfuse": "Self-powered",
+          "workmode_tou": "Time-of-use",
+          "workmode_standby_mode": "Standby",
+          "workmode_ai_schedule": "AI mode",
+          "workmode_backup": "Backup",
+          "workmode_timer_mode": "Schedule",
+          "workmode_soc_calib": "Battery calibration",
+          "workmode_ac_makeup": "Charging from grid"
+        }
       },
       "pcs_run_state": {
-        "name": "Inverter run state"
+        "name": "Inverter run state",
+        "state": {
+          "runsta_run": "Running",
+          "runsta_stop": "Stopped",
+          "runsta_standby": "Standby"
+        }
       },
       "cloud_feed_in_power": {
         "name": "Feed-in power limit (cloud)"
       },
       "cloud_feed_mode": {
-        "name": "Feed-in mode (cloud)"
+        "name": "Feed-in mode (cloud)",
+        "state": {
+          "1": "Unlimited",
+          "2": "Zero power",
+          "3": "Power limiting",
+          "0": "Off"
+        }
       },
       "cloud_feed_ratio": {
         "name": "Feed-in ratio (cloud)"
@@ -839,10 +860,18 @@
         "name": "Circuit breaker capacity (cloud)"
       },
       "online": {
-        "name": "Online"
+        "name": "Online",
+        "state": {
+          "1": "Online",
+          "0": "Offline"
+        }
       },
       "grid_state": {
-        "name": "Grid state"
+        "name": "Grid state",
+        "state": {
+          "0": "On-grid",
+          "1": "Off-grid"
+        }
       },
       "charge_limit": {
         "name": "Charge limit"
@@ -920,16 +949,40 @@
         "name": "Discharged total"
       },
       "pack_state": {
-        "name": "State"
+        "name": "State",
+        "state": {
+          "normal_state": "Normal",
+          "pre_power_on_state": "Starting",
+          "cfm_power_on_state": "Switched on",
+          "power_off_state": "Switched off",
+          "sleep_state": "Sleep"
+        }
       },
       "pack_bms_run_state": {
-        "name": "BMS run state"
+        "name": "BMS run state",
+        "state": {
+          "pb_bms_state_chargeable": "Ready to charge",
+          "pb_bms_state_normal": "Normal",
+          "pb_bms_state_dischargeable": "Ready to discharge",
+          "pb_bms_state_shutdown": "Shut down",
+          "pb_bms_state_fault": "Fault"
+        }
       },
       "pack_charge_state": {
-        "name": "Charge state"
+        "name": "Charge state",
+        "state": {
+          "pb_chg_state": "Charging",
+          "pb_dsg_state": "Discharging",
+          "pb_standby_state": "Standby"
+        }
       },
       "pack_module_state": {
-        "name": "Module state"
+        "name": "Module state",
+        "state": {
+          "pb_mod_sta_normal": "Normal",
+          "pb_mod_sta_warnning": "Warning",
+          "pb_mod_sta_fault": "Fault"
+        }
       },
       "pack_balance_state": {
         "name": "Balance state"
