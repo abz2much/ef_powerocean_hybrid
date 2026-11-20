@@ -2,6 +2,8 @@
   "domain": "ef_powerocean_hybrid",
   "name": "EF PowerOcean Hybrid",
   "after_dependencies": [
+    "frontend",
+    "http",
     "modbus"
   ],
   "codeowners": [

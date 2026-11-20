@@ -86,6 +86,23 @@ The inverter's firmware version comes from Modbus. A system set up through the
 cloud alone shows none on the inverter's device; the firmware of the EMS and
 the other modules is in the diagnostics.
 
+## Schedule card
+
+The integration comes with a dashboard card for the scheduled tasks. Edit a
+dashboard, choose **Add card** and pick **EF PowerOcean schedules**.
+
+- A bar shows today's schedules over 24 hours (Use battery in green, Charge in
+  blue; the one in use is outlined). Below is every schedule with its on/off
+  switch; schedules that do not run today are faded.
+- Tap a schedule to change or delete it, or **+ Add** for a new one. The form
+  checks the rules as you type (no overlaps, at most 6, 30-minute steps, power
+  up to Max schedule power) and sends the whole schedule only when you press
+  **Save**. If the system refuses it, the form stays open with the reason.
+- It needs the Extended connection (MQTT). Adding and changing also need Max
+  schedule power in the options.
+- After an update, reload the browser page (or clear the app's cache) if the
+  card still looks old.
+
 ## Moving from powerocean_single_phase
 
 Not ready yet; the integration is still in development. When it is:

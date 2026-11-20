@@ -36,6 +36,7 @@ from .coordinator import (
     identity_mismatch_issue_id,
     state_store,
 )
+from .frontend_card import async_register_card
 from .modbus import async_prepare
 from .reading_checks import KEYS as READING_CHECK_KEYS
 from .runtime import HybridData
@@ -66,8 +67,9 @@ async def async_setup(
     hass: HomeAssistant,
     config: ConfigType,  # noqa: ARG001 - required by the integration API
 ) -> bool:
-    """Register the actions, which serve every configured inverter."""
+    """Register the actions, which serve every configured inverter, and the card."""
     async_setup_services(hass)
+    await async_register_card(hass)
     return True
 
 

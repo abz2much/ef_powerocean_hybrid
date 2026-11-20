@@ -50,6 +50,12 @@
   `delete_schedule`. The list is read when MQTT connects and every minute, so
   a change made in the app shows within a minute. The same checks as the
   EcoFlow app: at most 6 schedules, no overlaps, times in steps of 30 minutes.
+- A dashboard card for the scheduled tasks, served with the integration ("EF
+  PowerOcean schedules" in the card picker): a bar of today's schedules, the
+  list with on/off switches, and a form to add, change and delete them that
+  checks the rules as you type and sends only on Save. The Active schedule
+  sensor tells the card the max schedule power (attribute
+  `max_schedule_power`, not recorded).
 - The option "Max schedule power (W)": the highest power a schedule may use.
   Without it, schedules cannot be added or changed. There is no default.
 - The battery packs' firmware from the cloud on their device pages.
