@@ -9,6 +9,7 @@ import {
   checkDraft,
   defaultPower,
   deleteCall,
+  draftTitle,
   findSchedules,
   firstFreeWindow,
   runsOn,
@@ -118,6 +119,10 @@ const STYLE = `
                   background: var(--divider-color); color: inherit; }
   .chips button.sel { background: var(--primary-color); color: #fff; }
   .error { color: var(--error-color); font-size: .85em; margin-top: 3px; }
+  .notice { display: flex; gap: 8px; align-items: center; font-size: .9em; margin: 4px 0 8px;
+            color: var(--secondary-text-color); }
+  .notice.error { color: var(--error-color); }
+  .notice button { border: none; background: none; color: inherit; padding: 0 4px; }
   .buttons { display: flex; justify-content: space-between; align-items: center; margin-top: 16px; }
   .buttons button { border: none; border-radius: 16px; padding: 6px 14px; background: none; }
   .delete { color: var(--error-color); }
@@ -244,6 +249,7 @@ class ScheduleCard extends HTMLElement {
           full || noMax ? "disabled" : ""
         }>+ Add</button></div>
       ${addHint ? `<div class="hint">${escape(addHint)}</div>` : ""}
+      ${this._noticeHtml()}
       <div class="bar">${pieces}</div>
       <div class="ticks"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>
       ${rows}`;
@@ -259,9 +265,16 @@ class ScheduleCard extends HTMLElement {
         (s) => s.entityId === data.toggle,
       );
       if (schedule) {
-        const { domain, service, data: call } = toggleCall(schedule);
-        this._hass.callService(domain, service, call);
+        this._call(
+          toggleCall(schedule),
+          `${schedule.enabled ? "Switching off" : "Switching on"} ${
+            schedule.title
+          }`,
+        );
       }
+    } else if (data.dismiss !== undefined) {
+      this._notice = null;
+      this._redraw();
     } else if (data.add !== undefined) {
       this._open(null);
     } else if (data.edit !== undefined) {
@@ -437,46 +450,75 @@ class ScheduleCard extends HTMLElement {
     }
   }
 
-  async _call({ domain, service, data, target }) {
+  // The form closes at once (owner); the card says what is being done and,
+  // if the system refuses it or does not confirm it, why.
+  async _call({ domain, service, data, target }, label) {
     if (this._busy) return;
     this._busy = true;
-    this._serverError = "";
-    this._renderMessages();
+    this.shadowRoot.querySelector("dialog").close();
+    this._notice = {
+      text: `${label}… It can take a minute to show.`,
+      error: false,
+    };
+    this._redraw();
     try {
-      // The form shows a refusal; no second message from Home Assistant.
+      // The card shows a refusal; no second message from Home Assistant.
       await this._hass.callService(domain, service, data, target, false);
-      this.shadowRoot.querySelector("dialog").close();
+      this._notice = null;
     } catch (error) {
-      // Refused or not confirmed: keep the form and what was entered.
-      this._serverError = error?.message ?? String(error);
+      this._notice = {
+        text: `${label} failed: ${error?.message ?? String(error)}`,
+        error: true,
+      };
     } finally {
       this._busy = false;
-      if (this._draft) this._renderMessages();
+      this._redraw();
     }
+  }
+
+  _noticeHtml() {
+    const notice = this._notice;
+    if (!notice) return "";
+    const dismiss = notice.error
+      ? '<button data-dismiss aria-label="Dismiss">✕</button>'
+      : "";
+    return `<div class="notice${notice.error ? " error" : ""}" role="status">
+      <span>${escape(notice.text)}</span>${dismiss}</div>`;
+  }
+
+  _redraw() {
+    this._shownKey = undefined;
+    this._render();
   }
 
   _save() {
     if (!this._canSave(this._errors())) return;
     if (this._original) {
-      this._call({
-        domain: DOMAIN,
-        service: "update_schedule",
-        data: changedFields(this._original, this._draft),
-        target: { entity_id: this._original.entityId },
-      });
+      this._call(
+        {
+          domain: DOMAIN,
+          service: "update_schedule",
+          data: changedFields(this._original, this._draft),
+          target: { entity_id: this._original.entityId },
+        },
+        `Saving ${this._original.title}`,
+      );
     } else {
-      this._call({
-        domain: DOMAIN,
-        service: "add_schedule",
-        data: addData(this._draft, this._data.deviceId),
-      });
+      this._call(
+        {
+          domain: DOMAIN,
+          service: "add_schedule",
+          data: addData(this._draft, this._data.deviceId),
+        },
+        `Adding ${draftTitle(this._draft)}`,
+      );
     }
   }
 
   _delete() {
     if (this._busy || !this._original) return;
     if (!window.confirm(`Delete ${this._original.title}?`)) return;
-    this._call(deleteCall(this._original));
+    this._call(deleteCall(this._original), `Deleting ${this._original.title}`);
   }
 }
 

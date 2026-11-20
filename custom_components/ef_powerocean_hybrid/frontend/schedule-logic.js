@@ -266,3 +266,8 @@ export function deleteCall(schedule) {
     target: { entity_id: schedule.entityId },
   };
 }
+
+// The name of a schedule being added, for the card's note.
+export function draftTitle(draft) {
+  return title(draft.type, draft.start, draft.end);
+}

@@ -9,6 +9,7 @@ import {
   changedFields,
   defaultPower,
   deleteCall,
+  draftTitle,
   checkDraft,
   findSchedules,
   firstFreeWindow,
@@ -416,4 +417,8 @@ test("delete targets the schedule's switch", () => {
 test("a bar piece names its schedule", () => {
   const [piece] = barPieces([byId(14)], "fri");
   assert.equal(piece.title, "Charge 06:00–08:00");
+});
+
+test("a draft is named as a schedule", () => {
+  assert.equal(draftTitle(NEW), "Charge 21:00–22:00");
 });
