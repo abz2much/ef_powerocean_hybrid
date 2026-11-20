@@ -1,9 +1,11 @@
 """test_mqtt: protobuf messages and module info of the MQTT connection."""
 
 import dataclasses
+import logging
+import threading
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from paho.mqtt.client import convert_disconnect_error_code_to_reason_code
@@ -324,6 +326,45 @@ def test_connection_uses_the_app_credentials() -> None:
     assert mqtt.client._client_id.decode().startswith("ANDROID_")
     assert mqtt.client._client_id.decode().endswith(f"_{USER_ID}")
     assert mqtt.client._username == b"app-account"
+
+
+@pytest.mark.usefixtures("socket_enabled")  # paho's loop opens a local socket pair
+def test_the_network_thread_does_not_carry_the_user_id() -> None:
+    """Home Assistant prints the thread name with every log line from it."""
+    mqtt = PowerOceanMqtt(CREDENTIALS, SN, USER_ID, _callbacks())
+    release = threading.Event()
+    with (
+        patch.object(mqtt.client, "tls_set"),
+        patch.object(mqtt.client, "connect_async"),
+        patch.object(mqtt.client, "disconnect", side_effect=release.set),
+        # The network loop, kept running until the stop
+        patch.object(
+            mqtt.client, "loop_forever", side_effect=lambda **_: release.wait(5)
+        ),
+    ):
+        mqtt.start()
+        names = [thread.name for thread in threading.enumerate()]
+        mqtt.stop()
+
+    assert not [name for name in names if USER_ID in name]
+    assert "ef_powerocean_hybrid MQTT" in names
+
+
+def test_the_user_id_is_masked_in_paho_s_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """paho logs the client id, which holds the user id, when it connects."""
+    mqtt = PowerOceanMqtt(CREDENTIALS, SN, USER_ID, _callbacks())
+    client_id = mqtt.client._client_id.decode()
+
+    with caplog.at_level(logging.DEBUG):
+        logging.getLogger("custom_components.ef_powerocean_hybrid.cloud.paho").debug(
+            "Sending CONNECT (u1, p1, wr0, wq0, wf0, c1, k60) client_id=%s",
+            client_id.encode(),
+        )
+
+    assert "Sending CONNECT" in caplog.text
+    assert USER_ID not in caplog.text
 
 
 def test_on_connect_subscribes_and_requests_full_state(

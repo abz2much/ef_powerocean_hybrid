@@ -205,6 +205,11 @@
   the heartbeat has changed once, within about two minutes.
 - An unload before the cloud's first answer no longer leaves the wait for it
   behind.
+- The EcoFlow account's user ID no longer shows in the log. paho named its
+  network thread after the MQTT client ID, which ends in the user ID, and Home
+  Assistant prints the thread name with every log line from that thread; the
+  thread is now named "ef_powerocean_hybrid MQTT". In paho's debug log the user
+  ID in the client ID is masked.
 
 ## [0.2.0] - Unreleased
 

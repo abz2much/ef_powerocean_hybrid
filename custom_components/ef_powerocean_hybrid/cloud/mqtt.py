@@ -19,7 +19,9 @@ This module does not depend on Home Assistant.
 
 from __future__ import annotations
 
+import logging
 import math
+import re
 import ssl
 import struct
 import threading
@@ -39,6 +41,26 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 LOGGER = getLogger(__package__)
+# The client id ends in the account's user id (as the app's does).
+_CLIENT_ID_USER = re.compile(r"(ANDROID_[0-9A-F]+_)\d+")
+# The name of paho's network thread, which Home Assistant prints with every log
+# line from it: paho names it after the client id.
+THREAD_NAME = "ef_powerocean_hybrid MQTT"
+
+
+class _MaskUserId(logging.Filter):
+    """Mask the user id in the client id paho logs when it connects."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        masked = _CLIENT_ID_USER.sub(r"\1<user id>", message)
+        if masked != message:
+            record.msg, record.args = masked, None
+        return True
+
+
+_PAHO_LOGGER = LOGGER.getChild("paho")
+_PAHO_LOGGER.addFilter(_MaskUserId())
 
 # Minutes in a day: a schedule's start and end are below it.
 
@@ -689,7 +711,7 @@ class PowerOceanMqtt:
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
         # paho's own log (keep alive, reconnects) in the integration's debug log
-        self.client.enable_logger(LOGGER.getChild("paho"))
+        self.client.enable_logger(_PAHO_LOGGER)
         self.client.reconnect_delay_set(min_delay=5, max_delay=300)
 
     @property
@@ -713,6 +735,10 @@ class PowerOceanMqtt:
         self.client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
         self.client.connect_async(self.host, self.port, keepalive=60)
         self.client.loop_start()
+        # paho names its thread after the client id, which holds the user id.
+        thread = getattr(self.client, "_thread", None)
+        if isinstance(thread, threading.Thread):
+            thread.name = THREAD_NAME
 
     def stop(self) -> None:
         """Disconnect (blocking)."""
