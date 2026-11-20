@@ -9,6 +9,19 @@ from typing import Any
 from .const import ECOFLOW_PORTAL_HISTORY_URL, ECOFLOW_PORTAL_LANGUAGES
 
 
+def seconds_since(moment: datetime | None, now: datetime) -> float:
+    """Return the seconds from *moment* to *now*, infinite for none.
+
+    A moment after *now* means the clock stepped back since it was taken; it
+    counts as long ago too, so a timer re-sends or re-beats rather than freezing
+    until the clock catches up.
+    """
+    if moment is None:
+        return math.inf
+    elapsed = (now - moment).total_seconds()
+    return math.inf if elapsed < 0 else elapsed
+
+
 def parse_datetime(raw: Any) -> datetime | None:
     """Parse an ISO format datetime string into a datetime object."""
     if not raw:

@@ -14,7 +14,6 @@ import random
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from datetime import datetime
-from math import inf
 from typing import Any
 
 from homeassistant.exceptions import HomeAssistantError
@@ -32,6 +31,7 @@ from .const import (
     HEARTBEAT_WINDOW_S,
 )
 from .modbus import ModbusClient, ModbusRejected
+from .util import seconds_since
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -135,9 +135,7 @@ class Heartbeat:
         return await self._async_write_heartbeat()
 
     def _age(self) -> float:
-        if self._last_success is None:
-            return inf
-        return (dt.now() - self._last_success).total_seconds()
+        return seconds_since(self._last_success, dt.now())
 
     async def _run(self) -> None:
         while True:

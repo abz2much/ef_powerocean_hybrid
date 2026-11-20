@@ -229,3 +229,14 @@ def test_closer_to_zero_ends_at_a_deficit() -> None:
     assert Zone.SURPLUS.closer_to_zero() is Zone.DEFICIT
     assert Zone.DEFICIT_ABOVE_LIMIT.closer_to_zero() is Zone.DEFICIT
     assert Zone.DEFICIT.closer_to_zero() is Zone.DEFICIT
+
+
+def test_a_clock_stepped_back_does_not_hold_a_step_back() -> None:
+    """A step left "in the future" after a step back counts as left long ago."""
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+    state = ModeState(Feature.EXPORT_SOLAR_FIRST)
+    step = export_to_grid()
+    state._left_at[step] = now + timedelta(hours=1)
+    state._cooldown_s[step] = 600.0
+
+    assert state._may_switch_to(step, now) is True

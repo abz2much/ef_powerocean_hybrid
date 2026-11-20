@@ -209,6 +209,12 @@
 - Commands go out one at a time. Before, a poll and a user action could
   interleave their writes, and the poll could then commit its older command
   over the user's newer one until the next poll.
+- A clock that steps back no longer freezes the control timers. Every time
+  recorded before the step then lies in the future and now counts as long ago,
+  so the heartbeat is rewritten and a changed command goes out at once. Before,
+  a command change could be held back until the clock caught up (an hour after
+  a one-hour step), the heartbeat counted as current for as long, and a guard's
+  hand-back or a mode's cooldown stalled.
 
 ### Fixed
 

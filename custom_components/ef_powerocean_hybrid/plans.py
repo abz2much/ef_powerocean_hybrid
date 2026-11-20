@@ -32,6 +32,7 @@ from typing import Final
 
 from .const import GUARD_HANDBACK_MAX_S, GUARD_HANDBACK_S
 from .models import ControlFeature, ControlStatus
+from .util import seconds_since
 
 
 class Way(Enum):
@@ -261,7 +262,7 @@ class ModeState:
         left_at = self._left_at.get(step)
         if left_at is None:
             return True
-        return (now - left_at).total_seconds() >= self._cooldown_s.get(step, 0.0)
+        return seconds_since(left_at, now) >= self._cooldown_s.get(step, 0.0)
 
     def _switch_to(self, step: Step, now: datetime) -> None:
         if step == self.step:
@@ -270,7 +271,7 @@ class ModeState:
         if leaving != self.mode.deficit and self.since is not None:
             # Each switch rewrites the inverter's method, so a step that lasted
             # under a minute waits twice as long as last time before it is used again.
-            lasted = (now - self.since).total_seconds()
+            lasted = seconds_since(self.since, now)
             previous = self._cooldown_s.get(leaving, 0.0)
             self._cooldown_s[leaving] = (
                 min(max(2 * previous, GUARD_HANDBACK_S), GUARD_HANDBACK_MAX_S)

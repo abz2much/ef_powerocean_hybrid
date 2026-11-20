@@ -71,6 +71,7 @@ from .models import (
 )
 from .plans import CHARGE, DISCHARGE, Mode, ModeState, Step, Way, battery_power
 from .reading_checks import ReadingChecks
+from .util import seconds_since
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -242,7 +243,7 @@ class GuardHandback:
     wait_s: float = GUARD_HANDBACK_S
 
     def elapsed_s(self, now: datetime) -> float:
-        return 0.0 if self.since is None else (now - self.since).total_seconds()
+        return 0.0 if self.since is None else seconds_since(self.since, now)
 
     def enter(self, phase: HandbackPhase, now: datetime) -> None:
         self.phase = phase
@@ -413,9 +414,7 @@ class ControlManager:
         Two missed polls and the time a reconnect takes: longer than that, the
         guards and the expiry have stopped watching the command.
         """
-        if self._decided_at is None:
-            return False
-        age = (dt.now() - self._decided_at).total_seconds()
+        age = seconds_since(self._decided_at, dt.now())
         return age <= 2 * self._scan_interval_s + CONTROL_LOGIC_GRACE_S
 
     @property
@@ -1718,10 +1717,7 @@ class ControlManager:
 
     def _control_written_within(self, seconds: float) -> bool:
         """Return whether the last command went out less than *seconds* ago."""
-        if self._last_control_write_time is None:
-            return False
-        age = (dt.now() - self._last_control_write_time).total_seconds()
-        return age < seconds
+        return seconds_since(self._last_control_write_time, dt.now()) < seconds
 
     def _reset_deviation(self) -> None:
         """Forget how the last command was going; a new one starts from nothing."""
@@ -1779,10 +1775,7 @@ class ControlManager:
 
     def _turning_around(self) -> bool:
         """Return whether the current command is too new to call it overruled."""
-        if self._retargeted_at is None:
-            return False
-        age = (dt.now() - self._retargeted_at).total_seconds()
-        return age < GUARD_SETTLE_S
+        return seconds_since(self._retargeted_at, dt.now()) < GUARD_SETTLE_S
 
     async def async_poll(self, data: Mapping[str, Any]) -> None:
         """Run from a poll, where a write failure must not stop the read."""

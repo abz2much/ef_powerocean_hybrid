@@ -125,6 +125,28 @@ def test_the_heartbeat_asks_whether_the_control_logic_is_running(control) -> Non
     assert control._heartbeat._alive() is control.deciding
 
 
+def test_a_clock_stepped_back_does_not_freeze_the_timers(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a step back, every time recorded before it lies in the future.
+
+    Each then counts as long ago: the heartbeat is rewritten, a changed command
+    goes out, and the control logic must run on a new poll before beats go on.
+    """
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_poll({"battery_soc": 50.0}))
+    ahead = HEARTBEAT_START + timedelta(hours=1)
+    control._heartbeat._last_success = ahead
+    control._last_control_write_time = ahead
+    control._retargeted_at = ahead
+    control._decided_at = ahead
+
+    assert control._heartbeat.in_control is False
+    assert control._control_written_within(const.MIN_CONTROL_DWELL_S) is False
+    assert control._turning_around() is False
+    assert control.deciding is False
+
+
 def test_a_recent_beat_is_reused_and_a_stale_one_is_rewritten(
     control, monkeypatch: pytest.MonkeyPatch
 ) -> None:
