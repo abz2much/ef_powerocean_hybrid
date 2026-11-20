@@ -579,6 +579,77 @@ def test_the_control_word_refuses_off_grid_and_shutdown_bits(
     write.assert_not_awaited()
 
 
+def test_a_mode_change_cannot_send_off_grid_or_shutdown_bits_either(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every control word goes through the same guard, not only battery saver's."""
+    write = allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, 2500))
+    monkeypatch.setattr(control_module, "CONTROL_COMMAND_BATTERY_SAVER_BIT", 0)
+    control._battery_saver = True
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+
+    assert const.CONTROL_COMMAND_REGISTER not in [a for a, _ in commands(write)]
+
+
+def _charging_at(control, monkeypatch: pytest.MonkeyPatch, power: float):
+    write = allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping({"battery_soc": 50.0})
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, power))
+    asyncio.run(control.async_select_feature(Feature.CHARGE_BATTERY))
+    return write
+
+
+def _poll_reading_back(control, monkeypatch, seconds: float, setpoint: float) -> None:
+    advance(control, monkeypatch, seconds)
+    asyncio.run(
+        control.async_poll({"battery_soc": 50.0, "battery_power_setpoint": setpoint})
+    )
+
+
+def test_control_stops_when_the_inverter_reads_back_another_setpoint(
+    control, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Such as 2500 W read as 2500 << 16: the words in the other order.
+
+    The inverter would then run something far from what was sent.
+    """
+    _charging_at(control, monkeypatch, 2500)
+
+    _poll_reading_back(control, monkeypatch, 30, 2500 << 16)
+    assert control.enabled is True  # one poll can be a stale read
+    _poll_reading_back(control, monkeypatch, 35, 2500 << 16)
+
+    assert control.enabled is False
+    assert "reads back" in caplog.text
+
+
+def test_control_goes_on_while_the_setpoint_reads_back_as_sent(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _charging_at(control, monkeypatch, 2500)
+
+    for seconds in (30, 35, 40):
+        _poll_reading_back(control, monkeypatch, seconds, 2500)
+
+    assert control.enabled is True
+
+
+def test_a_setpoint_just_written_is_not_read_back_yet(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A poll can read the register before the write that just went out."""
+    _charging_at(control, monkeypatch, 2500)
+
+    for seconds in (0, 1):
+        _poll_reading_back(control, monkeypatch, seconds, 0)
+
+    assert control.enabled is True
+
+
 @pytest.mark.parametrize(
     ("setter", "limit", "soc", "solar", "house", "expected", "feature", "power"),
     (

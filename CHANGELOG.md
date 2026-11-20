@@ -197,6 +197,15 @@
   default method, then starts the heartbeat. Without a heartbeat the inverter
   ignores these writes, so a command left from an earlier session can no
   longer come back to life with the first beat.
+- Every control word now goes through one check that refuses the off-grid and
+  shutdown bits, before anything is written. Before, only battery saver's path
+  had it.
+- The power setpoint is read back on every poll and compared with what was
+  sent. If the inverter holds something else on two polls in a row (not right
+  after a write), Modbus Control is switched off and the log says what it held,
+  such as 2500 W read as 2500 x 65536: the words in the other order, which would
+  run something far from what was sent. The two setpoint registers are now read
+  on every poll for this, whatever entities are enabled.
 
 ### Fixed
 

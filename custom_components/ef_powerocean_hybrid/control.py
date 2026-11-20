@@ -78,6 +78,10 @@ _LOGGER = logging.getLogger(__name__)
 CONTROL_LOGIC_GRACE_S = 30
 # How long releasing the command may hold up a switch-off or a shutdown.
 RELEASE_TIMEOUT_S = 5
+# Polls in a row a setpoint may read back wrong before control stops, and the
+# time after a write, beyond one poll interval, before it is read back at all.
+READ_BACK_MISSES = 2
+READ_BACK_GRACE_S = 5
 
 # Device states in which control steps aside and leaves the inverter to itself.
 _STEPPED_ASIDE = frozenset(
@@ -156,6 +160,9 @@ class ControlInputs:
     limit_inv_power: float | None = None
     system_modes: float | None = None
     system_state_2: float | None = None
+    # What the setpoint registers hold, read back against what was sent.
+    battery_power_setpoint: float | None = None
+    system_power_setpoint: float | None = None
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> ControlInputs:
@@ -361,6 +368,10 @@ class ControlManager:
         self._resends = 0
         self._not_accepted = False
         self._fault_polls = 0
+        # Polls in a row whose setpoint register holds something else than was
+        # sent, and what it held once that is enough to stop.
+        self._read_back_misses = 0
+        self._read_back_failed: tuple[int, float] | None = None
         # What each poll's readings say about the inverter. Control steps aside
         # while a check has failed, and a frame whose readings contradict each other
         # never moves the guards, so a single bad read cannot latch one.
@@ -1777,6 +1788,19 @@ class ControlManager:
             await self.async_apply(data, notify=False)
         except HomeAssistantError as err:
             _LOGGER.debug("Could not apply %s this poll: %r", self._feature, err)
+        if (failed := self._read_back_failed) is not None:
+            self._read_back_failed = None
+            sent, held = failed
+            _LOGGER.error(
+                "The inverter reads back %s W from its setpoint register, but %s W "
+                "was sent, for %s polls in a row. It may be running something else "
+                "than it was told, so Modbus Control is switched off",
+                held,
+                sent,
+                READ_BACK_MISSES,
+            )
+            await self.async_set_enabled(False)
+            self._on_update()
 
     async def async_apply(
         self,
@@ -1854,9 +1878,38 @@ class ControlManager:
             self._update_deviation(inputs)
             if polled:
                 self._check_followed()
+                self._check_read_back(inputs)
         finally:
             if notify:
                 self._on_update()
+
+    def _check_read_back(self, inputs: ControlInputs) -> None:
+        """Compare the setpoint the inverter holds with the one sent.
+
+        A value far off, such as one 65536 times too big, means the two sides
+        read the words in a different order, or the register moved with a
+        firmware update. One poll can read the register before a write lands, so
+        it takes READ_BACK_MISSES in a row, and none right after a write.
+        """
+        definition = CONTROL_FEATURES[self._commanded_feature]
+        if (
+            not self._enabled
+            or not definition.commands_power
+            or definition.setpoint_key is None
+            or self._control_written_within(self._scan_interval_s + READ_BACK_GRACE_S)
+        ):
+            return
+        held = inputs.value(definition.setpoint_key)
+        if held is None:
+            return
+        sent = round(self._commanded_power) * definition.sign
+        if round(float(held)) == sent:
+            self._read_back_misses = 0
+            return
+        self._read_back_misses += 1
+        if self._read_back_misses >= READ_BACK_MISSES:
+            self._read_back_misses = 0
+            self._read_back_failed = (sent, float(held))
 
     def _expire_command(self) -> None:
         """Return to automatic once a command's time runs out, leaving the limits."""
@@ -1896,6 +1949,8 @@ class ControlManager:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="not_connected"
             )
+        # Before the setpoint, so a word that would be refused sends nothing.
+        self._require_safe(self._compose_control_command(feature))
 
         if CONTROL_FEATURES[feature].commands_power:
             await self._async_require_control_authority()
@@ -1910,12 +1965,8 @@ class ControlManager:
     async def _async_apply_control_command(self) -> None:
         """Write the control word once and refresh so the read-back shows it."""
         value = self._compose_control_command()
-        if value & CONTROL_COMMAND_UNSAFE_BITS:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="unsafe_control_command",
-                translation_placeholders={"value": f"0x{value:08X}"},
-            )
+        # Before anything is written, not only before the word itself.
+        self._require_safe(value)
         if not self._modbus_client.connected:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="not_connected"
@@ -1978,7 +2029,19 @@ class ControlManager:
             register.address, words, what=f"setpoint {value} W"
         )
 
+    @staticmethod
+    def _require_safe(value: int) -> None:
+        """Refuse a control word with the off-grid or shutdown bit set."""
+        if value & CONTROL_COMMAND_UNSAFE_BITS:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="unsafe_control_command",
+                translation_placeholders={"value": f"0x{value:08X}"},
+            )
+
     async def _async_write_control_word(self, value: int) -> None:
+        """Write the control word: the one way any reaches the inverter."""
+        self._require_safe(value)
         await self._modbus_client.async_write(
             CONTROL_COMMAND_REGISTER,
             encode_register(value, RegisterType.UINT32),
