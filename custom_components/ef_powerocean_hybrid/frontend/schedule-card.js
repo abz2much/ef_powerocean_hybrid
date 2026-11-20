@@ -7,9 +7,13 @@ import {
   barPieces,
   changedFields,
   checkDraft,
+  defaultPower,
+  deleteCall,
   findSchedules,
   firstFreeWindow,
   runsOn,
+  timeHint,
+  toggleCall,
   toHm,
   viewKey,
   weekdayIn,
@@ -169,9 +173,13 @@ class ScheduleCard extends HTMLElement {
       root.addEventListener("click", (event) => this._onClick(event));
       root.addEventListener("change", (event) => this._onChange(event));
       root.addEventListener("input", (event) => this._onChange(event));
-      root
-        .querySelector("dialog")
-        .addEventListener("close", () => this._closed());
+      root.addEventListener("keydown", (event) => this._onKey(event));
+      const dialog = root.querySelector("dialog");
+      dialog.addEventListener("close", () => this._closed());
+      // Esc while a command is being sent: keep the form for its answer.
+      dialog.addEventListener("cancel", (event) => {
+        if (this._busy) event.preventDefault();
+      });
     }
     // Only when what the card shows changed: a redraw between pointer-down
     // and click would drop the tap.
@@ -200,10 +208,11 @@ class ScheduleCard extends HTMLElement {
         : "";
     const pieces = barPieces(schedules, today)
       .map(
-        (p) => `<button class="piece ${p.type}${p.enabled ? "" : " off"}${
-          p.inUse ? " now" : ""
-        }"
-          data-edit="${escape(p.entityId)}" title="Edit"
+        (p) => `<button class="piece ${escape(p.type)}${
+          p.enabled ? "" : " off"
+        }${p.inUse ? " now" : ""}"
+          data-edit="${escape(p.entityId)}"
+          title="Edit ${escape(p.title)}" aria-label="Edit ${escape(p.title)}"
           style="left:${(p.from / 1440) * 100}%;width:${
             ((p.to - p.from) / 1440) * 100
           }%"></button>`,
@@ -214,8 +223,9 @@ class ScheduleCard extends HTMLElement {
         (s) => `<div class="row${s.enabled ? "" : " off"}${
           runsOn(s, today) ? "" : " later"
         }"
-          data-edit="${escape(s.entityId)}">
-          <span class="dot ${s.type}"></span>
+          data-edit="${escape(s.entityId)}" tabindex="0" role="button"
+          aria-label="Edit ${escape(s.title)}">
+          <span class="dot ${escape(s.type)}"></span>
           <div class="grow">${escape(s.title)}${
             s.inUse ? '<span class="now-label">now</span>' : ""
           }
@@ -224,8 +234,8 @@ class ScheduleCard extends HTMLElement {
             )}</div></div>
           <button class="toggle${s.enabled ? " on" : ""}" data-toggle="${escape(
             s.entityId,
-          )}"
-            aria-label="${s.enabled ? "Switch off" : "Switch on"}"></button>
+          )}" role="switch" aria-checked="${s.enabled}"
+            aria-label="${escape(s.title)}"></button>
         </div>`,
       )
       .join("");
@@ -245,10 +255,13 @@ class ScheduleCard extends HTMLElement {
     const data = target.dataset;
     if (data.toggle !== undefined) {
       event.stopPropagation();
-      const on = target.classList.contains("on");
-      this._hass.callService("switch", on ? "turn_off" : "turn_on", {
-        entity_id: data.toggle,
-      });
+      const schedule = this._data.schedules.find(
+        (s) => s.entityId === data.toggle,
+      );
+      if (schedule) {
+        const { domain, service, data: call } = toggleCall(schedule);
+        this._hass.callService(domain, service, call);
+      }
     } else if (data.add !== undefined) {
       this._open(null);
     } else if (data.edit !== undefined) {
@@ -269,11 +282,20 @@ class ScheduleCard extends HTMLElement {
       this._draft.days = days;
       this._renderDialog();
     } else if (data.action === "cancel") {
-      this.shadowRoot.querySelector("dialog").close();
+      if (!this._busy) this.shadowRoot.querySelector("dialog").close();
     } else if (data.action === "save") {
       this._save();
     } else if (data.action === "delete") {
       this._delete();
+    }
+  }
+
+  _onKey(event) {
+    // Rows open their form with Enter or Space, as buttons do.
+    const row = event.target.closest?.(".row");
+    if (row && event.target === row && ["Enter", " "].includes(event.key)) {
+      event.preventDefault();
+      row.click();
     }
   }
 
@@ -300,7 +322,7 @@ class ScheduleCard extends HTMLElement {
         }
       : {
           type: "charge",
-          power: 1000,
+          power: defaultPower(this._data.maxPower),
           ...firstFreeWindow(this._data.schedules),
           days: "daily",
         };
@@ -350,7 +372,7 @@ class ScheduleCard extends HTMLElement {
     ).join("");
     this.shadowRoot.querySelector("dialog").innerHTML = `
       <h3>${this._original ? "Edit schedule" : "New schedule"}</h3>
-      <div class="error" data-msg="limit"></div><div class="error" data-msg="time"></div>
+      <div class="error" data-msg="limit"></div>
       <div class="field"><label>Type</label><div class="seg">
         <button data-type="charge" class="charge ${
           d.type === "charge" ? "sel" : ""
@@ -374,6 +396,7 @@ class ScheduleCard extends HTMLElement {
           "end",
         )}<div class="error" data-msg="end"></div></div>
       </div>
+      <div class="error" data-msg="time"></div>
       <div class="hint" data-hint="time"></div>
       <div class="field"><label>Days</label><div class="chips">
         <button data-daily class="${
@@ -397,10 +420,10 @@ class ScheduleCard extends HTMLElement {
     const dialog = this.shadowRoot.querySelector("dialog");
     const errors = this._errors();
     const d = this._draft;
-    dialog.querySelector("[data-hint=time]").textContent =
-      d.end < d.start
-        ? "Runs over midnight."
-        : "Times in 30-minute steps; an end before the start runs over midnight.";
+    dialog.querySelector("[data-hint=time]").textContent = timeHint(
+      d.start,
+      d.end,
+    );
     for (const box of dialog.querySelectorAll("[data-msg]")) {
       box.textContent =
         box.dataset.msg === "server"
@@ -408,14 +431,20 @@ class ScheduleCard extends HTMLElement {
           : errors[box.dataset.msg] ?? "";
     }
     dialog.querySelector(".save").disabled = !this._canSave(errors);
+    // While a command is being sent, nothing else may be sent or dropped.
+    for (const button of dialog.querySelectorAll(".delete, .cancel")) {
+      button.disabled = this._busy;
+    }
   }
 
-  async _call(service, data, target) {
+  async _call({ domain, service, data, target }) {
+    if (this._busy) return;
     this._busy = true;
     this._serverError = "";
     this._renderMessages();
     try {
-      await this._hass.callService(DOMAIN, service, data, target);
+      // The form shows a refusal; no second message from Home Assistant.
+      await this._hass.callService(domain, service, data, target, false);
       this.shadowRoot.querySelector("dialog").close();
     } catch (error) {
       // Refused or not confirmed: keep the form and what was entered.
@@ -429,22 +458,25 @@ class ScheduleCard extends HTMLElement {
   _save() {
     if (!this._canSave(this._errors())) return;
     if (this._original) {
-      this._call(
-        "update_schedule",
-        changedFields(this._original, this._draft),
-        {
-          entity_id: this._original.entityId,
-        },
-      );
+      this._call({
+        domain: DOMAIN,
+        service: "update_schedule",
+        data: changedFields(this._original, this._draft),
+        target: { entity_id: this._original.entityId },
+      });
     } else {
-      this._call("add_schedule", addData(this._draft, this._data.deviceId));
+      this._call({
+        domain: DOMAIN,
+        service: "add_schedule",
+        data: addData(this._draft, this._data.deviceId),
+      });
     }
   }
 
   _delete() {
-    if (!this._original || !window.confirm(`Delete ${this._original.title}?`))
-      return;
-    this._call("delete_schedule", {}, { entity_id: this._original.entityId });
+    if (this._busy || !this._original) return;
+    if (!window.confirm(`Delete ${this._original.title}?`)) return;
+    this._call(deleteCall(this._original));
   }
 }
 
@@ -471,7 +503,11 @@ class ScheduleCardEditor extends HTMLElement {
           )}</option>`,
       )
       .join("");
-    this.innerHTML = `<label>System (its Active schedule sensor)<br><select>${options}</select></label>`;
+    const missing = !candidates(this._hass).includes(this._config.entity);
+    const choose = missing
+      ? '<option value="" selected disabled>Choose a system</option>'
+      : "";
+    this.innerHTML = `<label>System (its Active schedule sensor)<br><select>${choose}${options}</select></label>`;
     this.querySelector("select").addEventListener("change", (event) => {
       this._config = { ...this._config, entity: event.target.value };
       this.dispatchEvent(

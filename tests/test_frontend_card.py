@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
+from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 
 from custom_components.ef_powerocean_hybrid import const, frontend_card
 from custom_components.ef_powerocean_hybrid.frontend_card import async_register_card
@@ -64,3 +65,18 @@ def test_the_card_imports_its_logic_with_the_version() -> None:
     card = (frontend_card.FOLDER / "schedule-card.js").read_text()
 
     assert f'from "./schedule-logic.js?v={manifest["version"]}"' in card
+
+
+async def test_the_card_file_is_served(
+    hass: HomeAssistant, hass_client_no_auth: ClientSessionGenerator
+) -> None:
+    assert await async_setup_component(hass, "http", {})
+    await async_register_card(hass)
+    client = await hass_client_no_auth()
+
+    response = await client.get("/ef_powerocean_hybrid/frontend/schedule-card.js")
+
+    assert response.status == 200
+    assert "ef-powerocean-schedule-card" in await response.text()
+    logic = await client.get("/ef_powerocean_hybrid/frontend/schedule-logic.js")
+    assert logic.status == 200

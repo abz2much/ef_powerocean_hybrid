@@ -7,11 +7,15 @@ import {
   addData,
   barPieces,
   changedFields,
+  defaultPower,
+  deleteCall,
   checkDraft,
   findSchedules,
   firstFreeWindow,
   overlaps,
   runsOn,
+  timeHint,
+  toggleCall,
   toHm,
   toMinutes,
   viewKey,
@@ -361,4 +365,55 @@ test("the view changes with a schedule, the day or the max power", () => {
   assert.notEqual(switched, before);
   hass.states[SENSOR].attributes = { max_schedule_power: 5000 };
   assert.notEqual(viewKey(hass, SENSOR, "fri"), switched);
+});
+
+test("a new schedule's power is 1000 W, or the max if lower", () => {
+  assert.equal(defaultPower(6000), 1000);
+  assert.equal(defaultPower(800), 800);
+  assert.equal(defaultPower(null), 1000);
+});
+
+test("unchanged chosen days are not checked, as the integration", () => {
+  // A schedule the system reports with no day left can still be edited.
+  const original = { ...byId(14), days: [] };
+  const errors = checkDraft(draftOf(original, { power: 1400 }), schedules(), {
+    maxPower: 6000,
+    original,
+  });
+  assert.equal(errors.days, undefined);
+});
+
+test("the time hint says what the window does", () => {
+  assert.equal(timeHint(1320, 0), "Ends at midnight.");
+  assert.equal(timeHint(1380, 120), "Runs over midnight.");
+  assert.equal(
+    timeHint(360, 480),
+    "Times in 30-minute steps; an end before the start runs over midnight.",
+  );
+});
+
+test("the switch turns a schedule on or off", () => {
+  assert.deepEqual(toggleCall({ ...byId(13), enabled: true }), {
+    domain: "switch",
+    service: "turn_off",
+    data: { entity_id: "switch.x_schedule_13" },
+  });
+  assert.deepEqual(
+    toggleCall({ ...byId(13), enabled: false }).service,
+    "turn_on",
+  );
+});
+
+test("delete targets the schedule's switch", () => {
+  assert.deepEqual(deleteCall(byId(16)), {
+    domain: "ef_powerocean_hybrid",
+    service: "delete_schedule",
+    data: {},
+    target: { entity_id: "switch.my_day_battery" },
+  });
+});
+
+test("a bar piece names its schedule", () => {
+  const [piece] = barPieces([byId(14)], "fri");
+  assert.equal(piece.title, "Charge 06:00–08:00");
 });

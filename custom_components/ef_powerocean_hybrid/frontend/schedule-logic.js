@@ -111,8 +111,8 @@ export function runsOn(schedule, weekday) {
 export function barPieces(schedules, weekday) {
   return schedules
     .filter((schedule) => runsOn(schedule, weekday))
-    .flatMap(({ entityId, type, start, end, enabled, inUse }) => {
-      const piece = { entityId, type, enabled, inUse };
+    .flatMap(({ entityId, type, start, end, enabled, inUse, title }) => {
+      const piece = { entityId, type, enabled, inUse, title };
       return start < end
         ? [{ ...piece, from: start, to: end }]
         : [
@@ -185,7 +185,9 @@ export function checkDraft(draft, schedules, { maxPower, original }) {
   if (!onStep(draft.end))
     errors.end = "Use 30-minute steps from 00:00 to 23:30.";
   else if (draft.start === draft.end) errors.end = "Start and end must differ.";
-  if (draft.days !== "daily" && draft.days.length === 0)
+  // As update_schedule: the days are checked only when they change.
+  const daysChanged = isNew || !sameDays(draft.days, original.days);
+  if (daysChanged && draft.days !== "daily" && draft.days.length === 0)
     errors.days = "Choose at least one day.";
   const timeChanged =
     isNew || draft.start !== original.start || draft.end !== original.end;
@@ -231,4 +233,36 @@ export function addData(draft, deviceId) {
   };
   if (draft.days !== "daily") data.days = [...draft.days];
   return data;
+}
+
+// The power a new schedule starts with.
+export function defaultPower(maxPower) {
+  return maxPower === null || maxPower === undefined
+    ? 1000
+    : Math.min(1000, maxPower);
+}
+
+export function timeHint(start, end) {
+  if (end === 0) return "Ends at midnight.";
+  if (end < start) return "Runs over midnight.";
+  return "Times in 30-minute steps; an end before the start runs over midnight.";
+}
+
+// The on/off switch: the switch's own service, which works also while Max
+// schedule power is not set (update_schedule refuses then).
+export function toggleCall(schedule) {
+  return {
+    domain: "switch",
+    service: schedule.enabled ? "turn_off" : "turn_on",
+    data: { entity_id: schedule.entityId },
+  };
+}
+
+export function deleteCall(schedule) {
+  return {
+    domain: DOMAIN,
+    service: "delete_schedule",
+    data: {},
+    target: { entity_id: schedule.entityId },
+  };
 }
