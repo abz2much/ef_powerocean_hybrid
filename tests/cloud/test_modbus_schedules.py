@@ -12,6 +12,7 @@ import pytest
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant, State
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
@@ -247,3 +248,30 @@ async def test_a_cloud_only_entry_is_unchanged(
     )
     assert cloud_entry.runtime_data.modbus is None
     assert _client().commands == []
+
+
+async def test_the_action_refuses_schedules_on_a_modbus_only_entry(
+    hass: HomeAssistant,
+    set_up_modbus_only: Callable[[], Awaitable[MockConfigEntry]],
+) -> None:
+    entry = await set_up_modbus_only()
+    await _switch_control_on(hass, entry)
+    select_id = _entity_id(hass, entry, "select", const.BATTERY_MODE_SELECT.key)
+    device = next(
+        device
+        for device in dr.async_entries_for_config_entry(
+            dr.async_get(hass), entry.entry_id
+        )
+        if (const.DOMAIN, SERIAL) in device.identifiers
+    )
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            const.DOMAIN,
+            SERVICE_SET_BATTERY_COMMAND,
+            {"device_id": device.id, "mode": "schedules"},
+            blocking=True,
+        )
+
+    assert entry.runtime_data.modbus.control.following_schedules is False
+    assert _state(hass, select_id).state == "automatic"

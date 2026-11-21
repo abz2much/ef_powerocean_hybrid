@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.util import dt
 
 from .const import (
@@ -906,6 +906,10 @@ class ControlManager:
 
     async def async_follow_schedules(self) -> None:
         """Follow the app's schedules: each slot's command while it runs."""
+        if not self.schedules_available:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="schedules_unavailable"
+            )
         self._require_modbus_control()
         self._following_schedules = True
         self._expires_at = None

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock
 from zoneinfo import ZoneInfo
 
 import pytest
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.util import dt as dt_util
 
 from custom_components.ef_powerocean_hybrid import const, models
@@ -2802,6 +2802,19 @@ def test_following_needs_modbus_control(
 
     with pytest.raises(HomeAssistantError):
         asyncio.run(control.async_follow_schedules())
+    assert control.following_schedules is False
+
+
+def test_following_needs_a_schedule_list(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    assert control.schedules_available is False
+
+    with pytest.raises(ServiceValidationError) as error:
+        asyncio.run(control.async_follow_schedules())
+
+    assert error.value.translation_key == "schedules_unavailable"
     assert control.following_schedules is False
 
 

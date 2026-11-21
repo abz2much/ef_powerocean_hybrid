@@ -1329,6 +1329,9 @@
     "modbus_control_off": {
       "message": "Modbus Control is off. Turn it on to command the inverter; nothing was changed."
     },
+    "schedules_unavailable": {
+      "message": "This system has no EcoFlow cloud connection, so it has no schedules to follow."
+    },
     "unknown_device": {
       "message": "Device {device_id} is not an inverter set up in this integration."
     },
