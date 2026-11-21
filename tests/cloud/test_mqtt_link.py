@@ -544,18 +544,25 @@ class SlowMqtt(FakeMqtt):
     hold: ClassVar[str] = "start"
     entered: ClassVar[threading.Event] = threading.Event()
     release: ClassVar[threading.Event] = threading.Event()
+    # Set once the held call has run to its end. Cancelling the start does not
+    # wait for the executor thread, so a test reads the client only after this.
+    finished: ClassVar[threading.Event] = threading.Event()
 
     def start(self) -> None:
         if SlowMqtt.hold == "start":
             SlowMqtt.entered.set()
             SlowMqtt.release.wait(5)
         super().start()
+        if SlowMqtt.hold == "start":
+            SlowMqtt.finished.set()
 
     def request_schedules(self) -> None:
         if SlowMqtt.hold == "list":
             SlowMqtt.entered.set()
             SlowMqtt.release.wait(5)
         super().request_schedules()
+        if SlowMqtt.hold == "list":
+            SlowMqtt.finished.set()
 
 
 async def _cancel_while_held(
@@ -567,6 +574,7 @@ async def _cancel_while_held(
     SlowMqtt.hold = hold
     SlowMqtt.entered.clear()
     SlowMqtt.release.clear()
+    SlowMqtt.finished.clear()
     with patch(
         "custom_components.ef_powerocean_hybrid.cloud.coordinator.PowerOceanMqtt",
         SlowMqtt,
@@ -579,6 +587,7 @@ async def _cancel_while_held(
         SlowMqtt.release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
+        assert await hass.async_add_executor_job(SlowMqtt.finished.wait, 5)
         await hass.async_block_till_done(wait_background_tasks=True)
     (client,) = FakeMqtt.instances
     assert isinstance(client, SlowMqtt)
