@@ -62,9 +62,6 @@ jobs:
   unit-tests:
     name: Unit tests (Home Assistant ${{ matrix.ha }})
     runs-on: ubuntu-latest
-    # The newest Home Assistant is an early warning: its failure shows, but does
-    # not fail the run, so it never holds up a release of unchanged code.
-    continue-on-error: ${{ matrix.ha == 'latest' }}
     strategy:
       fail-fast: false
       matrix:
