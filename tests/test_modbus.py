@@ -232,6 +232,10 @@ async def test_any_answer_counts_as_a_shared_link_being_up(shared_client, unit) 
 async def test_a_shared_link_asks_for_our_timeout(unit) -> None:
     import modbus_connection
 
+    if not hasattr(unit, "require_timeout"):
+        # Home Assistant 2026.9.0 pins modbus-connection 4.10.0, before it; the
+        # test below covers a unit without it.
+        pytest.skip("this modbus-connection has no require_timeout")
     modbus_module.SharedLink(unit, modbus_connection)
 
     assert unit.required_timeout == const.MODBUS_REQUEST_TIMEOUT_S
