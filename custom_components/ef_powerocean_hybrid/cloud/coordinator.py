@@ -251,6 +251,8 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._schedule_lock = asyncio.Lock()
         # The list in the last HTTP response, None if it had none.
         self._http_schedules: list[Schedule] | None = None
+        # Whether the last read of that list failed, so it is logged once.
+        self._http_schedules_failed = False
         # The saved copy, and the list (with its source) last handed to the store.
         self._saved_schedules: ScheduleList | None = None
         self._persisted_schedules: tuple[tuple[Schedule, ...], str] | None = None
@@ -268,16 +270,36 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             msg = f"Unexpected cloud response: {err}"
             raise UpdateFailed(msg) from err
         self.soc_limits = soc_limits_of(response)
-        found = schedules_from_http(response)
-        if found is not None:
-            self._http_schedules = found
-            self._save_schedules()
+        self._take_http_schedules(response)
         self._update_firmware(result.firmware)
         self._note_report_times(values)
         self._hold_recent_settings(values)
         self._hold_energy_stream(values)
         self.last_success_at = dt_util.utcnow()
         return values
+
+    def _take_http_schedules(self, response: dict[str, Any]) -> None:
+        """
+        Take the schedule list of the response, if it has one.
+
+        A list that cannot be read keeps the last one and is logged once
+        (until a list is read again); it never fails the poll.
+        """
+        try:
+            found = schedules_from_http(response)
+        except Exception:
+            if not self._http_schedules_failed:
+                _LOGGER.warning(
+                    "Could not read the schedule list in the cloud response; "
+                    "keeping the last one",
+                    exc_info=True,
+                )
+            self._http_schedules_failed = True
+            return
+        self._http_schedules_failed = False
+        if found is not None:
+            self._http_schedules = found
+            self._save_schedules()
 
     def _hold_recent_settings(self, values: dict[str, Any]) -> None:
         """Keep settings confirmed over MQTT the HTTP response does not show yet.
@@ -761,10 +783,11 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         Return the schedules from the best source there is, None if unknown.
 
-        The MQTT list while it is known, else the HTTP list, else the saved
-        copy (from before a restart or an outage).
+        The MQTT list while it is known and MQTT is connected, else the HTTP
+        list, else the saved copy (from before a restart or an outage). While
+        paho reconnects, changes made in the app arrive only by HTTP.
         """
-        if self.mqtt is not None and self._schedules_known:
+        if self._mqtt_up() is not None and self._schedules_known:
             ordered = sorted(self.schedules.values(), key=lambda s: s.schedule_id)
             return ScheduleList(tuple(ordered), SOURCE_MQTT, days_trusted=True)
         if self._http_schedules is not None:

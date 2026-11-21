@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from custom_components.ef_powerocean_hybrid.cloud.schedules import schedules_from_http
 
@@ -96,3 +99,58 @@ def test_a_response_without_data_is_unknown() -> None:
     """A malformed response gives None."""
     assert schedules_from_http({}) is None
     assert schedules_from_http({"data": {"quota": None}}) is None
+
+
+def _with_first_entry(change: Any) -> tuple[dict[str, Any], int]:
+    """Return the owner's response with its first entry changed, and the id."""
+    response = copy.deepcopy(load("response_model86_schedules.json"))
+    entries = response["data"]["quota"][REPORT]["timeTaskCfg"]
+    task = entries[0]["taskIndex"]
+    entries[0] = change(entries[0])
+    return response, task
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        pytest.param(lambda e: e | {"sysChgDsgPwr": math.nan}, id="nan_power"),
+        pytest.param(lambda e: e | {"sysChgDsgPwr": math.inf}, id="inf_power"),
+        pytest.param(lambda e: e | {"sysChgDsgPwr": "3000"}, id="text_power"),
+        pytest.param(lambda e: e | {"sysChgDsgPwr": True}, id="bool_power"),
+        pytest.param(lambda e: e | {"taskIndex": True}, id="bool_task_index"),
+        pytest.param(lambda e: e | {"type": True}, id="bool_type"),
+        pytest.param(lambda e: e | {"timeTable": [True]}, id="bool_time_table"),
+        pytest.param(
+            lambda e: {k: v for k, v in e.items() if k != "type"}, id="no_type"
+        ),
+        pytest.param(lambda e: [e], id="not_a_dict"),
+    ),
+)
+def test_a_malformed_entry_is_skipped(change: Any) -> None:
+    """One bad entry is left out; the others are read."""
+    response, task = _with_first_entry(change)
+    schedules = schedules_from_http(response)
+    assert schedules is not None
+    assert task not in {s.schedule_id for s in schedules}
+    assert len(schedules) == 5
+
+
+@pytest.mark.parametrize("value", (3, "x", {"a": 1}))
+def test_a_list_that_is_no_list_is_unknown(value: Any) -> None:
+    response = copy.deepcopy(load("response_model86_schedules.json"))
+    response["data"]["quota"][REPORT]["timeTaskCfg"] = value
+    assert schedules_from_http(response) is None
+
+
+def test_a_report_without_a_list_is_unknown() -> None:
+    """A timer report without timeTaskCfg says nothing about the list."""
+    response = copy.deepcopy(load("response_model86_schedules.json"))
+    del response["data"]["quota"][REPORT]["timeTaskCfg"]
+    assert schedules_from_http(response) is None
+
+
+def test_an_explicit_empty_list_is_known() -> None:
+    """Only an explicit list is known, and [] is one: no schedules."""
+    response = copy.deepcopy(load("response_model86_schedules.json"))
+    response["data"]["quota"][REPORT]["timeTaskCfg"] = []
+    assert schedules_from_http(response) == []

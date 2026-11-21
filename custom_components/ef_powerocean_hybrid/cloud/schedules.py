@@ -12,7 +12,7 @@ This module does not depend on Home Assistant.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 from .mqtt import (
     SCHEDULE_CHARGE,
@@ -181,32 +181,45 @@ def _flag(value: Any) -> bool:
     return bool(value)
 
 
+def _whole(value: Any) -> TypeGuard[int]:
+    """Return whether a value is an int (a bool is not one here)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _schedule_from_entry(entry: Any) -> Schedule | None:
-    """Return the schedule of one entry of the list, None if it is incomplete."""
+    """
+    Return the schedule of one entry of the list, None if it is incomplete.
+
+    An entry without a whole id, type or time, or without a finite power, is
+    not a schedule.
+    """
     if not isinstance(entry, dict):
         return None
     table = entry.get("timeTable")
     schedule_id = entry.get("taskIndex")
     schedule_type = entry.get("type")
+    power = entry.get("sysChgDsgPwr")
     if (
         not isinstance(table, list)
         or not table
-        or not isinstance(table[0], int)
-        or not isinstance(schedule_id, int)
-        or not isinstance(schedule_type, int)
+        or not _whole(table[0])
+        or not _whole(schedule_id)
+        or not _whole(schedule_type)
+        or isinstance(power, bool)
+        or not isinstance(power, (int, float))
+        or not math.isfinite(power)
     ):
         return None
     start, end = unpack_schedule_time(table[0])
-    power = entry.get("sysChgDsgPwr")
     repeat = entry.get("timeMode")
     return Schedule(
         schedule_id=schedule_id,
         schedule_type=schedule_type,
         enabled=_flag(entry.get("isEnable")),
-        power=int(power) if isinstance(power, (int, float)) else 0,
+        power=int(power),
         start=start,
         end=end,
-        repeat=repeat if isinstance(repeat, int) else 0,
+        repeat=repeat if _whole(repeat) else 0,
         in_use=_flag(entry.get("isEffect")),
     )
 
@@ -215,8 +228,9 @@ def schedules_from_http(response: Mapping[str, Any]) -> list[Schedule] | None:
     """
     Return the schedules in a cloud HTTP response.
 
-    None when the response has no schedule report (the list is unknown); an
-    empty list when the report is empty. Entries without a time are skipped.
+    None when the response has no schedule report, or its list is missing or
+    no list (the list is unknown); an empty list when the list is empty.
+    Malformed entries are skipped.
     """
     data = response.get("data")
     quota = data.get("quota") if isinstance(data, dict) else None
@@ -227,7 +241,9 @@ def schedules_from_http(response: Mapping[str, Any]) -> list[Schedule] | None:
             continue
         if not isinstance(report, dict):
             return None
-        entries = report.get("timeTaskCfg") or []
+        entries = report.get("timeTaskCfg")
+        if not isinstance(entries, list):
+            return None
         schedules = (_schedule_from_entry(entry) for entry in entries)
         return [schedule for schedule in schedules if schedule is not None]
     return None

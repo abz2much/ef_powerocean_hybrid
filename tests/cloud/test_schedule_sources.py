@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import timedelta
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from freezegun.api import FrozenDateTimeFactory
@@ -19,6 +20,7 @@ from custom_components.ef_powerocean_hybrid.cloud.api import EcoflowConnectionEr
 from custom_components.ef_powerocean_hybrid.cloud.coordinator import CloudCoordinator
 from custom_components.ef_powerocean_hybrid.cloud.schedules import (
     ScheduleList,
+    saved_list,
     schedules_from_http,
 )
 from tests.cloud.conftest import SetUp
@@ -317,3 +319,117 @@ async def test_removing_the_entry_deletes_the_saved_list(
     await async_remove_entry(hass, cloud_entry)
 
     assert key_of(cloud_entry) not in hass_storage
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_the_http_list_stands_in_while_mqtt_is_disconnected(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    hass_storage: dict[str, Any],
+    cloud_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+) -> None:
+    """A known MQTT list is not used while paho reconnects; app edits come by HTTP."""
+    with schedule_system():
+        api = FakeApi(fetch=[http_response()])
+        cloud = await start(hass, cloud_entry, set_up_hybrid, api, mqtt=True)
+        await tick(hass, freezer)
+        assert cloud.schedules_known
+        mqtt_list = cloud.schedule_list()
+        assert mqtt_list is not None
+        assert mqtt_list.source == "mqtt"
+
+        assert cloud.mqtt is not None
+        cloud.mqtt.connected = False  # type: ignore[misc]
+        # The app switches slot 13 off
+        changed = http_response()
+        entries = changed["data"]["quota"]["JTS1_EMS_ALL_TIMER_TASK_REPORT"]
+        for entry in entries["timeTaskCfg"]:
+            if entry["taskIndex"] == 13:
+                entry["isEnable"] = False
+        api.respond(changed)
+        await cloud.async_refresh()
+        await tick(hass, freezer)
+
+        found = cloud.schedule_list()
+        assert found is not None
+        assert found.source == "http"
+        assert {s.schedule_id: s.enabled for s in found.schedules}[13] is False
+    # While the option MQTT is on, only an MQTT list is saved
+    saved = hass_storage[key_of(cloud_entry)]["data"]
+    assert saved["source"] == "mqtt"
+    assert saved["schedules"] == saved_list(mqtt_list.schedules, "mqtt")["schedules"]
+
+
+def _bad_report(change: Any) -> dict[str, Any]:
+    """Return the owner's response with its schedule report changed."""
+    response = http_response()
+    change(response["data"]["quota"]["JTS1_EMS_ALL_TIMER_TASK_REPORT"])
+    return response
+
+
+def _first(report: dict[str, Any], **values: Any) -> None:
+    report["timeTaskCfg"][0].update(values)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.parametrize(
+    ("change", "kept"),
+    (
+        pytest.param(lambda r: _first(r, sysChgDsgPwr=float("nan")), 5, id="nan"),
+        pytest.param(lambda r: r.update(timeTaskCfg=3), 6, id="int_list"),
+        pytest.param(lambda r: _first(r, taskIndex=True), 5, id="bool_index"),
+        pytest.param(lambda r: r["timeTaskCfg"].append(7), 6, id="not_a_dict"),
+        pytest.param(lambda r: r["timeTaskCfg"][0].pop("type"), 5, id="no_type"),
+    ),
+)
+async def test_a_malformed_schedule_report_does_not_fail_the_poll(
+    hass: HomeAssistant,
+    cloud_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    change: Any,
+    kept: int,
+) -> None:
+    api = FakeApi(fetch=[http_response()])
+    cloud = await start(hass, cloud_entry, set_up_hybrid, api, mqtt=False)
+    api.respond(_bad_report(change))
+    await cloud.async_refresh()
+    assert cloud.last_update_success
+    found = cloud.schedule_list()
+    assert found is not None
+    assert found.source == "http"
+    assert len(found.schedules) == kept
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_a_parser_error_keeps_the_last_http_list_and_logs_once(
+    hass: HomeAssistant,
+    cloud_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api = FakeApi(fetch=[http_response()])
+    cloud = await start(hass, cloud_entry, set_up_hybrid, api, mqtt=False)
+    before = cloud.schedule_list()
+    with patch(
+        "custom_components.ef_powerocean_hybrid.cloud.coordinator.schedules_from_http",
+        side_effect=ValueError("bad"),
+    ):
+        caplog.clear()
+        await cloud.async_refresh()
+        await cloud.async_refresh()
+    assert cloud.last_update_success
+    assert cloud.schedule_list() == before
+    logged = [r for r in caplog.records if "schedule list" in r.getMessage()]
+    assert len(logged) == 1
+    assert logged[0].levelname == "WARNING"
+
+    # A good list again, then a fault again: logged again
+    await cloud.async_refresh()
+    with patch(
+        "custom_components.ef_powerocean_hybrid.cloud.coordinator.schedules_from_http",
+        side_effect=TypeError("bad"),
+    ):
+        caplog.clear()
+        await cloud.async_refresh()
+    assert len([r for r in caplog.records if "schedule list" in r.getMessage()]) == 1
