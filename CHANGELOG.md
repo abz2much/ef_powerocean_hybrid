@@ -4,29 +4,22 @@
 
 ### Added
 
-- The control manager can follow the app's schedules: while it does, each
-  charge slot charges at the slot's power (the Charge Battery power you set is
-  kept) and any other time runs Automatic. Choosing another mode stops it; a
-  command with an expiry sent while following returns to the schedules when it
-  runs out, and the expiry event says where it returned to (`returned_to`).
-  Switching Modbus Control on follows the schedules when there is a list.
-  With Modbus and the cloud both set up, Battery Mode has a "schedules" option
-  and the `set_battery_command` action accepts `mode: schedules` (the power,
-  charge limit and expiry are ignored). Control Status shows the slot as
-  `schedule`, where the list comes from as `schedule_source`, and the slots that
-  cannot run as `schedules_not_run`. Entries with only Modbus or only the cloud
-  are unchanged.
-- A function that works out what the app's schedules say the battery should
-  do now (charge at the slot's power, else Automatic), with its rules for
-  days, midnight and summer time. Not used by the integration yet.
-- The cloud coordinator offers one schedule list: from MQTT when it is known,
-  else from the HTTP response (which has no days, so they are not trusted),
-  else from a copy saved on disk (deleted with the entry). With MQTT on only the
-  MQTT list is saved; with it off, the HTTP list. Not used by the
-  integration yet.
-- The schedule list is read from the cloud HTTP response (the app's schedules,
-  with the live system's response as a test fixture). Not used by the
-  integration yet.
+- Schedules under Modbus Control. With Modbus and the cloud both set up,
+  Battery Mode has a "schedules" option (and `set_battery_command` accepts
+  `mode: schedules`; power, charge limit and expiry are ignored). It runs the
+  app's schedule slots: a charge slot charges at its power (the Charge Battery
+  power you set is kept); a Use battery slot, a gap and a switched-off slot run
+  Automatic. Switching Modbus Control on selects it when there is a list.
+  Choosing another mode stops it; a command with an expiry sent while
+  following returns to the schedules when it runs out, and the expiry event
+  and logbook say where it returned (`returned_to`). Entries with only Modbus
+  or only the cloud are unchanged.
+- The schedule list comes from MQTT when known, else from the cloud HTTP
+  response (which has no days, so they are not trusted), else from a copy
+  saved on disk (deleted with the entry). Slots with an unknown repeat or
+  type, or chosen days from the HTTP list alone, are not run. Control Status
+  shows the slot as `schedule`, the source as `schedule_source` and the slots
+  not run as `schedules_not_run`.
 - The EcoFlow cloud HTTP API, response parser and anonymiser from
   powerocean_single_phase v1.0.1 (commit `45287c9`), with their tests. Not
   used by the integration yet.

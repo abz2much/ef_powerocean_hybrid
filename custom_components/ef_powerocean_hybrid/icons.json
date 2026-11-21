@@ -42,7 +42,8 @@
           "discharge_battery": "mdi:battery-arrow-down",
           "export_to_grid": "mdi:transmission-tower-export",
           "import_from_grid": "mdi:transmission-tower-import",
-          "export_solar_first": "mdi:solar-power"
+          "export_solar_first": "mdi:solar-power",
+          "schedules": "mdi:calendar-clock"
         }
       }
     },

@@ -43,10 +43,13 @@ def async_describe_events(
     def async_describe_command_expired(event: Event) -> dict[str, Any]:
         entity_id = event.data.get(ATTR_ENTITY_ID)
         state = hass.states.get(entity_id) if entity_id else None
+        returned_to = (
+            "schedules" if event.data.get("returned_to") == "schedules" else "automatic"
+        )
         described = {
             LOGBOOK_ENTRY_NAME: state.name if state else "Battery Mode",
             LOGBOOK_ENTRY_MESSAGE: (
-                "returned to automatic because the "
+                f"returned to {returned_to} because the "
                 f"{event.data.get(ATTR_MODE)} action expired"
             ),
         }

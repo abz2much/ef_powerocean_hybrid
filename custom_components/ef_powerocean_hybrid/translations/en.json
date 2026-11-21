@@ -1169,7 +1169,8 @@
           "discharge_battery": "Discharge battery",
           "export_to_grid": "Export to grid",
           "import_from_grid": "Import from grid",
-          "export_solar_first": "Export solar first"
+          "export_solar_first": "Export solar first",
+          "schedules": "Schedules"
         }
       }
     },

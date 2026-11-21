@@ -147,6 +147,27 @@ Not ready yet; the integration is still in development. When it is:
 - Commands go out one at a time, and a clock that steps back does not stall
   the control timers.
 
+## Schedules under Modbus Control
+
+Needs Modbus and the EcoFlow cloud set up together.
+
+- Schedules is a Battery Mode option. It runs the slots of the EcoFlow app's
+  schedule list. A charge slot charges at its power. A Use battery slot runs
+  Automatic at any power, because Modbus on this model has no discharge cap. A
+  gap, or a slot that is switched off, runs Automatic.
+- Switching Modbus Control on selects Schedules on a system with the cloud.
+  Any other mode, or the `set_battery_command` action, is Manual. A command with
+  an expiry returns to Schedules when it runs out, and the expiry event says
+  where it returned (`returned_to`).
+- The list comes from MQTT, else from the cloud HTTP poll, else from a copy
+  saved on disk. Control Status shows the current slot (`schedule`) and the
+  source (`schedule_source`).
+- A slot is not run if its repeat or type is unknown, or if it repeats on
+  chosen days and the list came from HTTP alone, which has no trusted days.
+  Control Status lists these in `schedules_not_run`.
+- If Home Assistant stops, the inverter runs the same app schedules itself
+  within about 60 seconds.
+
 ## Troubleshooting
 
 - **Repairs shows "The inverter stopped answering Modbus" or "is not

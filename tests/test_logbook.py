@@ -63,3 +63,27 @@ def test_a_cleared_reading_check_says_what_ended(hass: HomeAssistant) -> None:
     )
 
     assert entry == {"name": "Inverter", "message": "no longer off grid"}
+
+
+def test_an_expiry_back_to_schedules_says_so(hass: HomeAssistant) -> None:
+    entry = _describe(
+        hass,
+        const.EVENT_COMMAND_EXPIRED,
+        {"mode": "charge_battery", "returned_to": "schedules"},
+    )
+
+    assert entry["message"] == (
+        "returned to schedules because the charge_battery action expired"
+    )
+
+
+def test_an_expiry_back_to_automatic_or_without_a_target_says_automatic(
+    hass: HomeAssistant,
+) -> None:
+    expected = "returned to automatic because the charge_battery action expired"
+    for data in (
+        {"mode": "charge_battery", "returned_to": "automatic"},
+        {"mode": "charge_battery"},
+    ):
+        entry = _describe(hass, const.EVENT_COMMAND_EXPIRED, data)
+        assert entry["message"] == expected

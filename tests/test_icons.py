@@ -146,6 +146,14 @@ def test_battery_mode_icons_cover_its_options() -> None:
     assert ICONS["entity"]["select"]["battery_mode"]["state"].keys() == options.keys()
 
 
+def test_the_schedules_option_is_named_and_has_an_icon() -> None:
+    translations = json.loads((INTEGRATION / "translations" / "en.json").read_text())
+    state = translations["entity"]["select"]["battery_mode"]["state"]
+    assert state[const.SCHEDULES_OPTION] == "Schedules"
+    icons = ICONS["entity"]["select"]["battery_mode"]["state"]
+    assert icons[const.SCHEDULES_OPTION] == "mdi:calendar-clock"
+
+
 def test_modbus_control_shows_an_hourglass_only_while_handing_back() -> None:
     """Off, but the inverter still obeys until its window runs out."""
     icon = MODBUS_CONTROL_SWITCH.icon
