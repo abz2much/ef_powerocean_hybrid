@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
@@ -2934,3 +2935,51 @@ def test_a_schedule_list_that_cannot_be_read_runs_automatic(
     failures = [r for r in caplog.records if "schedule" in r.getMessage().lower()]
     assert len([r for r in failures if r.exc_info]) == 2
     assert control.selected_feature is Feature.AUTOMATIC
+
+
+@pytest.mark.usefixtures("dublin")
+def test_a_slot_not_run_is_logged_once_with_its_reason(
+    control, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    base = charge_slot()
+    slots = {
+        2: dataclasses.replace(base, schedule_id=2, repeat=65),
+        3: dataclasses.replace(base, schedule_id=3, schedule_type=3),
+        4: dataclasses.replace(base, schedule_id=4, repeat=2, days=1),
+        5: dataclasses.replace(base, schedule_id=5, start=1500, end=60),
+    }
+    shown = dict(slots)
+
+    def source() -> ScheduleList:
+        return ScheduleList(tuple(shown.values()), "http", days_trusted=False)
+
+    def not_run_logs() -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelname == "WARNING" and "is not run" in r.getMessage()
+        ]
+
+    following(control, monkeypatch, source)
+    for seconds in (10, 20):
+        at_three(control, monkeypatch, seconds)
+        asyncio.run(control.async_poll(FRAME))
+    assert control.schedules_not_run == (2, 3, 4, 5)
+    assert sorted(not_run_logs()) == [
+        "Schedule 2 is not run: unknown repeat",
+        "Schedule 3 is not run: unknown type",
+        "Schedule 4 is not run: chosen days from a list without trusted days",
+        "Schedule 5 is not run: time past 23:59",
+    ]
+
+    # Fixed, then not run again: logged again; the others are not
+    caplog.clear()
+    del shown[2]
+    at_three(control, monkeypatch, 30)
+    asyncio.run(control.async_poll(FRAME))
+    assert control.schedules_not_run == (3, 4, 5)
+    assert not_run_logs() == []
+    shown[2] = slots[2]
+    at_three(control, monkeypatch, 40)
+    asyncio.run(control.async_poll(FRAME))
+    assert not_run_logs() == ["Schedule 2 is not run: unknown repeat"]

@@ -11,8 +11,8 @@ Rules:
   after midnight belong to the day it started on.
 - Switched-off slots never run.
 - A slot that cannot be run (a repeat other than daily or chosen days, chosen
-  days that are not trusted, a type other than charge or use battery) is
-  skipped and listed in `not_run`, whatever the time.
+  days that are not trusted, a type other than charge or use battery, a start
+  or end past 23:59) is skipped and listed in `not_run`, whatever the time.
 - If two slots are active at once, the one with the lowest id wins.
 """
 
@@ -28,6 +28,7 @@ from .cloud.mqtt import (
     SCHEDULE_REPEAT_DAYS,
     SCHEDULE_USE_BATTERY,
 )
+from .cloud.schedules import within_the_day
 from .models import ControlFeature
 
 if TYPE_CHECKING:
@@ -49,13 +50,24 @@ class SlotCommand(NamedTuple):
     not_run: tuple[int, ...]
 
 
+def not_run_reason(slot: Schedule, days_trusted: bool) -> str | None:
+    """Return why the runner cannot run this slot at all, None if it can."""
+    if slot.schedule_type not in (SCHEDULE_CHARGE, SCHEDULE_USE_BATTERY):
+        return "unknown type"
+    if not within_the_day(slot):
+        return "time past 23:59"
+    if slot.repeat == SCHEDULE_REPEAT_DAILY:
+        return None
+    if slot.repeat != SCHEDULE_REPEAT_DAYS:
+        return "unknown repeat"
+    if not days_trusted:
+        return "chosen days from a list without trusted days"
+    return None
+
+
 def _runnable(slot: Schedule, days_trusted: bool) -> bool:
     """Return whether the runner can run this slot at all."""
-    if slot.schedule_type not in (SCHEDULE_CHARGE, SCHEDULE_USE_BATTERY):
-        return False
-    if slot.repeat == SCHEDULE_REPEAT_DAILY:
-        return True
-    return slot.repeat == SCHEDULE_REPEAT_DAYS and days_trusted
+    return not_run_reason(slot, days_trusted) is None
 
 
 def _runs_on(slot: Schedule, weekday: int) -> bool:

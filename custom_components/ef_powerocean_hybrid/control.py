@@ -71,7 +71,7 @@ from .models import (
 )
 from .plans import CHARGE, DISCHARGE, Mode, ModeState, Step, Way, battery_power
 from .reading_checks import ReadingChecks
-from .schedule_runner import SlotCommand, slot_command
+from .schedule_runner import SlotCommand, not_run_reason, slot_command
 from .util import seconds_since
 
 if TYPE_CHECKING:
@@ -370,6 +370,9 @@ class ControlManager:
         # Whether the last read of the schedules failed, so a lasting fault is
         # logged once rather than every poll.
         self._schedule_read_failed = False
+        # Ids of the slots not run that have been logged: each is logged once,
+        # and again only after it was run (or gone) in between.
+        self._logged_not_run: frozenset[int] = frozenset()
         # Which guard, if any, is forcing the current command.
         self._command_status: ControlStatus | None = None
         self._handback = GuardHandback()
@@ -938,6 +941,7 @@ class ControlManager:
                 None if self._schedule_source is None else self._schedule_source()
             )
             self._slot = slot_command(schedules, dt.now())
+            self._log_not_run(schedules)
         except Exception:
             # Automatic rather than a failed poll, so the guards keep running.
             if not self._schedule_read_failed:
@@ -958,6 +962,22 @@ class ControlManager:
         self._schedule_power = self._slot.power
         self._handback = GuardHandback()
         return True
+
+    def _log_not_run(self, schedules: ScheduleList | None) -> None:
+        """Warn once for each slot newly not run, with the reason."""
+        not_run = frozenset(self._slot.not_run)
+        if schedules is not None:
+            for slot in schedules.schedules:
+                if (
+                    slot.schedule_id in not_run
+                    and slot.schedule_id not in self._logged_not_run
+                ):
+                    _LOGGER.warning(
+                        "Schedule %s is not run: %s",
+                        slot.schedule_id,
+                        not_run_reason(slot, schedules.days_trusted),
+                    )
+        self._logged_not_run = not_run
 
     async def async_select_feature(self, feature: ControlFeature) -> None:
         """Select a control feature."""

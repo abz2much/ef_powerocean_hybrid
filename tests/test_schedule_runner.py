@@ -9,13 +9,23 @@ from zoneinfo import ZoneInfo
 import pytest
 from homeassistant.util import dt as dt_util
 
-from custom_components.ef_powerocean_hybrid.cloud.mqtt import Schedule
-from custom_components.ef_powerocean_hybrid.cloud.schedules import ScheduleList
+from custom_components.ef_powerocean_hybrid.cloud.mqtt import (
+    Schedule,
+    pack_schedule_time,
+)
+from custom_components.ef_powerocean_hybrid.cloud.schedules import (
+    ScheduleList,
+    saved_list,
+    schedules_from_http,
+    schedules_from_saved,
+)
 from custom_components.ef_powerocean_hybrid.models import ControlFeature
 from custom_components.ef_powerocean_hybrid.schedule_runner import (
     SlotCommand,
+    not_run_reason,
     slot_command,
 )
+from tests.cloud.test_schedules_http import REPORT, load
 
 MONDAY = 1
 DUBLIN = "Europe/Dublin"
@@ -228,3 +238,70 @@ def test_summer_time_end_night() -> None:
     assert (
         slot_command(mqtt(slot), datetime(2026, 10, 25, 6, 30, tzinfo=UTC)).slot is None
     )
+
+
+# A time past 23:59 (the probe): 25:00-01:00 and 01:40-25:00
+PAST_THE_DAY = ((1500, 60), (100, 1500))
+
+
+def test_a_time_past_the_day_from_http_is_not_run() -> None:
+    """The HTTP list keeps such a time; the runner does not run the slot."""
+    response = load("response_model86_schedules.json")
+    entries = response["data"]["quota"][REPORT]["timeTaskCfg"]
+    by_id = {entry["taskIndex"]: entry for entry in entries}
+    # 13 is Charge 3000 W, 14 Charge 1500 W, both daily
+    for task, (start, end) in zip((13, 14), PAST_THE_DAY, strict=True):
+        by_id[task]["timeTable"] = [pack_schedule_time(start, end)]
+    response["data"]["quota"][REPORT]["timeTaskCfg"] = [by_id[13], by_id[14]]
+    found = schedules_from_http(response)
+    assert found is not None
+    schedules = ScheduleList(tuple(found), "http", False)
+    for now in (mon(0, 30), mon(12)):
+        cmd = slot_command(schedules, now)
+        assert cmd == SlotCommand(ControlFeature.AUTOMATIC, 0.0, None, (13, 14))
+
+
+def test_a_time_past_the_day_from_the_saved_list_is_not_run() -> None:
+    slots = [sched(i, start=s, end=e) for i, (s, e) in enumerate(PAST_THE_DAY, 1)]
+    schedules = schedules_from_saved(saved_list(slots, "http"))
+    assert schedules is not None
+    assert schedules.source == "saved"
+    for now in (mon(0, 30), mon(12)):
+        cmd = slot_command(schedules, now)
+        assert cmd == SlotCommand(ControlFeature.AUTOMATIC, 0.0, None, (1, 2))
+
+
+def test_a_time_past_the_day_from_mqtt_is_not_run() -> None:
+    slots = [sched(i, start=s, end=e) for i, (s, e) in enumerate(PAST_THE_DAY, 1)]
+    for now in (mon(0, 30), mon(12)):
+        cmd = slot_command(mqtt(*slots), now)
+        assert cmd == SlotCommand(ControlFeature.AUTOMATIC, 0.0, None, (1, 2))
+
+
+def test_the_last_minute_of_the_day_is_a_time_of_the_day() -> None:
+    slot = sched(start=1380, end=1439)
+    assert slot_command(mqtt(slot), mon(23, 30)).slot == slot
+
+
+UNTRUSTED = "chosen days from a list without trusted days"
+
+
+@pytest.mark.parametrize(
+    ("slot", "trusted", "reason"),
+    (
+        (sched(), True, None),
+        (sched(repeat=65), True, "unknown repeat"),
+        (sched(schedule_type=3), True, "unknown type"),
+        (
+            sched(repeat=2, days=MONDAY),
+            False,
+            "chosen days from a list without trusted days",
+        ),
+        (sched(repeat=2, days=MONDAY), True, None),
+        (sched(start=1500, end=60), True, "time past 23:59"),
+    ),
+)
+def test_the_reason_a_slot_is_not_run(
+    slot: Schedule, trusted: bool, reason: str | None
+) -> None:
+    assert not_run_reason(slot, trusted) == reason

@@ -182,6 +182,25 @@ async def test_control_status_shows_the_slot_title_while_one_runs(
     assert _state(hass, status_id).attributes["schedule"] == schedule_title(slot)
 
 
+async def test_control_status_shows_that_schedules_drive(
+    hass: HomeAssistant, hybrid_entry: MockConfigEntry, set_up_hybrid: SetUp
+) -> None:
+    await setup(hass, hybrid_entry, set_up_hybrid)
+    await _switch_control_on(hass, hybrid_entry)
+    status_id = _entity_id(hass, hybrid_entry, "sensor", "control_status")
+    select_id = _entity_id(hass, hybrid_entry, "select", const.BATTERY_MODE_SELECT.key)
+    assert _state(hass, status_id).attributes["following_schedules"] is True
+
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": select_id, "option": "hold_battery"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert _state(hass, status_id).attributes["following_schedules"] is False
+
+
 @pytest.fixture
 async def set_up_modbus_only(
     hass: HomeAssistant, inverter: FakeInverter
@@ -226,6 +245,7 @@ async def test_a_modbus_only_entry_has_no_schedules_option(
     assert attributes["schedule"] is None
     assert attributes["schedule_source"] is None
     assert attributes["schedules_not_run"] == []
+    assert attributes["following_schedules"] is False
 
 
 async def test_a_cloud_only_entry_is_unchanged(

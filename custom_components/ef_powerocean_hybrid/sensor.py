@@ -212,6 +212,7 @@ class EcoFlowControlStatusSensor(EcoFlowBaseEntity[SensorDef], SensorEntity):
             "control_method": str(control.method),
             "in_control": control.in_control,
             "expires_at": control.expires_at,
+            "following_schedules": control.following_schedules,
             "schedule": None if slot is None else schedule_title(slot),
             "schedule_source": control.schedule_source,
             "schedules_not_run": list(control.schedules_not_run),
