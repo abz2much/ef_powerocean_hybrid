@@ -4,6 +4,9 @@
 
 ### Added
 
+- The schedule list is read from the cloud HTTP response (the app's schedules,
+  with the live system's response as a test fixture). Not used by the
+  integration yet.
 - The EcoFlow cloud HTTP API, response parser and anonymiser from
   powerocean_single_phase v1.0.1 (commit `45287c9`), with their tests. Not
   used by the integration yet.

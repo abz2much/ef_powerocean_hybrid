@@ -19,6 +19,7 @@ from .mqtt import (
     SCHEDULE_REPEAT_DAYS,
     SCHEDULE_USE_BATTERY,
     Schedule,
+    unpack_schedule_time,
 )
 
 if TYPE_CHECKING:
@@ -106,6 +107,69 @@ def schedule_attributes(schedule: Schedule) -> dict[str, Any]:
         "days": schedule_days(schedule),
         "in_use": schedule.in_use,
     }
+
+
+# Suffix of the quota key that holds the schedules; the prefix is the model's
+TIMER_REPORT_SUFFIX = "_EMS_ALL_TIMER_TASK_REPORT"
+
+
+def _flag(value: Any) -> bool:
+    """Return a flag the cloud sends as a bool or as the text TRUE/FALSE."""
+    if isinstance(value, str):
+        return value.strip().upper() == "TRUE"
+    return bool(value)
+
+
+def _schedule_from_entry(entry: Any) -> Schedule | None:
+    """Return the schedule of one entry of the list, None if it is incomplete."""
+    if not isinstance(entry, dict):
+        return None
+    table = entry.get("timeTable")
+    schedule_id = entry.get("taskIndex")
+    schedule_type = entry.get("type")
+    if (
+        not isinstance(table, list)
+        or not table
+        or not isinstance(table[0], int)
+        or not isinstance(schedule_id, int)
+        or not isinstance(schedule_type, int)
+    ):
+        return None
+    start, end = unpack_schedule_time(table[0])
+    power = entry.get("sysChgDsgPwr")
+    repeat = entry.get("timeMode")
+    return Schedule(
+        schedule_id=schedule_id,
+        schedule_type=schedule_type,
+        enabled=_flag(entry.get("isEnable")),
+        power=int(power) if isinstance(power, (int, float)) else 0,
+        start=start,
+        end=end,
+        repeat=repeat if isinstance(repeat, int) else 0,
+        in_use=_flag(entry.get("isEffect")),
+    )
+
+
+def schedules_from_http(response: Mapping[str, Any]) -> list[Schedule] | None:
+    """
+    Return the schedules in a cloud HTTP response.
+
+    None when the response has no schedule report (the list is unknown); an
+    empty list when the report is empty. Entries without a time are skipped.
+    """
+    data = response.get("data")
+    quota = data.get("quota") if isinstance(data, dict) else None
+    if not isinstance(quota, dict):
+        return None
+    for key, report in quota.items():
+        if not (isinstance(key, str) and key.endswith(TIMER_REPORT_SUFFIX)):
+            continue
+        if not isinstance(report, dict):
+            return None
+        entries = report.get("timeTaskCfg") or []
+        schedules = (_schedule_from_entry(entry) for entry in entries)
+        return [schedule for schedule in schedules if schedule is not None]
+    return None
 
 
 def _minutes(value: time) -> int:
