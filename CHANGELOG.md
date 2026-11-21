@@ -4,6 +4,10 @@
 
 ### Added
 
+- The cloud coordinator offers one schedule list: from MQTT when it is known,
+  else from the HTTP response (which has no days, so they are not trusted),
+  else from a copy saved on disk (deleted with the entry). Not used by the
+  integration yet.
 - The schedule list is read from the cloud HTTP response (the app's schedules,
   with the live system's response as a test fixture). Not used by the
   integration yet.

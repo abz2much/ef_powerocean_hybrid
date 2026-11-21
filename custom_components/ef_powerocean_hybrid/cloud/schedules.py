@@ -12,7 +12,7 @@ This module does not depend on Home Assistant.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from .mqtt import (
     SCHEDULE_CHARGE,
@@ -107,6 +107,67 @@ def schedule_attributes(schedule: Schedule) -> dict[str, Any]:
         "days": schedule_days(schedule),
         "in_use": schedule.in_use,
     }
+
+
+SOURCE_MQTT = "mqtt"
+SOURCE_HTTP = "http"
+SOURCE_SAVED = "saved"
+SAVED_FIELDS = (
+    "schedule_id",
+    "schedule_type",
+    "enabled",
+    "power",
+    "start",
+    "end",
+    "repeat",
+    "days",
+    "in_use",
+)
+
+
+class ScheduleList(NamedTuple):
+    """
+    The schedules and where they come from.
+
+    `source` is "mqtt", "http" or "saved". `days_trusted` says whether the
+    chosen days are right: the MQTT list has them, the HTTP list has none, so
+    its schedules (and a saved copy of it) cannot tell which days they run.
+    """
+
+    schedules: tuple[Schedule, ...]
+    source: str
+    days_trusted: bool
+
+
+def saved_list(schedules: Iterable[Schedule], source: str) -> dict[str, Any]:
+    """Return a list of schedules as it is saved; `source` is its origin."""
+    return {
+        "source": source,
+        "schedules": [
+            {name: getattr(schedule, name) for name in SAVED_FIELDS}
+            for schedule in schedules
+        ],
+    }
+
+
+def schedules_from_saved(data: Any) -> ScheduleList | None:
+    """Return the list saved by `saved_list`, None if it is missing or damaged."""
+    if not isinstance(data, dict) or data.get("source") not in (
+        SOURCE_MQTT,
+        SOURCE_HTTP,
+    ):
+        return None
+    entries = data.get("schedules")
+    if not isinstance(entries, list):
+        return None
+    try:
+        schedules = tuple(
+            Schedule(**{name: entry[name] for name in SAVED_FIELDS})
+            for entry in entries
+        )
+    except (TypeError, KeyError):
+        return None
+    return ScheduleList(schedules, SOURCE_SAVED, data["source"] == SOURCE_MQTT)
 
 
 # Suffix of the quota key that holds the schedules; the prefix is the model's

@@ -23,6 +23,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -40,6 +41,8 @@ from ..const import (
     CONF_LIVE_POWER,
     CONF_MAX_SCHEDULE_POWER,
     DOMAIN,
+    STATE_SAVE_DELAY_S,
+    STORAGE_VERSION,
 )
 from ..sources import Reading
 from .api import (
@@ -65,7 +68,17 @@ from .mqtt import (
 )
 from .parse import parse
 from .schedule_rules import MAX_SCHEDULES, refuse, validate_schedule
-from .schedules import schedule_title, windows_overlap, within_the_day
+from .schedules import (
+    SOURCE_HTTP,
+    SOURCE_MQTT,
+    ScheduleList,
+    saved_list,
+    schedule_title,
+    schedules_from_http,
+    schedules_from_saved,
+    windows_overlap,
+    within_the_day,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -133,6 +146,11 @@ class CloudApi(Protocol):
     async def async_mqtt_credentials(self) -> dict[str, Any]: ...
 
     async def fetch_raw(self) -> dict[str, Any]: ...
+
+
+def schedule_store(hass: HomeAssistant, entry_id: str) -> Store[dict[str, Any]]:
+    """Return the store of the last schedule list seen from MQTT or HTTP."""
+    return Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry_id}.schedules")
 
 
 def create_api(hass: HomeAssistant, entry: ConfigEntry) -> CloudApi:
@@ -230,6 +248,12 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._schedule_waiters: list[asyncio.Future[None]] = []
         # One schedule command at a time: the next id is the highest plus 1.
         self._schedule_lock = asyncio.Lock()
+        # The list in the last HTTP response, None if it had none.
+        self._http_schedules: list[Schedule] | None = None
+        # The saved copy, and the list (with its source) last handed to the store.
+        self._saved_schedules: ScheduleList | None = None
+        self._persisted_schedules: tuple[tuple[Schedule, ...], str] | None = None
+        self._schedule_store = schedule_store(hass, entry.entry_id)
 
     async def _async_update_data(self) -> dict[str, Any]:
         if self.api.token is None:
@@ -243,6 +267,10 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             msg = f"Unexpected cloud response: {err}"
             raise UpdateFailed(msg) from err
         self.soc_limits = soc_limits_of(response)
+        found = schedules_from_http(response)
+        if found is not None:
+            self._http_schedules = found
+            self._save_schedules()
         self._update_firmware(result.firmware)
         self._note_report_times(values)
         self._hold_recent_settings(values)
@@ -705,6 +733,7 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for waiter in self._schedule_waiters:
             if not waiter.done():
                 waiter.set_result(None)
+        self._save_schedules()
         if changed:
             self.async_update_listeners()
 
@@ -724,7 +753,44 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             self._past_the_day.pop(schedule.schedule_id, None)
             self.schedules = {**self.schedules, schedule.schedule_id: schedule}
+        self._save_schedules()
         self.async_update_listeners()
+
+    def schedule_list(self) -> ScheduleList | None:
+        """
+        Return the schedules from the best source there is, None if unknown.
+
+        The MQTT list while it is known, else the HTTP list, else the saved
+        copy (from before a restart or an outage).
+        """
+        if self.mqtt is not None and self._schedules_known:
+            ordered = sorted(self.schedules.values(), key=lambda s: s.schedule_id)
+            return ScheduleList(tuple(ordered), SOURCE_MQTT, days_trusted=True)
+        if self._http_schedules is not None:
+            ordered = sorted(self._http_schedules, key=lambda s: s.schedule_id)
+            return ScheduleList(tuple(ordered), SOURCE_HTTP, days_trusted=False)
+        return self._saved_schedules
+
+    async def async_load_saved_schedules(self) -> None:
+        """Read the saved copy of the list, for use until a list arrives."""
+        self._saved_schedules = schedules_from_saved(
+            await self._schedule_store.async_load()
+        )
+
+    @callback
+    def _save_schedules(self) -> None:
+        """Save the list from MQTT or HTTP when it differs from the one saved."""
+        current = self.schedule_list()
+        if current is None:
+            return
+        state = (current.schedules, current.source)
+        if state == self._persisted_schedules:
+            return
+        self._persisted_schedules = state
+        self._schedule_store.async_delay_save(
+            lambda: saved_list(current.schedules, current.source),
+            STATE_SAVE_DELAY_S,
+        )
 
     def _warn_past_the_day(self) -> None:
         """Warn once for each schedule with a time past 23:59, as it is now."""

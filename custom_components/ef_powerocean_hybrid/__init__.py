@@ -238,6 +238,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> b
     cloud = None
     if CONF_CLOUD_SERIAL in entry.data:
         cloud = CloudCoordinator(hass, entry, cloud_module.create_api(hass, entry))
+        await cloud.async_load_saved_schedules()
         # Not a first refresh: a cloud that is down or rejects the login must
         # not stop the entry, or its Modbus side, from loading.
         await cloud.async_refresh()
@@ -438,3 +439,4 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Delete the state saved for the entry, which nothing else would read again."""
     outage.async_forget(hass, entry)
     await state_store(hass, entry.entry_id).async_remove()
+    await cloud_module.schedule_store(hass, entry.entry_id).async_remove()
