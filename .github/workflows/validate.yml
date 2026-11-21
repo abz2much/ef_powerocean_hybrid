@@ -57,7 +57,7 @@ jobs:
         with:
           node-version: "22"
       - name: Run the schedule card's tests
-        run: node --test tests/frontend/
+        run: node --test "tests/frontend/*.test.mjs"
 
   unit-tests:
     name: Unit tests (Home Assistant ${{ matrix.ha }})
