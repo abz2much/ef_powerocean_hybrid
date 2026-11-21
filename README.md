@@ -10,9 +10,8 @@ Early development. Do not install it yet.
 
 - **Modbus:** the local Modbus integration it is based on, under a new name, for
   every model that integration supports. It still contains that integration's
-  battery control, now with safeguards (see below). Control has not been tested
-  on a PowerOcean Single Phase yet: do not switch Modbus Control on until the
-  supervised checks on the inverter are done.
+  battery control (confirmed on the PowerOcean 1-phase upstream), now with
+  safeguards (see below).
 - **EcoFlow cloud (PowerOcean Single Phase only):** set up beside Modbus or on its
   own. The cloud adds the values Modbus does not have, such as each battery
   pack's state of health, cycles and temperatures. If the inverter does not
