@@ -5,10 +5,12 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      # Home Assistant pins these (package_constraints.txt), and the integration
-      # runs with the versions Home Assistant ships, so the tests use those.
+      # Home Assistant ships these (package_constraints.txt, and its Modbus
+      # integration's requirement), and the integration runs with the versions
+      # Home Assistant ships, so the tests use those.
       - dependency-name: paho-mqtt
       - dependency-name: pymodbus
+      - dependency-name: modbus-connection
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
