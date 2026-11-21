@@ -4,6 +4,10 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    ignore:
+      # Home Assistant pins it (package_constraints.txt), and the integration
+      # runs with the version Home Assistant ships, so the tests use that one.
+      - dependency-name: paho-mqtt
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
