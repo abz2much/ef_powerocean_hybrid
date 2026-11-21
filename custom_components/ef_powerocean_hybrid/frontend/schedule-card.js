@@ -18,7 +18,7 @@ import {
   toHm,
   viewKey,
   weekdayIn,
-} from "./schedule-logic.js?v=0.3.0"; // the manifest version (tested)
+} from "./schedule-logic.js?v=1.0.0"; // the manifest version (tested)
 
 const DOMAIN = "ef_powerocean_hybrid";
 const CARD = "ef-powerocean-schedule-card";

@@ -33,7 +33,7 @@ async def test_the_card_folder_is_served_and_loaded(hass: HomeAssistant) -> None
     # Cached: both files are fetched with the version in their address.
     assert config.cache_headers is True
     add_url.assert_called_once_with(
-        hass, "/ef_powerocean_hybrid/frontend/schedule-card.js?v=0.3.0"
+        hass, "/ef_powerocean_hybrid/frontend/schedule-card.js?v=1.0.0"
     )
 
 
