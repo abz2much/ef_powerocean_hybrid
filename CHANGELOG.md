@@ -4,6 +4,9 @@
 
 ### Added
 
+- A function that works out what the app's schedules say the battery should
+  do now (charge at the slot's power, else Automatic), with its rules for
+  days, midnight and summer time. Not used by the integration yet.
 - The cloud coordinator offers one schedule list: from MQTT when it is known,
   else from the HTTP response (which has no days, so they are not trusted),
   else from a copy saved on disk (deleted with the entry). With MQTT on only the
