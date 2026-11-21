@@ -66,10 +66,6 @@ Home Assistant 2026.9 or newer is required. The integration is in English only.
 - Single-phase inverters no longer get L2 and L3 voltage and current sensors,
   which always read 0. On the PowerOcean Single Phase, the PV string 3 sensors
   start disabled.
-- A lost connection is retried after 0, 5, 10 and 20 seconds, then every 30
-  seconds. On the connection Home Assistant shares, a request times out after 3
-  seconds and a timeout drops the connection, so a connection a firewall
-  silently drops is replaced.
 - The German translation and `scripts/control_feature_scan.py`, which wrote to
   the inverter outside the integration, are removed.
 - The integration has its own icon.
@@ -80,11 +76,15 @@ Home Assistant 2026.9 or newer is required. The integration is in English only.
   up, and again after a reconnect. Before, the first requests could be lost.
 - A command is refused while MQTT is reconnecting. Before, it was held and sent
   on reconnect, long after Home Assistant had reported it failed.
-- MQTT stops when Home Assistant stops, and a disconnect the integration asked
-  for is logged at debug level.
-- The EcoFlow user ID no longer shows in the log: the MQTT thread has its own
-  name, and paho's debug log masks the user ID.
-- A schedule the system reports with a time past 23:59 still counts toward the
-  6 schedules and for overlaps.
+- MQTT stops when Home Assistant stops.
+- The MQTT connection now logs: a dropped connection is a warning, and connects,
+  commands and replies are logged at debug level. The user ID in paho's debug
+  log is masked.
+- The EcoFlow user ID no longer shows in the log. paho named its thread after
+  the MQTT client ID, which ends in the user ID; the thread now has its own
+  name.
+- A schedule the system reports with a time past 23:59 is no longer shown as a
+  switch. It still counts toward the 6 schedules and for overlaps, and the log
+  warns about it once.
 - Wi-Fi, Ethernet and 4G state show "Connected" or "Not connected" for the codes
   seen on a real system. The Heartbeat update time sensor is off by default.

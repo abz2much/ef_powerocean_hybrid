@@ -1,7 +1,8 @@
 # EF PowerOcean Hybrid
 
 EF PowerOcean Hybrid is a Home Assistant integration for EcoFlow PowerOcean
-inverters. It reads the inverter over Modbus TCP on your local network and can
+and Ocean 2 inverters: the PowerOcean Single Phase, Three Phase, Plus and DC
+Fit, and the Ocean 2 Three Phase, Single Phase and Plus Single Phase. It reads the inverter over Modbus TCP on your local network and can
 control its battery. For the PowerOcean Single Phase it can also use the EcoFlow
 cloud, which adds the values Modbus does not have and lets you manage the
 scheduled tasks of the EcoFlow app from Home Assistant.
@@ -62,8 +63,8 @@ Assistant.
    and turn on **Extended connection (MQTT)**. To add or change schedules, also
    set **Max schedule power**.
 
-A system set up with Modbus alone can add the cloud later, and a system set up
-through the cloud alone can add a Modbus address later. Both are under
+A PowerOcean Single Phase set up with Modbus alone can add the cloud later, and
+one set up through the cloud alone can add a Modbus address later. Both are under
 **Reconfigure** in the entry's menu.
 
 ## Documentation

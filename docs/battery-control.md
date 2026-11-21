@@ -45,7 +45,7 @@ Modbus Control is on, the inverter does not run the app's
 [scheduled tasks](schedules.md) itself, so Home Assistant runs them:
 
 - During a Charge schedule, the battery charges at the schedule's power. The
-  Charge battery power you set for that mode is kept as it is.
+  Battery Charge Power you set for that mode is kept as it is.
 - During a Use battery schedule, the battery runs Automatic at any power. Modbus
   on these inverters has no way to cap the discharge.
 - Between schedules, or during a schedule that is switched off, the battery runs
@@ -56,7 +56,8 @@ Choosing another mode, or sending `set_battery_command` with another mode,
 stops following the schedules. A command with an expiry that is sent while
 Schedules is selected returns to Schedules when it runs out.
 
-The schedule list comes from MQTT while MQTT is connected. Otherwise it comes
+The schedule list comes from MQTT while MQTT is connected and has sent it.
+Otherwise it comes
 from the cloud's regular data, and otherwise from a copy saved on disk, so
 Schedules keeps working while the cloud is away. A schedule is not run if Home
 Assistant cannot be sure when it should run: if its repeat or type is unknown,
@@ -75,13 +76,13 @@ about 60 seconds.
 
 Two number entities keep the battery within limits in every mode:
 
-| Guard           | Stops the battery from       | Off at |
-| --------------- | ---------------------------- | ------ |
-| Charge Limit    | charging above this level    | 100 %  |
-| Battery Reserve | discharging below this level | 0 %    |
+| Guard                | Stops the battery from       | Off at |
+| -------------------- | ---------------------------- | ------ |
+| Battery Charge Limit | charging above this level    | 100 %  |
+| Battery Reserve      | discharging below this level | 0 %    |
 
 The guards only ever stop the battery; they never reverse it. In Automatic, the
-battery can still power the house under the Charge Limit and still charge from
+battery can still power the house under the Battery Charge Limit and still charge from
 solar under the Battery Reserve. A guard releases once the charge has moved 5 %
 back. The inverter has no charge limit setting, so while a guard is on, the
 integration runs self-consumption itself and blocks the forbidden direction.
@@ -99,7 +100,7 @@ shows:
 
 **Effective Battery Reserve** shows which reserve holds right now. With an
 emulated reserve, the switch **Charge to Battery Reserve** also charges the
-battery from the grid up to the reserve, at the Charge battery power, as the
+battery from the grid up to the reserve, at the Battery Charge Power, as the
 app's backup reserve does.
 
 ## Control Status
@@ -112,7 +113,7 @@ app's backup reserve does.
 | Active                                   | The selected mode is working                                                |
 | Ramping                                  | The inverter has not reached the target yet                                 |
 | Limited by inverter                      | The inverter goes the other way or past the target                          |
-| Charge limit reached                     | The Charge Limit is stopping the battery                                    |
+| Charge limit reached                     | The Battery Charge Limit is stopping the battery                            |
 | Battery reserve reached                  | The Battery Reserve is stopping the battery                                 |
 | Charging to battery reserve              | Charge to Battery Reserve is charging up to it                              |
 | Below solar export limit                 | Export solar first is exporting the whole surplus                           |
@@ -135,7 +136,8 @@ check shows to be wrong is unavailable until it makes sense again.
 
 ## Commanding the battery from automations
 
-The `set_battery_command` action sets the mode, its power and the Charge Limit
+The `set_battery_command` action sets the mode, its power and the Battery
+Charge Limit
 in one step:
 
 ```yaml

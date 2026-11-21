@@ -33,8 +33,11 @@ can stay.
 2. Remove powerocean_single_phase.
 3. Set up this integration. Choose Modbus TCP and add the EcoFlow cloud, or
    choose EcoFlow cloud only.
-4. Give the inverter's device the name it had, so the entity IDs match. The
-   schedule switches are named `schedule_<id>` after the device name, as before.
+4. Give the inverter's device the name it had. The schedule switches
+   (`schedule_<id>`) and the Active schedule sensor then keep their entity IDs.
+   The sensors get new entity IDs, made from their names rather than the
+   cloud's keys, so every dashboard, automation and the Energy dashboard that
+   uses a sensor must be pointed at the new one.
 5. Turn on the same options: Extended connection (MQTT), Live power values and
    Max schedule power.
 6. Change automations and scripts that call
