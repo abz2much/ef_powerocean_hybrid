@@ -39,7 +39,8 @@ def test_in_use_follows_is_effect() -> None:
     """Only the schedule the system runs now is in use."""
     schedules = schedules_from_http(load("response_model86_schedules.json"))
     assert schedules is not None
-    assert [s.schedule_id for s in schedules if s.in_use] == [14]
+    # Saved at 08:00, while the 08:00-17:00 slot ran
+    assert [s.schedule_id for s in schedules if s.in_use] == [16]
 
 
 def test_an_empty_list_is_no_schedules() -> None:
