@@ -401,7 +401,8 @@ async def test_cloud_down_at_start_starts_mqtt_with_its_first_answer(
 
     api.recover()
     await cloud.async_refresh()
-    await hass.async_block_till_done()
+    # The start runs as a background task.
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     (client,) = FakeMqtt.instances
     assert client.started
