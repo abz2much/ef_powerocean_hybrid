@@ -180,13 +180,6 @@
   Modbus Control switch cannot be found counts as controlling. If the other's
   control comes on while control is on here, the next poll switches it off
   here, with a warning in the log.
-- The heartbeat that keeps the inverter following Modbus commands now beats only
-  while the control logic (guards, expiry, modes) has run on a poll within two
-  poll intervals plus 30 seconds. Before, it beat on its own timer whatever
-  happened to the polls, so a bug that stopped the logic would leave the
-  inverter on its last command, such as charging from the grid, for as long as
-  Home Assistant ran. Now the inverter hands back to its app settings within
-  60 seconds, with a warning in the log.
 - Switching Modbus Control off, unloading the entry or stopping Home Assistant
   now releases the command first (setpoint 0 and the default method, battery
   saver kept), within 5 seconds, then stops the heartbeat. Before, nothing was
@@ -196,10 +189,6 @@
   release has its own stop listener.
 - The stop listeners (this one and MQTT's) no longer log an error when the
   entry unloads after Home Assistant's stop.
-- Switching Modbus Control on first clears the power setpoints and selects the
-  default method, then starts the heartbeat. Without a heartbeat the inverter
-  ignores these writes, so a command left from an earlier session can no
-  longer come back to life with the first beat.
 - Every control word now goes through one check that refuses the off-grid and
   shutdown bits, before anything is written. Before, only battery saver's path
   had it.
@@ -214,8 +203,8 @@
   over the user's newer one until the next poll.
 - A clock that steps back no longer freezes the control timers. Every time
   recorded before the step then lies in the future and now counts as long ago:
-  a changed command goes out at once, the heartbeat counts as lapsed and beats
-  again after the next poll, and a timed command (`expire_in`) ends at once
+  a changed command goes out at once, the heartbeat counts as lapsed and is
+  rewritten, and a timed command (`expire_in`) ends at once
   instead of running longer by the size of the step. Before, a command change
   could be held back until the clock caught up (an hour after a one-hour step),
   the heartbeat counted as current for as long, and a guard's hand-back or a

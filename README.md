@@ -139,12 +139,8 @@ Not ready yet; the integration is still in development. When it is:
   address, and it is switched off here if that one's control comes on later.
   With its control off, the other integration only reads and is left alone. The address is compared as entered: an IP address
   in one and a host name in the other are not recognised as the same inverter.
-- The heartbeat that keeps the inverter following commands beats only while the
-  control logic runs on recent polls; otherwise the inverter returns to its app
-  settings within 60 seconds.
 - Switching off, unloading or stopping Home Assistant first releases the
-  command (setpoint 0, default method); switching on first clears what the
-  inverter held.
+  command (default method, setpoint 0).
 - Every control word is checked for the off-grid and shutdown bits, and the
   setpoint is read back each poll: if the inverter holds something else on two
   polls in a row, control is switched off and the log says why.

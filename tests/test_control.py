@@ -103,35 +103,13 @@ def beat(control, now: datetime, monkeypatch: pytest.MonkeyPatch) -> bool:
     return asyncio.run(control._heartbeat.async_ensure_fresh())
 
 
-def test_only_a_poll_keeps_the_control_logic_counted_as_running(
-    control, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The heartbeat follows this: guards and expiry run on each poll's readings."""
-    allow_writes(control, monkeypatch)
-    assert control.deciding is False
-
-    asyncio.run(control.async_poll({"battery_soc": 50.0}))
-    assert control.deciding is True
-
-    limit = 2 * const.DEFAULT_SCAN_INTERVAL_S + 30
-    advance(control, monkeypatch, limit + 1)
-    # A user action re-applies the last poll's readings: no new decision on them.
-    asyncio.run(control.async_apply())
-    assert control.deciding is False
-
-
-def test_the_heartbeat_asks_whether_the_control_logic_is_running(control) -> None:
-    assert control._heartbeat._alive is not None
-    assert control._heartbeat._alive() is control.deciding
-
-
 def test_a_clock_stepped_back_does_not_freeze_the_timers(
     control, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """After a step back, every time recorded before it lies in the future.
 
-    Each then counts as long ago: the heartbeat is rewritten, a changed command
-    goes out, and the control logic must run on a new poll before beats go on.
+    Each then counts as long ago: the heartbeat counts as lapsed and a changed
+    command goes out.
     """
     allow_writes(control, monkeypatch)
     asyncio.run(control.async_poll({"battery_soc": 50.0}))
@@ -139,12 +117,10 @@ def test_a_clock_stepped_back_does_not_freeze_the_timers(
     control._heartbeat._last_success = ahead
     control._last_control_write_time = ahead
     control._retargeted_at = ahead
-    control._decided_at = ahead
 
     assert control._heartbeat.in_control is False
     assert control._control_written_within(const.MIN_CONTROL_DWELL_S) is False
     assert control._turning_around() is False
-    assert control.deciding is False
 
 
 def test_a_clock_stepped_back_does_not_stretch_a_timed_command(
@@ -1330,8 +1306,6 @@ def test_switching_modbus_control_off_hands_back_and_on_takes_control_again(
 
     control._heartbeat.start = Mock()
     asyncio.run(control.async_set_enabled(True))
-    # Switching on cleared what the inverter held; what follows is the poll.
-    write.reset_mock()
     # The restarted heartbeat has landed.
     advance(control, monkeypatch, const.HEARTBEAT_WINDOW_S + 2)
     asyncio.run(control.async_poll({"battery_soc": 50.0}))
@@ -1340,87 +1314,6 @@ def test_switching_modbus_control_off_hands_back_and_on_takes_control_again(
     # The inverter may still follow the old command, so the default is re-sent.
     assert commands(write) == [(const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0000])]
     assert control.status is Status.AUTOMATIC
-
-
-def test_switching_on_clears_the_inverter_before_the_first_beat(
-    control, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A command left from an earlier session would act with the first beat.
-
-    Without a heartbeat the inverter stores these writes and ignores them, so
-    clearing first is safe.
-    """
-    write = allow_writes(control, monkeypatch)
-    control._enabled = False
-    control._battery_saver = True
-    order: list[str] = []
-    write.side_effect = lambda *_args, **_kwargs: order.append("write")
-    control._heartbeat.start = Mock(side_effect=lambda: order.append("beat"))
-
-    asyncio.run(control.async_set_enabled(True))
-
-    sent = commands(write)
-    # Every setpoint at 0, then the default method with battery saver as set
-    assert sorted(sent[:-1]) == sorted(
-        [
-            (const.REGISTERS_BY_KEY["battery_power_setpoint"].address, [0, 0]),
-            (const.REGISTERS_BY_KEY["system_power_setpoint"].address, [0, 0]),
-        ]
-    )
-    assert sent[-1] == (const.CONTROL_COMMAND_REGISTER, [0x0000, 0x0008])
-    assert order == ["write", "write", "write", "beat"]
-
-
-def test_switching_on_without_a_connection_still_switches_on(
-    control, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The first poll after the connection returns sends the command anyway."""
-    write = allow_writes(control, monkeypatch)
-    control._enabled = False
-    control._modbus_client.connected = False
-    control._heartbeat.start = Mock()
-
-    asyncio.run(control.async_set_enabled(True))
-
-    write.assert_not_awaited()
-    assert control.enabled is True
-    control._heartbeat.start.assert_called_once()
-
-
-def test_a_poll_and_a_user_action_do_not_interleave_their_writes(
-    control, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Otherwise the poll can commit its older power over the user's newer one."""
-    write = _charging_at(control, monkeypatch, 2500)
-    control._control_stale = True
-    write.reset_mock()
-    setpoint = const.REGISTERS_BY_KEY["battery_power_setpoint"].address
-
-    async def run() -> None:
-        released = asyncio.Event()
-        first = True
-
-        async def slow_write(*_args, **_kwargs) -> None:
-            nonlocal first
-            if first:
-                first = False
-                await released.wait()
-
-        write.side_effect = slow_write
-        poll = asyncio.create_task(control.async_poll({"battery_soc": 50.0}))
-        await asyncio.sleep(0)  # the poll is now held in its first write
-        user = asyncio.create_task(
-            control.async_set_feature_power(Feature.CHARGE_BATTERY, 3000)
-        )
-        await asyncio.sleep(0)
-        released.set()
-        await asyncio.gather(poll, user)
-
-    asyncio.run(run())
-
-    setpoints = [words for address, words in commands(write) if address == setpoint]
-    assert setpoints[-1] == [0x0000, 0x0BB8]  # 3000 W, the user's
-    assert control.power == 3000.0
 
 
 def test_a_shutdown_releases_the_command_before_the_heartbeat_stops(

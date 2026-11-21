@@ -75,8 +75,6 @@ from .util import seconds_since
 
 _LOGGER = logging.getLogger(__name__)
 
-# Added to two poll intervals before the control logic counts as stopped.
-CONTROL_LOGIC_GRACE_S = 30
 # How long releasing the command may hold up a switch-off or a shutdown.
 RELEASE_TIMEOUT_S = 5
 # Polls in a row a setpoint may read back wrong before control stops, and the
@@ -311,14 +309,9 @@ class ControlManager:
 
         self._enabled = enabled
         self._scan_interval_s = scan_interval_s
-        # When a poll's readings last went through the guards, expiry and modes.
-        self._decided_at: datetime | None = None
         # One beating on another clock can be passed in, as for a simulation.
         self._heartbeat = heartbeat or Heartbeat(
-            modbus_client,
-            scan_interval_s=scan_interval_s,
-            start_task=start_task,
-            alive=self._control_logic_running,
+            modbus_client, scan_interval_s=scan_interval_s, start_task=start_task
         )
 
         # A restart stops the heartbeat, so the inverter has already handed control
@@ -409,20 +402,6 @@ class ControlManager:
         self._test_running = False
         # Once stopping has released the command, nothing may send it again.
         self._shut_down = False
-
-    @property
-    def deciding(self) -> bool:
-        """Return whether the control logic has run on a recent poll."""
-        return self._control_logic_running()
-
-    def _control_logic_running(self) -> bool:
-        """Return whether a poll's readings went through the logic lately.
-
-        Two missed polls and the time a reconnect takes: longer than that, the
-        guards and the expiry have stopped watching the command.
-        """
-        age = seconds_since(self._decided_at, dt.now())
-        return age <= 2 * self._scan_interval_s + CONTROL_LOGIC_GRACE_S
 
     @property
     def test_running(self) -> bool:
@@ -756,30 +735,6 @@ class ControlManager:
                 translation_domain=DOMAIN, translation_key="control_stopped"
             )
 
-    async def _async_clear_before_taking_control(self) -> None:
-        """Clear the setpoints and select the default method, before any beat.
-
-        The inverter may hold a command from an earlier session, which the first
-        beat would bring back to life. Without a beat it stores these writes and
-        ignores them, so this is safe; a failure leaves it to the first poll.
-        """
-        if not self._modbus_client.connected or not self._modbus_client.writes_allowed:
-            return
-        features = {
-            definition.setpoint_key: feature
-            for feature, definition in CONTROL_FEATURES.items()
-            if definition.setpoint_key in self._registers_by_key
-        }
-        try:
-            async with asyncio.timeout(RELEASE_TIMEOUT_S), self._write_lock:
-                for feature in features.values():
-                    await self._async_write_setpoint(feature, 0.0)
-                await self._async_write_control_word(
-                    self._compose_control_command(ControlFeature.AUTOMATIC)
-                )
-        except (HomeAssistantError, TimeoutError) as err:
-            _LOGGER.debug("Could not clear the inverter before control: %r", err)
-
     async def _async_release(self) -> None:
         """Tell the inverter to drop the command, before the heartbeat stops.
 
@@ -828,7 +783,6 @@ class ControlManager:
         if enabled:
             # We cannot know what the inverter follows now, so the next poll re-sends.
             self._control_stale = True
-            await self._async_clear_before_taking_control()
             self._heartbeat.start()
         else:
             await self._async_release()
@@ -1865,8 +1819,6 @@ class ControlManager:
 
         self._one_way_ran = False
         decision = self._desired_command(inputs)
-        if polled:
-            self._decided_at = dt.now()
         if not self._one_way_ran:
             self._handback = GuardHandback()
             self._handback_for = frozenset()
