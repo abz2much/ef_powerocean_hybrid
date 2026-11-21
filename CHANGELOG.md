@@ -9,10 +9,11 @@
   `mode: schedules`; power, charge limit and expiry are ignored). It runs the
   app's schedule slots: a charge slot charges at its power (the Charge Battery
   power you set is kept); a Use battery slot, a gap and a switched-off slot run
-  Automatic. Switching Modbus Control on selects it when there is a list.
-  Choosing another mode stops it; a command with an expiry sent while
-  following returns to the schedules when it runs out, and the expiry event
-  and logbook say where it returned (`returned_to`). Entries with only Modbus
+  Automatic. Switching Modbus Control on selects it when the cloud is set up.
+  Choosing another mode stops it. A command with an expiry, sent while
+  Schedules is selected, returns to Schedules when it runs out; otherwise it
+  returns to Automatic. The expiry event and logbook say which
+  (`returned_to`). Entries with only Modbus
   or only the cloud are unchanged.
 - The schedule list comes from MQTT when known, else from the cloud HTTP
   response (which has no days, so they are not trusted), else from a copy

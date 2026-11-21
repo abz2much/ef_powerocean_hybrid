@@ -156,9 +156,10 @@ Needs Modbus and the EcoFlow cloud set up together.
   Automatic at any power, because Modbus on this model has no discharge cap. A
   gap, or a slot that is switched off, runs Automatic.
 - Switching Modbus Control on selects Schedules on a system with the cloud.
-  Any other mode, or the `set_battery_command` action, is Manual. A command with
-  an expiry returns to Schedules when it runs out, and the expiry event says
-  where it returned (`returned_to`).
+  Choosing any other mode, or sending `set_battery_command` with another mode,
+  stops following Schedules. A command with an expiry, sent while Schedules is
+  selected, returns to Schedules when it runs out; otherwise it returns to
+  Automatic. The expiry event says which (`returned_to`).
 - The list comes from MQTT, else from the cloud HTTP poll, else from a copy
   saved on disk. Control Status shows the current slot (`schedule`) and the
   source (`schedule_source`).
