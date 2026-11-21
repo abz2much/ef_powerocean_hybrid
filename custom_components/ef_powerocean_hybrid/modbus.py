@@ -132,7 +132,8 @@ class ModbusReadRejected(ModbusException):
     """
 
     def __init__(self, message: str, *, exception_code: int | None = None) -> None:
-        super().__init__(message)
+        # Unannotated in pymodbus 3.13.1, the version Home Assistant pins.
+        super().__init__(message)  # type: ignore[no-untyped-call]
         self.exception_code = exception_code
 
     @property

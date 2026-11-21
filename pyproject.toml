@@ -46,6 +46,9 @@ explicit_package_bases = true
 strict = true
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+# pymodbus 3.13.1, the version Home Assistant pins, leaves some functions
+# unannotated (ModbusException.__init__ among them).
+untyped_calls_exclude = ["pymodbus"]
 
 [[tool.mypy.overrides]]
 # Home Assistant re-exports from its .const modules without __all__.
