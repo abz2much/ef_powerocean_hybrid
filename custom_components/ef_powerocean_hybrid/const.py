@@ -1024,6 +1024,9 @@ BATTERY_MODE_SELECT: Final = ControlEntityDef(
     key="battery_mode",
     availability=requires_modbus_control,
 )
+# The Battery Mode option that follows the app's schedules. It is not a control
+# feature: while it runs, the mode is the command of the slot running now.
+SCHEDULES_OPTION: Final = "schedules"
 
 CHARGE_LIMIT_SOC_NUMBER: Final = ControlEntityDef(
     key="charge_limit_soc",

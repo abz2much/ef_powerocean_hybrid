@@ -324,8 +324,11 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ── Command expiry ────────────────────────────────────────────────────────
 
     @callback
-    def _command_expired(self, feature: ControlFeature) -> None:
-        """Fire an event for a command that was not renewed in time."""
+    def _command_expired(self, feature: ControlFeature, returned_to: str) -> None:
+        """Fire an event for a command that was not renewed in time.
+
+        returned_to says where the mode went back to: "schedules" or "automatic".
+        """
         entry_id = self.config_entry.entry_id
         devices = device_registry.async_entries_for_config_entry(
             device_registry.async_get(self.hass), entry_id
@@ -342,6 +345,7 @@ class EcoflowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ATTR_DEVICE_ID: devices[0].id if devices else None,
                 ATTR_ENTITY_ID: select_id,
                 ATTR_MODE: str(feature),
+                "returned_to": returned_to,
             },
             context=context,
         )

@@ -4,6 +4,13 @@
 
 ### Added
 
+- The control manager can follow the app's schedules: while it does, each
+  charge slot charges at the slot's power (the Charge Battery power you set is
+  kept) and any other time runs Automatic. Choosing another mode stops it; a
+  command with an expiry sent while following returns to the schedules when it
+  runs out, and the expiry event says where it returned to (`returned_to`).
+  Switching Modbus Control on follows the schedules when there is a list. Not
+  offered in the UI yet.
 - A function that works out what the app's schedules say the battery should
   do now (charge at the slot's power, else Automatic), with its rules for
   days, midnight and summer time. Not used by the integration yet.

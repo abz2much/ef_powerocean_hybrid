@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timedelta
 from enum import Enum, auto
-from typing import Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt
@@ -71,7 +71,12 @@ from .models import (
 )
 from .plans import CHARGE, DISCHARGE, Mode, ModeState, Step, Way, battery_power
 from .reading_checks import ReadingChecks
+from .schedule_runner import SlotCommand, slot_command
 from .util import seconds_since
+
+if TYPE_CHECKING:
+    from .cloud.mqtt import Schedule
+    from .cloud.schedules import ScheduleList
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +86,9 @@ RELEASE_TIMEOUT_S = 5
 # time after a write, beyond one poll interval, before it is read back at all.
 READ_BACK_MISSES = 2
 READ_BACK_GRACE_S = 5
+
+# What the schedules say while nothing is being followed.
+_NO_SLOT = SlotCommand(ControlFeature.AUTOMATIC, 0.0, None, ())
 
 # Device states in which control steps aside and leaves the inverter to itself.
 _STEPPED_ASIDE = frozenset(
@@ -129,9 +137,12 @@ class WriteSetting(Protocol):
 
 
 class CommandExpired(Protocol):
-    """Announces that a command was not renewed and the mode is back to automatic."""
+    """Announces that a command was not renewed, and where the mode went back to.
 
-    def __call__(self, feature: ControlFeature) -> None: ...
+    returned_to is "schedules" or "automatic".
+    """
+
+    def __call__(self, feature: ControlFeature, returned_to: str) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,6 +355,18 @@ class ControlManager:
         # stretching it.
         self._expiry_set_at: datetime | None = None
         self._expire_in_s = 0.0
+        # Where the app's schedules come from, whether they are being followed,
+        # and the slot command last applied from them. While following, _feature
+        # is the slot's command and _schedule_power its power, so the stored
+        # Charge Battery power is left as the user set it.
+        self._schedule_source: Callable[[], ScheduleList | None] | None = None
+        self._following_schedules = False
+        self._slot = _NO_SLOT
+        self._schedule_command: tuple[ControlFeature, int] | None = None
+        self._schedule_power = 0.0
+        # Whether a command with an expiry, sent while following, returns to the
+        # schedules rather than to automatic.
+        self._return_to_schedules = False
         # Which guard, if any, is forcing the current command.
         self._command_status: ControlStatus | None = None
         self._handback = GuardHandback()
@@ -505,6 +528,34 @@ class ControlManager:
     def expires_at(self) -> datetime | None:
         """Return when the running command returns to automatic, if it expires."""
         return self._expires_at
+
+    @property
+    def schedules_available(self) -> bool:
+        """Return whether there is a source of the app's schedules to follow."""
+        return self._schedule_source is not None
+
+    @property
+    def following_schedules(self) -> bool:
+        """Return whether the mode follows the app's schedules."""
+        return self._following_schedules
+
+    @property
+    def schedule_slot(self) -> Schedule | None:
+        """Return the slot being followed now, if any."""
+        return self._slot.slot
+
+    @property
+    def schedule_source(self) -> str | None:
+        """Return where the schedule list comes from, or None without one."""
+        if self._schedule_source is None:
+            return None
+        schedules = self._schedule_source()
+        return None if schedules is None else schedules.source
+
+    @property
+    def schedules_not_run(self) -> tuple[int, ...]:
+        """Return the ids of switched-on slots that cannot be followed."""
+        return self._slot.not_run
 
     @property
     def charge_limit_soc(self) -> float:
@@ -784,7 +835,11 @@ class ControlManager:
             # We cannot know what the inverter follows now, so the next poll re-sends.
             self._control_stale = True
             self._heartbeat.start()
+            if self.schedules_available:
+                self._following_schedules = True
+                self._schedule_command = None
         else:
+            self._stop_following()
             await self._async_release()
             await self._heartbeat.async_stop()
             # Start over as if freshly loaded, so no mode comes back by itself.
@@ -836,11 +891,55 @@ class ControlManager:
                 translation_placeholders={"register": str(HEARTBEAT_REGISTER)},
             )
 
+    def set_schedule_source(
+        self, source: Callable[[], ScheduleList | None] | None
+    ) -> None:
+        """Set where the app's schedules come from, or None for nowhere."""
+        self._schedule_source = source
+
+    async def async_follow_schedules(self) -> None:
+        """Follow the app's schedules: each slot's command while it runs."""
+        self._require_modbus_control()
+        self._following_schedules = True
+        self._expires_at = None
+        self._return_to_schedules = False
+        # So the next resolve applies the slot, whatever was applied before.
+        self._schedule_command = None
+        await self.async_apply(force=True)
+
+    def _stop_following(self) -> None:
+        """Stop following the schedules, and returning to them."""
+        self._following_schedules = False
+        self._return_to_schedules = False
+        self._schedule_command = None
+        self._slot = _NO_SLOT
+
+    def _follow_schedule(self) -> bool:
+        """Take the command of the slot running now, while following.
+
+        Return whether it changed: only then are the mode and its hand-back
+        set, so a slot that goes on leaves the running command alone.
+        """
+        if not (self._following_schedules and self._enabled):
+            return False
+        schedules = None if self._schedule_source is None else self._schedule_source()
+        self._slot = slot_command(schedules, dt.now())
+        command = (self._slot.feature, round(self._slot.power))
+        if command == self._schedule_command:
+            return False
+        _LOGGER.debug("Following the schedules: %s at %s W", *command)
+        self._schedule_command = command
+        self._feature = self._slot.feature
+        self._schedule_power = self._slot.power
+        self._handback = GuardHandback()
+        return True
+
     async def async_select_feature(self, feature: ControlFeature) -> None:
         """Select a control feature."""
         if feature is not ControlFeature.AUTOMATIC:
             self._require_modbus_control()
 
+        self._stop_following()
         self._feature = feature
         self._handback = GuardHandback()
         self._expires_at = None
@@ -862,6 +961,12 @@ class ControlManager:
         if feature is not ControlFeature.AUTOMATIC:
             self._require_modbus_control()
 
+        # A command sent with an expiry while following returns to the schedules;
+        # one without an expiry ends them. Renewing keeps where it returns to.
+        expires = expire_in_s is not None and feature is not ControlFeature.AUTOMATIC
+        returns = expires and (self._following_schedules or self._return_to_schedules)
+        self._stop_following()
+        self._return_to_schedules = returns
         if power is not None:
             self._feature_power[feature] = self._clamp_power(power, feature, live=False)
         if charge_limit_soc is not None:
@@ -1641,6 +1746,10 @@ class ControlManager:
         """
         if self._feature is ControlFeature.EXPORT_SOLAR_FIRST:
             return self._solar_export_target(inputs)
+        if self._following_schedules and self._feature is ControlFeature.CHARGE_BATTERY:
+            return self._clamp_power(
+                self._schedule_power, ControlFeature.CHARGE_BATTERY
+            )
         if CONTROL_FEATURES[self._feature].has_power:
             return self._clamp_power(self.feature_power(self._feature), self._feature)
         return None
@@ -1806,6 +1915,9 @@ class ControlManager:
             self._inputs = ControlInputs.from_mapping(data)
         inputs = self._inputs
         self._expire_command()
+        # A new slot goes out like a mode the user picks, not held by the dwell.
+        if self._follow_schedule():
+            force = True
         if polled:
             self._observe_device(inputs)
         self._follow_native_reserve(inputs)
@@ -1896,21 +2008,31 @@ class ControlManager:
             self._read_back_failed = (sent, float(held))
 
     def _expire_command(self) -> None:
-        """Return to automatic once a command's time runs out, leaving the limits."""
+        """Return to the schedules, or to automatic, once a command's time runs out.
+
+        The limits are left as they are.
+        """
         if (
             self._expires_at is None
             or seconds_since(self._expiry_set_at, dt.now()) < self._expire_in_s
         ):
             return
+        returned_to = "schedules" if self._return_to_schedules else "automatic"
         _LOGGER.debug(
-            "The %s command was not renewed in time, returning to automatic",
+            "The %s command was not renewed in time, returning to %s",
             self._feature,
+            returned_to,
         )
         expired = self._feature
         self._feature = ControlFeature.AUTOMATIC
         self._handback = GuardHandback()
         self._expires_at = None
-        self._on_command_expired(expired)
+        if self._return_to_schedules:
+            self._return_to_schedules = False
+            self._following_schedules = True
+            # So the slot running now is applied by the resolve that follows.
+            self._schedule_command = None
+        self._on_command_expired(expired, returned_to)
 
     def _compose_control_command(self, feature: ControlFeature | None = None) -> int:
         """Build the control word for *feature*, or for the commanded one by default.

@@ -364,6 +364,7 @@ async def test_a_command_that_runs_out_returns_to_automatic_and_says_why(
         "device_id": device.id,
         "entity_id": select_id,
         "mode": "hold_battery",
+        "returned_to": "automatic",
     }
     entry_text = _describe(hass, expired[0])
     assert entry_text["entity_id"] == select_id

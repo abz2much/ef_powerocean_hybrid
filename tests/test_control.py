@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock
+from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.exceptions import HomeAssistantError
@@ -15,6 +16,8 @@ from homeassistant.util import dt as dt_util
 from custom_components.ef_powerocean_hybrid import const, models
 from custom_components.ef_powerocean_hybrid import control as control_module
 from custom_components.ef_powerocean_hybrid import heartbeat as heartbeat_module
+from custom_components.ef_powerocean_hybrid.cloud.mqtt import Schedule
+from custom_components.ef_powerocean_hybrid.cloud.schedules import ScheduleList
 from custom_components.ef_powerocean_hybrid.coordinator import EcoflowCoordinator
 from custom_components.ef_powerocean_hybrid.modbus import (
     ModbusClient,
@@ -1148,7 +1151,9 @@ def test_a_command_not_renewed_returns_to_automatic_and_keeps_its_limit(
     assert control.selected_feature is Feature.AUTOMATIC
     assert control._commanded_feature is Feature.AUTOMATIC
     assert control.charge_limit_soc == 80.0
-    control._on_command_expired.assert_called_once_with(Feature.CHARGE_BATTERY)
+    control._on_command_expired.assert_called_once_with(
+        Feature.CHARGE_BATTERY, "automatic"
+    )
 
 
 def test_automatic_has_nothing_to_expire(
@@ -2621,3 +2626,256 @@ def test_a_flicker_of_a_device_state_does_not_interrupt_the_mode(
         asyncio.run(control.async_apply(data))
         assert control._commanded_feature is Feature.CHARGE_BATTERY
     assert control.status is not Status.OFF_GRID
+
+
+# ── Following the app's schedules ─────────────────────────────────────────────
+
+# 5 Jan 2026 is a Monday in winter, so Dublin time equals UTC.
+THREE_AM = datetime(2026, 1, 5, 3, 0, tzinfo=UTC)
+FRAME = {"battery_soc": 50.0}
+SETPOINT = const.REGISTERS_BY_KEY["battery_power_setpoint"].address
+
+
+@pytest.fixture
+def dublin():
+    """Use Europe/Dublin as the local time zone, then restore it."""
+    previous = dt_util.get_default_time_zone()
+    dt_util.set_default_time_zone(ZoneInfo("Europe/Dublin"))
+    yield
+    dt_util.set_default_time_zone(previous)
+
+
+def charge_slot(*, enabled: bool = True) -> Schedule:
+    """The app's 02:00-06:00 slot that charges the battery at 3000 W, daily."""
+    return Schedule(
+        schedule_id=1,
+        schedule_type=1,
+        enabled=enabled,
+        power=3000,
+        start=120,
+        end=360,
+    )
+
+
+def schedule_list(*slots: Schedule) -> ScheduleList:
+    return ScheduleList(schedules=slots, source="mqtt", days_trusted=True)
+
+
+def at_three(control, monkeypatch: pytest.MonkeyPatch, seconds: float = 0.0):
+    """Move the clock to 03:00 plus *seconds*, keeping control authority alive."""
+    now = THREE_AM + timedelta(seconds=seconds)
+    monkeypatch.setattr(dt_util, "now", lambda: now)
+    control._heartbeat._last_success = now
+
+
+def following(control, monkeypatch: pytest.MonkeyPatch, source):
+    """Follow *source* at 03:00 and return the writes."""
+    write = allow_writes(control, monkeypatch)
+    at_three(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping(FRAME)
+    control.set_schedule_source(source)
+    asyncio.run(control.async_follow_schedules())
+    return write
+
+
+def setpoints(write) -> list[list[int]]:
+    return [words for address, words in commands(write) if address == SETPOINT]
+
+
+@pytest.mark.usefixtures("dublin")
+def test_switching_on_follows_the_schedules(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    control._heartbeat.start = Mock()
+    asyncio.run(control.async_set_enabled(False))
+    control.set_schedule_source(lambda: schedule_list(charge_slot()))
+    assert control.schedules_available is True
+
+    asyncio.run(control.async_set_enabled(True))
+
+    assert control.following_schedules is True
+
+    asyncio.run(control.async_set_enabled(False))
+    control.set_schedule_source(None)
+    assert control.schedules_available is False
+    assert control.schedule_source is None
+    asyncio.run(control.async_set_enabled(True))
+
+    assert control.following_schedules is False
+    assert control.selected_feature is Feature.AUTOMATIC
+
+
+@pytest.mark.usefixtures("dublin")
+def test_a_charge_slot_charges_at_its_power(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = following(control, monkeypatch, lambda: schedule_list(charge_slot()))
+
+    assert control.following_schedules is True
+    assert control.selected_feature is Feature.CHARGE_BATTERY
+    assert control.power == 3000.0
+    assert setpoints(write) == [[0x0000, 3000]]
+    assert control.schedule_slot == charge_slot()
+    assert control.schedule_source == "mqtt"
+    assert control.schedules_not_run == ()
+
+
+@pytest.mark.usefixtures("dublin")
+def test_the_users_charge_power_is_kept(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_feature_power(Feature.CHARGE_BATTERY, 1500))
+
+    following(control, monkeypatch, lambda: schedule_list(charge_slot()))
+
+    assert control.power == 3000.0
+    assert control.feature_power(Feature.CHARGE_BATTERY) == 1500.0
+
+
+@pytest.mark.usefixtures("dublin")
+def test_a_slot_switched_off_mid_slot_returns_to_automatic(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slots = [charge_slot()]
+    following(control, monkeypatch, lambda: schedule_list(*slots))
+    assert control._commanded_feature is Feature.CHARGE_BATTERY
+
+    # Ten seconds on, well inside the dwell: the slot change still goes out.
+    slots[0] = charge_slot(enabled=False)
+    at_three(control, monkeypatch, 10)
+    asyncio.run(control.async_poll(FRAME))
+
+    assert control.following_schedules is True
+    assert control.selected_feature is Feature.AUTOMATIC
+    assert control._commanded_feature is Feature.AUTOMATIC
+    assert control.schedule_slot is None
+
+
+@pytest.mark.usefixtures("dublin")
+def test_the_command_changes_only_with_the_slot(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write = following(control, monkeypatch, lambda: schedule_list(charge_slot()))
+    resolved = control._schedule_command
+
+    for seconds in (10, 20, 30):
+        at_three(control, monkeypatch, seconds)
+        asyncio.run(control.async_poll(FRAME))
+
+    assert control._schedule_command == resolved
+    assert control.selected_feature is Feature.CHARGE_BATTERY
+    assert setpoints(write) == [[0x0000, 3000]]
+
+
+@pytest.mark.usefixtures("dublin")
+def test_no_list_runs_automatic(control, monkeypatch: pytest.MonkeyPatch) -> None:
+    following(control, monkeypatch, lambda: None)
+
+    assert control.following_schedules is True
+    assert control.selected_feature is Feature.AUTOMATIC
+    assert control.schedule_source is None
+    assert control.schedule_slot is None
+
+
+@pytest.mark.usefixtures("dublin")
+def test_another_mode_stops_following(control, monkeypatch: pytest.MonkeyPatch) -> None:
+    following(control, monkeypatch, lambda: schedule_list(charge_slot()))
+
+    asyncio.run(control.async_select_feature(Feature.HOLD_BATTERY))
+
+    assert control.following_schedules is False
+    assert control.selected_feature is Feature.HOLD_BATTERY
+    at_three(control, monkeypatch, 10)
+    asyncio.run(control.async_poll(FRAME))
+    assert control.selected_feature is Feature.HOLD_BATTERY
+
+
+@pytest.mark.usefixtures("dublin")
+def test_following_needs_modbus_control(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    asyncio.run(control.async_set_enabled(False))
+    control.set_schedule_source(lambda: schedule_list(charge_slot()))
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(control.async_follow_schedules())
+    assert control.following_schedules is False
+
+
+@pytest.mark.usefixtures("dublin")
+def test_an_expired_command_returns_to_the_schedules(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    following(control, monkeypatch, lambda: schedule_list(charge_slot()))
+
+    asyncio.run(
+        control.async_set_command(Feature.CHARGE_BATTERY, power=500, expire_in_s=60)
+    )
+    assert control.following_schedules is False
+    assert control.power == 500.0
+
+    at_three(control, monkeypatch, 61)
+    asyncio.run(control.async_poll(FRAME))
+
+    assert control.following_schedules is True
+    assert control.selected_feature is Feature.CHARGE_BATTERY
+    assert control.power == 3000.0
+    control._on_command_expired.assert_called_once_with(
+        Feature.CHARGE_BATTERY, "schedules"
+    )
+
+
+@pytest.mark.usefixtures("dublin")
+def test_a_command_without_an_expiry_stops_following_for_good(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    following(control, monkeypatch, lambda: schedule_list(charge_slot()))
+    asyncio.run(
+        control.async_set_command(Feature.CHARGE_BATTERY, power=500, expire_in_s=60)
+    )
+    asyncio.run(control.async_set_command(Feature.CHARGE_BATTERY, power=500))
+
+    at_three(control, monkeypatch, 61)
+    asyncio.run(control.async_poll(FRAME))
+
+    assert control.following_schedules is False
+    assert control.power == 500.0
+    control._on_command_expired.assert_not_called()
+
+
+def test_an_expired_command_without_schedules_returns_to_automatic(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_writes(control, monkeypatch)
+    control._inputs = control_module.ControlInputs.from_mapping(FRAME)
+    asyncio.run(
+        control.async_set_command(Feature.CHARGE_BATTERY, power=500, expire_in_s=60)
+    )
+
+    advance(control, monkeypatch, 61)
+    asyncio.run(control.async_poll(FRAME))
+
+    assert control.following_schedules is False
+    assert control.selected_feature is Feature.AUTOMATIC
+    control._on_command_expired.assert_called_once_with(
+        Feature.CHARGE_BATTERY, "automatic"
+    )
+
+
+@pytest.mark.usefixtures("dublin")
+def test_switching_off_stops_following(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    following(control, monkeypatch, lambda: schedule_list(charge_slot()))
+    asyncio.run(
+        control.async_set_command(Feature.CHARGE_BATTERY, power=500, expire_in_s=60)
+    )
+
+    asyncio.run(control.async_set_enabled(False))
+
+    assert control.following_schedules is False
+    assert control._return_to_schedules is False
+    assert control.selected_feature is Feature.AUTOMATIC
