@@ -2879,3 +2879,45 @@ def test_switching_off_stops_following(
     assert control.following_schedules is False
     assert control._return_to_schedules is False
     assert control.selected_feature is Feature.AUTOMATIC
+
+
+@pytest.mark.usefixtures("dublin")
+def test_a_schedule_list_that_cannot_be_read_runs_automatic(
+    control, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failing source must not stop the poll, or the guards stop with it."""
+    broken = [False]
+
+    def source() -> ScheduleList:
+        if broken[0]:
+            raise ValueError("unreadable")
+        return schedule_list(charge_slot())
+
+    following(control, monkeypatch, source)
+    assert control._commanded_feature is Feature.CHARGE_BATTERY
+
+    broken[0] = True
+    for seconds in (10, 20):
+        at_three(control, monkeypatch, seconds)
+        asyncio.run(control.async_poll(FRAME))
+
+    assert control.following_schedules is True
+    assert control.selected_feature is Feature.AUTOMATIC
+    assert control._commanded_feature is Feature.AUTOMATIC
+    assert control.schedule_slot is None
+    assert control.schedule_source is None
+    # Once per run of failures, not every poll.
+    failures = [r for r in caplog.records if "schedule" in r.getMessage().lower()]
+    assert len([r for r in failures if r.exc_info]) == 1
+
+    # A success in between lets the next failure be logged again.
+    broken[0] = False
+    at_three(control, monkeypatch, 30)
+    asyncio.run(control.async_poll(FRAME))
+    assert control.selected_feature is Feature.CHARGE_BATTERY
+    broken[0] = True
+    at_three(control, monkeypatch, 40)
+    asyncio.run(control.async_poll(FRAME))
+    failures = [r for r in caplog.records if "schedule" in r.getMessage().lower()]
+    assert len([r for r in failures if r.exc_info]) == 2
+    assert control.selected_feature is Feature.AUTOMATIC

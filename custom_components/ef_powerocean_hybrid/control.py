@@ -367,6 +367,9 @@ class ControlManager:
         # Whether a command with an expiry, sent while following, returns to the
         # schedules rather than to automatic.
         self._return_to_schedules = False
+        # Whether the last read of the schedules failed, so a lasting fault is
+        # logged once rather than every poll.
+        self._schedule_read_failed = False
         # Which guard, if any, is forcing the current command.
         self._command_status: ControlStatus | None = None
         self._handback = GuardHandback()
@@ -549,7 +552,11 @@ class ControlManager:
         """Return where the schedule list comes from, or None without one."""
         if self._schedule_source is None:
             return None
-        schedules = self._schedule_source()
+        try:
+            schedules = self._schedule_source()
+        except Exception:
+            # A poll logs the fault; an entity reading it only shows no source.
+            return None
         return None if schedules is None else schedules.source
 
     @property
@@ -922,8 +929,22 @@ class ControlManager:
         """
         if not (self._following_schedules and self._enabled):
             return False
-        schedules = None if self._schedule_source is None else self._schedule_source()
-        self._slot = slot_command(schedules, dt.now())
+        try:
+            schedules = (
+                None if self._schedule_source is None else self._schedule_source()
+            )
+            self._slot = slot_command(schedules, dt.now())
+        except Exception:
+            # Automatic rather than a failed poll, so the guards keep running.
+            if not self._schedule_read_failed:
+                _LOGGER.exception(
+                    "Could not read the app's schedules; running Automatic until "
+                    "they can be read"
+                )
+            self._schedule_read_failed = True
+            self._slot = _NO_SLOT
+        else:
+            self._schedule_read_failed = False
         command = (self._slot.feature, round(self._slot.power))
         if command == self._schedule_command:
             return False
