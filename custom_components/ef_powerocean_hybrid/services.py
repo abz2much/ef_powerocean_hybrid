@@ -12,7 +12,7 @@ from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 
-from .const import ATTR_MODE, CONTROL_FEATURES, DOMAIN
+from .const import ATTR_MODE, CONTROL_FEATURES, DOMAIN, SCHEDULES_OPTION
 from .control_test_core import DEFAULT_TEST_POWER_W, MAX_TEST_POWER_W, MIN_TEST_POWER_W
 from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
 from .models import ControlFeature
@@ -31,7 +31,9 @@ ATTR_EXPIRE_IN: Final = "expire_in"
 SET_BATTERY_COMMAND_SCHEMA: Final = vol.Schema(
     {
         vol.Required(ATTR_DEVICE_ID): cv.string,
-        vol.Required(ATTR_MODE): vol.In([str(feature) for feature in ControlFeature]),
+        vol.Required(ATTR_MODE): vol.In(
+            [*(str(feature) for feature in ControlFeature), SCHEDULES_OPTION]
+        ),
         vol.Optional(ATTR_POWER): vol.All(vol.Coerce(float), vol.Range(min=0)),
         vol.Optional(ATTR_CHARGE_LIMIT_SOC): vol.All(
             vol.Coerce(float), vol.Range(min=0, max=100)
@@ -65,6 +67,11 @@ def async_setup_services(hass: HomeAssistant) -> None:
     async_setup_schedule_services(hass)
 
     async def async_set_battery_command(call: ServiceCall) -> None:
+        if call.data[ATTR_MODE] == SCHEDULES_OPTION:
+            # The slot gives the power and the limits, so the others are ignored.
+            coordinator = _coordinator_for(hass, call.data[ATTR_DEVICE_ID])
+            await coordinator.control.async_follow_schedules()
+            return
         feature = ControlFeature(call.data[ATTR_MODE])
         definition = CONTROL_FEATURES[feature]
         power = call.data.get(ATTR_POWER)

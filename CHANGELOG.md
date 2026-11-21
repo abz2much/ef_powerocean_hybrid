@@ -9,8 +9,13 @@
   kept) and any other time runs Automatic. Choosing another mode stops it; a
   command with an expiry sent while following returns to the schedules when it
   runs out, and the expiry event says where it returned to (`returned_to`).
-  Switching Modbus Control on follows the schedules when there is a list. Not
-  offered in the UI yet.
+  Switching Modbus Control on follows the schedules when there is a list.
+  With Modbus and the cloud both set up, Battery Mode has a "schedules" option
+  and the `set_battery_command` action accepts `mode: schedules` (the power,
+  charge limit and expiry are ignored). Control Status shows the slot as
+  `schedule`, where the list comes from as `schedule_source`, and the slots that
+  cannot run as `schedules_not_run`. Entries with only Modbus or only the cloud
+  are unchanged.
 - A function that works out what the app's schedules say the battery should
   do now (charge at the slot's power, else Automatic), with its rules for
   days, midnight and summer time. Not used by the integration yet.

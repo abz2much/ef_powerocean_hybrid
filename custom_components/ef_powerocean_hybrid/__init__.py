@@ -242,6 +242,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoflowConfigEntry) -> b
         # Not a first refresh: a cloud that is down or rejects the login must
         # not stop the entry, or its Modbus side, from loading.
         await cloud.async_refresh()
+    if coordinator is not None and cloud is not None:
+        # The Battery Mode select can then follow the app's schedules. Without
+        # both sides there is no list to follow, so nothing is offered.
+        coordinator.control.set_schedule_source(cloud.schedule_list)
     entry.runtime_data = HybridData(modbus=coordinator, cloud=cloud)
     _async_make_device_physical(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

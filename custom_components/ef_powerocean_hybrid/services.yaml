@@ -17,6 +17,7 @@ set_battery_command:
             - export_to_grid
             - import_from_grid
             - export_solar_first
+            - schedules
     power:
       selector:
         number:

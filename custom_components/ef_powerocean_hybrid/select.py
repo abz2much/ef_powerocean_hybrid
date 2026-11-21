@@ -9,7 +9,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import BATTERY_MODE_SELECT
+from .const import BATTERY_MODE_SELECT, SCHEDULES_OPTION
 from .coordinator import EcoflowConfigEntry, EcoflowCoordinator
 from .entity import EcoFlowBaseEntity
 from .models import ControlEntityDef, ControlFeature
@@ -50,6 +50,10 @@ class EcoFlowBatteryModeSelect(EcoFlowBaseEntity[ControlEntityDef], SelectEntity
     ) -> None:
         super().__init__(coordinator, entry, definition)
         self._attr_options = [str(feature) for feature in ControlFeature]
+        # Only where the app's schedules can be read, so a Modbus-only entry
+        # keeps the options it has always had.
+        if coordinator.control.schedules_available:
+            self._attr_options.append(SCHEDULES_OPTION)
         self._attr_entity_category = definition.entity_category
 
     @callback
@@ -61,6 +65,8 @@ class EcoFlowBatteryModeSelect(EcoFlowBaseEntity[ControlEntityDef], SelectEntity
 
     @property
     def current_option(self) -> str:
+        if self.coordinator.control.following_schedules:
+            return SCHEDULES_OPTION
         return str(self.coordinator.control.selected_feature)
 
     @property
@@ -71,4 +77,7 @@ class EcoFlowBatteryModeSelect(EcoFlowBaseEntity[ControlEntityDef], SelectEntity
         }
 
     async def async_select_option(self, option: str) -> None:
+        if option == SCHEDULES_OPTION:
+            await self.coordinator.control.async_follow_schedules()
+            return
         await self.coordinator.control.async_select_feature(ControlFeature(option))

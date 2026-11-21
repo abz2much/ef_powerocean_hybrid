@@ -19,6 +19,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 
 from .catalogue import CATALOGUE_86
+from .cloud.schedules import schedule_title
 from .cloud_schedules import active_schedule_sensor
 from .cloud_sensor import CloudCounter, HeldCounter, cloud_sensors
 from .const import (
@@ -203,6 +204,7 @@ class EcoFlowControlStatusSensor(EcoFlowBaseEntity[SensorDef], SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         control = self.coordinator.control
+        slot = control.schedule_slot
         return {
             "mode": str(control.selected_feature),
             "guard": str(guard) if (guard := control.active_guard) else None,
@@ -210,6 +212,9 @@ class EcoFlowControlStatusSensor(EcoFlowBaseEntity[SensorDef], SensorEntity):
             "control_method": str(control.method),
             "in_control": control.in_control,
             "expires_at": control.expires_at,
+            "schedule": None if slot is None else schedule_title(slot),
+            "schedule_source": control.schedule_source,
+            "schedules_not_run": list(control.schedules_not_run),
         }
 
 

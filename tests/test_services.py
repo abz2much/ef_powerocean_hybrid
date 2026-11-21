@@ -224,3 +224,22 @@ async def test_a_device_is_found_by_its_config_entry(
 
     inverter.control_test.async_cancel.assert_awaited_once()
     assert "config_entries" not in caplog.text
+
+
+async def test_the_action_follows_the_schedules(
+    hass: HomeAssistant, inverter: SimpleNamespace
+) -> None:
+    """Schedules take no power, limit or expiry, so those are ignored."""
+    inverter.control.async_follow_schedules = AsyncMock()
+
+    await call(
+        hass,
+        device_id=inverter.device_id,
+        mode="schedules",
+        power="900",
+        charge_limit_soc=50,
+        expire_in=120,
+    )
+
+    inverter.control.async_follow_schedules.assert_awaited_once_with()
+    inverter.control.async_set_command.assert_not_awaited()
