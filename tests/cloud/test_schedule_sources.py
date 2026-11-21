@@ -23,7 +23,7 @@ from custom_components.ef_powerocean_hybrid.cloud.schedules import (
 )
 from tests.cloud.conftest import SetUp
 from tests.cloud.fakes import FakeApi, model86_response
-from tests.cloud.schedule_fakes import schedule_system, system_schedules
+from tests.cloud.schedule_fakes import ScheduleMqtt, schedule_system, system_schedules
 from tests.cloud.test_schedules_http import load
 
 SAVE_DELAY = const.STATE_SAVE_DELAY_S + 1
@@ -214,6 +214,46 @@ async def test_a_changed_mqtt_list_is_saved(
             FakeApi(fetch=[http_response()]),
             mqtt=True,
         )
+        await tick(hass, freezer)
+    saved = hass_storage[key_of(cloud_entry)]["data"]
+    assert saved["source"] == "mqtt"
+    assert [s["schedule_id"] for s in saved["schedules"]] == [10, 11, 12]
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_the_http_list_does_not_replace_the_saved_mqtt_list(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    hass_storage: dict[str, Any],
+    cloud_entry: MockConfigEntry,
+    set_up_hybrid: SetUp,
+) -> None:
+    """With MQTT on, a restart before MQTT connects keeps the saved MQTT list."""
+    with schedule_system():
+        await start(
+            hass,
+            cloud_entry,
+            set_up_hybrid,
+            FakeApi(fetch=[http_response()]),
+            mqtt=True,
+        )
+        await tick(hass, freezer)
+        await hass.config_entries.async_unload(cloud_entry.entry_id)
+        await hass.async_block_till_done()
+        assert hass_storage[key_of(cloud_entry)]["data"]["source"] == "mqtt"
+
+        # The cloud answers, MQTT gives no list yet
+        ScheduleMqtt.answer_lists = False
+        cloud = await start(
+            hass,
+            cloud_entry,
+            set_up_hybrid,
+            FakeApi(fetch=[http_response()]),
+            mqtt=True,
+        )
+        found = cloud.schedule_list()
+        assert found is not None
+        assert found.source == "http"
         await tick(hass, freezer)
     saved = hass_storage[key_of(cloud_entry)]["data"]
     assert saved["source"] == "mqtt"

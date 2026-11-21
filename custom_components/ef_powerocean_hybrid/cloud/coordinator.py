@@ -40,6 +40,7 @@ from ..const import (
     CONF_CLOUD_SERIAL,
     CONF_LIVE_POWER,
     CONF_MAX_SCHEDULE_POWER,
+    CONF_MQTT,
     DOMAIN,
     STATE_SAVE_DELAY_S,
     STORAGE_VERSION,
@@ -779,9 +780,19 @@ class CloudCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _save_schedules(self) -> None:
-        """Save the list from MQTT or HTTP when it differs from the one saved."""
+        """
+        Save the list when it differs from the one saved.
+
+        With the option MQTT on only the MQTT list is saved (the HTTP list has
+        no days and may lag), with it off only the HTTP list.
+        """
         current = self.schedule_list()
-        if current is None:
+        wanted = (
+            SOURCE_MQTT
+            if cast(ConfigEntry, self.config_entry).options.get(CONF_MQTT)
+            else SOURCE_HTTP
+        )
+        if current is None or current.source != wanted:
             return
         state = (current.schedules, current.source)
         if state == self._persisted_schedules:
