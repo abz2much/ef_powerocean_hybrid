@@ -160,12 +160,18 @@ Needs Modbus and the EcoFlow cloud set up together.
   stops following Schedules. A command with an expiry, sent while Schedules is
   selected, returns to Schedules when it runs out; otherwise it returns to
   Automatic. The expiry event says which (`returned_to`).
-- The list comes from MQTT, else from the cloud HTTP poll, else from a copy
-  saved on disk. Control Status shows the current slot (`schedule`) and the
-  source (`schedule_source`).
-- A slot is not run if its repeat or type is unknown, or if it repeats on
-  chosen days and the list came from HTTP alone, which has no trusted days.
-  Control Status lists these in `schedules_not_run`.
+- The list comes from MQTT while MQTT is connected and has sent it, else from
+  the cloud HTTP poll, else from a copy saved on disk. While MQTT reconnects,
+  changes made in the app arrive by the HTTP poll. Control Status shows
+  whether Schedules is driving (`following_schedules`), the current slot
+  (`schedule`) and the source (`schedule_source`).
+- A switched-on slot is not run if its repeat or type is unknown, if its
+  start or end is past 23:59, or if it repeats on chosen days and the list
+  came from HTTP alone, which has no trusted days. Control Status lists these
+  in `schedules_not_run`, and the log warns once for each, with the reason.
+  The MQTT list leaves out a slot with a time past 23:59 altogether.
+- A malformed entry in the HTTP schedule list is skipped. If the list cannot
+  be read at all, the last one is kept and the cloud poll carries on.
 - If Home Assistant stops, the inverter runs the same app schedules itself
   within about 60 seconds.
 

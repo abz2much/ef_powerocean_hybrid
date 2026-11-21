@@ -15,12 +15,16 @@
   returns to Automatic. The expiry event and logbook say which
   (`returned_to`). Entries with only Modbus
   or only the cloud are unchanged.
-- The schedule list comes from MQTT when known, else from the cloud HTTP
-  response (which has no days, so they are not trusted), else from a copy
-  saved on disk (deleted with the entry). Slots with an unknown repeat or
-  type, or chosen days from the HTTP list alone, are not run. Control Status
-  shows the slot as `schedule`, the source as `schedule_source` and the slots
-  not run as `schedules_not_run`.
+- The schedule list comes from MQTT while it is connected and the list is
+  known, else from the cloud HTTP response (which has no days, so they are
+  not trusted), else from a copy saved on disk (deleted with the entry).
+  Switched-on slots with an unknown repeat or type, a start or end past
+  23:59, or chosen days from the HTTP list alone, are not run; the log warns
+  once for each, with the reason. Malformed entries in the HTTP list are
+  skipped, and a list that cannot be read keeps the last one without failing
+  the cloud poll. Control Status shows whether Schedules is driving as
+  `following_schedules`, the slot as `schedule`, the source as
+  `schedule_source` and the slots not run as `schedules_not_run`.
 - The EcoFlow cloud HTTP API, response parser and anonymiser from
   powerocean_single_phase v1.0.1 (commit `45287c9`), with their tests. Not
   used by the integration yet.
